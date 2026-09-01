@@ -1,0 +1,54 @@
+[Unit]
+Description=StackPivot Agent
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=stackpivot-agent
+Group=stackpivot-agent
+# The docker group must already exist and be approved by the host operator.
+SupplementaryGroups=docker
+WorkingDirectory=/opt/agent-main
+ExecStart=/usr/bin/dotnet /opt/stackpivot-agent/StackPivot.Agent.dll
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=control-group
+
+Environment=DOTNET_ENVIRONMENT=Production
+Environment=STACKPIVOT_AGENT_WORK_ROOT=/opt/agent-main
+# The value is a path to the systemd credential, never the credential itself.
+Environment=STACKPIVOT_AGENT_API_KEY_FILE=%d/agent-api-key
+EnvironmentFile=/etc/stackpivot/agent.env
+LoadCredential=agent-api-key:/etc/stackpivot/agent-api-key
+
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/agent-main
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stackpivot-agent
+
+[Install]
+WantedBy=multi-user.target
