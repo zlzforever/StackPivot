@@ -1,0 +1,59 @@
+@page "/"
+@page "/workspaces"
+@rendermode InteractiveServer
+@inject StackPivotDbContext DbContext
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<PageTitle>Workspaces</PageTitle>
+<h1>Workspaces</h1>
+
+@if (workspaces is null)
+{
+    <p>正在加载。</p>
+}
+else if (workspaces.Count == 0)
+{
+    <p>没有可访问的 Workspace。</p>
+}
+else
+{
+    <ul>
+        @foreach (var workspace in workspaces)
+        {
+            <li>
+                <strong>@workspace.DisplayName</strong>
+                <span>@workspace.Name</span>
+                <a href="/workspaces/@workspace.WorkspaceId/stacks">查看 Stack</a>
+            </li>
+        }
+    </ul>
+}
+
+@code {
+    private List<WorkspaceView>? workspaces;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        var subject = state.User.FindFirst("sub")?.Value;
+        if (string.IsNullOrWhiteSpace(subject))
+        {
+            workspaces = new List<WorkspaceView>();
+            return;
+        }
+
+        var user = await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
+        if (user is null)
+        {
+            workspaces = new List<WorkspaceView>();
+            return;
+        }
+
+        workspaces = await DbContext.Workspaces
+            .AsNoTracking()
+            .Where(value => user.IsPlatformAdmin || value.Members.Any(member => member.UserId == user.UserId))
+            .OrderBy(value => value.Name)
+            .Select(value => new WorkspaceView(value.WorkspaceId, value.Name, value.DisplayName))
+            .ToListAsync();
+    }
+}

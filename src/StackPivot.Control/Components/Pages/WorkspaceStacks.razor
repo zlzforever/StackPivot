@@ -1,0 +1,65 @@
+@page "/workspaces/{WorkspaceId:guid}/stacks"
+@rendermode InteractiveServer
+@inject StackPivotDbContext DbContext
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject WorkspaceAuthorizationService Authorization
+
+<PageTitle>Stacks</PageTitle>
+<h1>Stacks</h1>
+
+@if (stacks is null)
+{
+    <p>正在加载。</p>
+}
+else if (stacks.Count == 0)
+{
+    <p>暂无 Stack。</p>
+}
+else
+{
+    <ul>
+        @foreach (var stack in stacks)
+        {
+            <li>
+                <strong>@stack.DisplayName</strong>
+                <span>@stack.FolderName</span>
+                @if (canDeploy)
+                {
+                    <a href="/stacks/@stack.StackId/deploy">部署</a>
+                }
+                <a href="/stacks/@stack.StackId/history">历史</a>
+            </li>
+        }
+    </ul>
+}
+
+@code {
+    [Parameter]
+    public Guid WorkspaceId { get; set; }
+
+    private List<StackView>? stacks;
+    private bool canDeploy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        var subject = state.User.FindFirst("sub")?.Value;
+        var user = string.IsNullOrWhiteSpace(subject)
+            ? null
+            : await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
+        if (user is null || !(await Authorization.RequireAsync(user.UserId, WorkspaceId, WorkspacePermission.ReadOnly, CancellationToken.None)).IsAllowed)
+        {
+            stacks = new List<StackView>();
+            return;
+        }
+
+        canDeploy = (await Authorization.RequireAsync(user.UserId, WorkspaceId, WorkspacePermission.Editor, CancellationToken.None)).IsAllowed;
+
+        stacks = await DbContext.Stacks
+            .AsNoTracking()
+            .Where(value => value.WorkspaceId == WorkspaceId)
+            .OrderBy(value => value.FolderName)
+            .Select(value => new StackView(value.StackId, value.WorkspaceId, value.FolderName, value.DisplayName))
+            .ToListAsync();
+    }
+}

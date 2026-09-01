@@ -1,0 +1,79 @@
+@page "/stacks/{StackId:guid}/history"
+@rendermode InteractiveServer
+@inject StackPivotDbContext DbContext
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject WorkspaceAuthorizationService Authorization
+
+<PageTitle>部署历史</PageTitle>
+<h1>部署历史</h1>
+
+@if (operations is null)
+{
+    <p>正在加载。</p>
+}
+else if (operations.Count == 0)
+{
+    <p>暂无记录。</p>
+}
+else
+{
+    <table>
+        <thead>
+            <tr><th>Agent</th><th>Commit</th><th>状态</th><th>完成时间</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var operation in operations)
+            {
+                <tr>
+                    <td>@operation.AgentId</td>
+                    <td>@operation.TargetCommitHash</td>
+                    <td>@operation.Status</td>
+                    <td>@operation.FinishedAt</td>
+                </tr>
+                <tr><td colspan="4"><pre>@operation.OutputLog</pre></td></tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    [Parameter]
+    public Guid StackId { get; set; }
+
+    private List<DeploymentTaskView>? operations;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        var subject = state.User.FindFirst("sub")?.Value;
+        var user = string.IsNullOrWhiteSpace(subject)
+            ? null
+            : await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
+        var stack = await DbContext.Stacks.AsNoTracking().SingleOrDefaultAsync(value => value.StackId == StackId);
+        if (user is null || stack is null || !(await Authorization.RequireAsync(user.UserId, stack.WorkspaceId, WorkspacePermission.ReadOnly, CancellationToken.None)).IsAllowed)
+        {
+            operations = new List<DeploymentTaskView>();
+            return;
+        }
+
+        operations = await DbContext.ServiceOperationHistories
+            .AsNoTracking()
+            .Where(value => value.StackId == StackId)
+            .OrderByDescending(value => value.LastEventAt)
+            .Take(50)
+            .Select(value => new DeploymentTaskView(
+                value.TaskId,
+                value.AgentId,
+                value.OperationType,
+                value.TargetCommitHash,
+                value.TaskStatus,
+                value.CommandText,
+                value.ExitCode,
+                value.StartTime,
+                value.FinishTime,
+                value.OutputLog,
+                value.LogTruncated,
+                value.ErrorCode))
+            .ToListAsync();
+    }
+}

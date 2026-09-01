@@ -1,0 +1,382 @@
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.EntityFrameworkCore;
+using StackPivot.Control.Application.Audit;
+using StackPivot.Control.Authorization;
+using StackPivot.Control.Domain.Entities;
+using StackPivot.Control.Infrastructure.Git;
+using StackPivot.Control.Infrastructure.Persistence;
+using StackPivot.Contracts.Deployments;
+using StackPivot.Contracts.SignalR;
+
+namespace StackPivot.Control.Application.Deployments;
+
+public interface IDeploymentService
+{
+    Task<DeploymentRequestResult> RequestAsync(
+        Guid userId,
+        Guid stackId,
+        DeployStackRequest request,
+        CancellationToken cancellationToken);
+
+    Task<DeploymentRequestView?> GetRequestAsync(
+        Guid userId,
+        Guid requestId,
+        CancellationToken cancellationToken);
+}
+
+public interface IAgentTransport
+{
+    Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken);
+    Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken);
+}
+
+public sealed class DeploymentRequestException(string code, int statusCode, string message) : Exception(message)
+{
+    public string Code { get; } = code;
+    public int StatusCode { get; } = statusCode;
+}
+
+public sealed class DeploymentService(
+    StackPivotDbContext dbContext,
+    WorkspaceAuthorizationService authorization,
+    ICentralGitPreflight preflight,
+    AuditWriter auditWriter) : IDeploymentService
+{
+    private static readonly SemaphoreSlim RequestLock = new(1, 1);
+
+    public Task<DeploymentRequestResult> RequestAsync(
+        Guid userId,
+        Guid stackId,
+        DeployStackRequest request,
+        CancellationToken cancellationToken)
+    {
+        return RequestAsync(
+            userId,
+            stackId,
+            request,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            cancellationToken);
+    }
+
+    public async Task<DeploymentRequestResult> RequestAsync(
+        Guid userId,
+        Guid stackId,
+        DeployStackRequest request,
+        Guid requestId,
+        Guid idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        await RequestLock.WaitAsync(cancellationToken);
+        try
+        {
+            return await RequestCoreAsync(userId, stackId, request, requestId, idempotencyKey, cancellationToken);
+        }
+        finally
+        {
+            RequestLock.Release();
+        }
+    }
+
+    private async Task<DeploymentRequestResult> RequestCoreAsync(
+        Guid userId,
+        Guid stackId,
+        DeployStackRequest request,
+        Guid requestId,
+        Guid idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (userId == Guid.Empty || stackId == Guid.Empty || requestId == Guid.Empty || idempotencyKey == Guid.Empty)
+        {
+            throw new DeploymentRequestException("invalid_request", 422, "Request identifiers are required.");
+        }
+
+        var stack = await dbContext.Stacks
+            .AsNoTracking()
+            .SingleOrDefaultAsync(value => value.StackId == stackId, cancellationToken);
+        if (stack is null)
+        {
+            throw new DeploymentRequestException("resource_not_found", 404, "Stack was not found.");
+        }
+
+        var readAccess = await authorization.RequireAsync(
+            userId,
+            stack.WorkspaceId,
+            WorkspacePermission.ReadOnly,
+            cancellationToken);
+        if (!readAccess.IsAllowed)
+        {
+            throw new DeploymentRequestException("resource_not_found", 404, "Stack was not found.");
+        }
+
+        var editorAccess = await authorization.RequireAsync(
+            userId,
+            stack.WorkspaceId,
+            WorkspacePermission.Editor,
+            cancellationToken);
+        if (!editorAccess.IsAllowed)
+        {
+            throw new DeploymentRequestException("insufficient_permission", 403, "Editor permission is required.");
+        }
+
+        var validation = request.Validate();
+        if (!validation.IsValid)
+        {
+            throw new DeploymentRequestException(validation.Errors[0], 422, "Deployment request is invalid.");
+        }
+
+        var fingerprint = ComputeFingerprint(stackId, request);
+        var existing = await dbContext.DeploymentRequests
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                value => value.UserId == userId && value.IdempotencyKey == idempotencyKey.ToString(),
+                cancellationToken);
+        if (existing is not null)
+        {
+            if (!string.Equals(existing.RequestFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                throw new DeploymentRequestException(
+                    "idempotency_key_reused",
+                    409,
+                    "Idempotency key was used with a different request.");
+            }
+
+            return await BuildResultAsync(existing.RequestId, cancellationToken);
+        }
+
+        var bindings = await dbContext.StackAgentBindings
+            .Include(value => value.Agent)
+            .Where(value => value.StackId == stackId)
+            .ToListAsync(cancellationToken);
+        var targets = ResolveTargets(request, bindings);
+        if (targets.Count == 0)
+        {
+            throw new DeploymentRequestException("invalid_target", 422, "No bound deployment target exists.");
+        }
+
+        var targetIds = targets.Select(value => value.AgentId).ToArray();
+        var active = await dbContext.ServiceOperationHistories
+            .AnyAsync(
+                value => value.StackId == stackId
+                    && value.TaskStatus == "pending"
+                    && targetIds.Contains(value.AgentId),
+                cancellationToken);
+        if (active)
+        {
+            throw new DeploymentRequestException("deployment_in_progress", 409, "Deployment is already running.");
+        }
+
+        var checkedOut = await preflight.ValidateAsync(stackId, request.TargetCommitHash, cancellationToken);
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        existing = await dbContext.DeploymentRequests
+            .SingleOrDefaultAsync(
+                value => value.UserId == userId && value.IdempotencyKey == idempotencyKey.ToString(),
+                cancellationToken);
+        if (existing is not null)
+        {
+            if (!string.Equals(existing.RequestFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                throw new DeploymentRequestException(
+                    "idempotency_key_reused",
+                    409,
+                    "Idempotency key was used with a different request.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return await BuildResultAsync(existing.RequestId, cancellationToken);
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var deployment = new DeploymentRequestEntity
+        {
+            RequestId = requestId,
+            StackId = stackId,
+            UserId = userId,
+            IdempotencyKey = idempotencyKey.ToString(),
+            RequestFingerprint = fingerprint,
+            TargetCommitHash = request.TargetCommitHash,
+            Mode = request.Mode,
+            CreatedAt = now
+        };
+        dbContext.DeploymentRequests.Add(deployment);
+        foreach (var target in targets)
+        {
+            deployment.Operations.Add(new ServiceOperationHistory
+            {
+                HistoryId = Guid.NewGuid(),
+                TaskId = Guid.NewGuid(),
+                RequestId = requestId,
+                StackId = stackId,
+                AgentId = target.AgentId,
+                UserId = userId,
+                TargetCommitHash = request.TargetCommitHash,
+                TokenKeyId = checkedOut.TokenKeyId,
+                TaskStatus = "pending",
+                CommandText = "docker compose up -d",
+                OutputLog = string.Empty,
+                LastSequence = -1,
+                LastEventAt = now
+            });
+        }
+
+        auditWriter.Add(
+            AuditActions.DeployRequested,
+            requestId,
+            userId,
+            null,
+            "stack",
+            stackId.ToString(),
+            "accepted");
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        _ = checkedOut;
+        return await BuildResultAsync(requestId, cancellationToken);
+    }
+
+    public async Task<DeploymentRequestView?> GetRequestAsync(
+        Guid userId,
+        Guid requestId,
+        CancellationToken cancellationToken)
+    {
+        var request = await dbContext.DeploymentRequests
+            .AsNoTracking()
+            .Include(value => value.Stack)
+            .SingleOrDefaultAsync(value => value.RequestId == requestId, cancellationToken);
+        if (request?.Stack is null)
+        {
+            return null;
+        }
+
+        var access = await authorization.RequireAsync(
+            userId,
+            request.Stack.WorkspaceId,
+            WorkspacePermission.ReadOnly,
+            cancellationToken);
+        if (!access.IsAllowed)
+        {
+            return null;
+        }
+
+        return await BuildViewAsync(request, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<DeploymentTaskView>?> GetOperationsAsync(
+        Guid userId,
+        Guid stackId,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        var stack = await dbContext.Stacks
+            .AsNoTracking()
+            .SingleOrDefaultAsync(value => value.StackId == stackId, cancellationToken);
+        if (stack is null)
+        {
+            return null;
+        }
+
+        var access = await authorization.RequireAsync(
+            userId,
+            stack.WorkspaceId,
+            WorkspacePermission.ReadOnly,
+            cancellationToken);
+        if (!access.IsAllowed)
+        {
+            return null;
+        }
+
+        limit = Math.Clamp(limit, 1, 100);
+        return await dbContext.ServiceOperationHistories
+            .AsNoTracking()
+            .Where(value => value.StackId == stackId)
+            .OrderByDescending(value => value.LastEventAt)
+            .Take(limit)
+            .Select(value => new DeploymentTaskView(
+                value.TaskId,
+                value.AgentId,
+                value.OperationType,
+                value.TargetCommitHash,
+                value.TaskStatus,
+                value.CommandText,
+                value.ExitCode,
+                value.StartTime,
+                value.FinishTime,
+                value.OutputLog,
+                value.LogTruncated,
+                value.ErrorCode))
+            .ToListAsync(cancellationToken);
+    }
+
+    private async Task<DeploymentRequestResult> BuildResultAsync(
+        Guid requestId,
+        CancellationToken cancellationToken)
+    {
+        var request = await dbContext.DeploymentRequests
+            .AsNoTracking()
+            .SingleAsync(value => value.RequestId == requestId, cancellationToken);
+        var tasks = await dbContext.ServiceOperationHistories
+            .AsNoTracking()
+            .Where(value => value.RequestId == requestId)
+            .OrderBy(value => value.AgentId)
+            .Select(value => new DeploymentTaskResult(
+                value.TaskId,
+                value.AgentId,
+                value.TaskStatus,
+                value.ErrorCode))
+            .ToListAsync(cancellationToken);
+        return new DeploymentRequestResult(request.RequestId, request.StackId, request.TargetCommitHash, tasks);
+    }
+
+    private async Task<DeploymentRequestView> BuildViewAsync(
+        DeploymentRequestEntity request,
+        CancellationToken cancellationToken)
+    {
+        var tasks = await dbContext.ServiceOperationHistories
+            .AsNoTracking()
+            .Where(value => value.RequestId == request.RequestId)
+            .OrderBy(value => value.AgentId)
+            .Select(value => new DeploymentTaskView(
+                value.TaskId,
+                value.AgentId,
+                value.OperationType,
+                value.TargetCommitHash,
+                value.TaskStatus,
+                value.CommandText,
+                value.ExitCode,
+                value.StartTime,
+                value.FinishTime,
+                value.OutputLog,
+                value.LogTruncated,
+                value.ErrorCode))
+            .ToListAsync(cancellationToken);
+        return new DeploymentRequestView(request.RequestId, tasks);
+    }
+
+    private static List<AgentNode> ResolveTargets(
+        DeployStackRequest request,
+        IReadOnlyCollection<StackAgentBinding> bindings)
+    {
+        return request.Mode switch
+        {
+            DeploymentMode.BoundAgents => bindings
+                .Where(value => value.Agent is not null && value.Agent.RevokedAt is null)
+                .Select(value => value.Agent!)
+                .ToList(),
+            DeploymentMode.SingleAgent => bindings
+                .Where(value => value.AgentId == request.AgentId && value.Agent is not null && value.Agent.RevokedAt is null)
+                .Select(value => value.Agent!)
+                .ToList(),
+            _ => new List<AgentNode>()
+        };
+    }
+
+    private static string ComputeFingerprint(Guid stackId, DeployStackRequest request)
+    {
+        var bytes = Encoding.UTF8.GetBytes($"{stackId:D}:{ProtocolJson.Serialize(request)}");
+        var digest = SHA256.HashData(bytes);
+        CryptographicOperations.ZeroMemory(bytes);
+        return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+}

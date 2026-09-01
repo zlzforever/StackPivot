@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>StackPivot.Contracts</RootNamespace>
+    <AssemblyName>StackPivot.Contracts</AssemblyName>
+  </PropertyGroup>
+</Project>

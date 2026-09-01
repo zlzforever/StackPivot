@@ -1,0 +1,124 @@
+@page "/stacks/{StackId:guid}/deploy"
+@rendermode InteractiveServer
+@inject StackPivotDbContext DbContext
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject WorkspaceAuthorizationService Authorization
+@inject IDeploymentService DeploymentService
+
+<PageTitle>部署 Stack</PageTitle>
+<h1>部署</h1>
+
+@if (stack is null)
+{
+    <p>Stack 不存在或无权访问。</p>
+}
+else if (!canDeploy)
+{
+    <p>当前账号只能查看部署状态。</p>
+}
+else
+{
+    <EditForm Model="form" OnValidSubmit="SubmitAsync">
+        <label>
+            Commit
+            <InputText @bind-Value="form.TargetCommitHash" />
+        </label>
+        <label>
+            目标模式
+            <InputSelect @bind-Value="form.Mode">
+                <option value="@DeploymentMode.BoundAgents">绑定 Agent</option>
+                <option value="@DeploymentMode.SingleAgent">单 Agent</option>
+            </InputSelect>
+        </label>
+        @if (form.Mode == DeploymentMode.SingleAgent)
+        {
+            <label>
+                Agent
+                <InputSelect @bind-Value="form.AgentId">
+                    <option value="">请选择</option>
+                    @foreach (var agent in agents)
+                    {
+                        <option value="@agent.AgentId">@agent.Name</option>
+                    }
+                </InputSelect>
+            </label>
+        }
+        <button type="submit">提交部署</button>
+    </EditForm>
+    @if (result is not null)
+    {
+        <p>请求已创建：@result.RequestId</p>
+    }
+    @if (!string.IsNullOrWhiteSpace(error))
+    {
+        <p role="alert">@error</p>
+    }
+}
+
+@code {
+    [Parameter]
+    public Guid StackId { get; set; }
+
+    private Stack? stack;
+    private bool canDeploy;
+    private List<AgentNode> agents = new();
+    private DeployForm form = new();
+    private DeploymentRequestResult? result;
+    private string? error;
+    private Guid userId;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        var subject = state.User.FindFirst("sub")?.Value;
+        if (string.IsNullOrWhiteSpace(subject))
+        {
+            return;
+        }
+
+        var user = await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
+        stack = await DbContext.Stacks.AsNoTracking().SingleOrDefaultAsync(value => value.StackId == StackId);
+        if (user is null || stack is null)
+        {
+            stack = null;
+            return;
+        }
+
+        userId = user.UserId;
+        var access = await Authorization.RequireAsync(userId, stack.WorkspaceId, WorkspacePermission.Editor, CancellationToken.None);
+        canDeploy = access.IsAllowed;
+        if (canDeploy)
+        {
+            agents = await DbContext.StackAgentBindings
+                .AsNoTracking()
+                .Include(value => value.Agent)
+                .Where(value => value.StackId == StackId && value.Agent != null && value.Agent.RevokedAt == null)
+                .Select(value => value.Agent!)
+                .ToListAsync();
+        }
+    }
+
+    private async Task SubmitAsync()
+    {
+        error = null;
+        try
+        {
+            result = await DeploymentService.RequestAsync(
+                userId,
+                StackId,
+                new DeployStackRequest(form.TargetCommitHash, form.Mode, form.AgentId),
+                CancellationToken.None);
+        }
+        catch (Exception exception) when (exception is DeploymentRequestException or DeploymentValidationException)
+        {
+            error = exception.Message;
+        }
+    }
+
+    private sealed class DeployForm
+    {
+        public string TargetCommitHash { get; set; } = string.Empty;
+        public DeploymentMode Mode { get; set; } = DeploymentMode.BoundAgents;
+        public Guid? AgentId { get; set; }
+    }
+}
