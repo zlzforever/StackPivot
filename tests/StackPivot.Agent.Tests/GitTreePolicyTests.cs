@@ -84,9 +84,71 @@ public sealed class GitTreePolicyTests
         }
     }
 
+    [Fact]
+    public void InMemoryAskpassIsExecutableByGit()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var credential = InMemoryGitCredential.Create("git-user", "secret"u8.ToArray());
+
+        Assert.True(File.GetUnixFileMode(credential.AskpassPath).HasFlag(UnixFileMode.UserExecute));
+    }
+
+    [Fact]
+    public async Task TruncatedTreeOutputFailsClosedBeforeMaterialization()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
+        var runner = new MaterializationRunner
+        {
+            TreeResult = new ProcessResult(
+                0,
+                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
+                string.Empty,
+                OutputTruncated: true)
+        };
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var token = "secret"u8.ToArray();
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    token,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    Path.Combine(root, "workspace_one", "stack_web")),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("git_tree_output_truncated", result.ErrorCode);
+            Assert.DoesNotContain(runner.Requests, request => request.Arguments.Contains("read-tree"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private sealed class MaterializationRunner : IProcessRunner
     {
         public List<ProcessRequest> Requests { get; } = new();
+        public ProcessResult TreeResult { get; init; } = new(
+            0,
+            "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
+            string.Empty);
 
         public Task<ProcessResult> RunAsync(ProcessRequest request, CancellationToken cancellationToken)
         {
@@ -104,10 +166,7 @@ public sealed class GitTreePolicyTests
                 case "cat-file":
                     return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
                 case "ls-tree":
-                    return Task.FromResult(new ProcessResult(
-                        0,
-                        "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
-                        string.Empty));
+                    return Task.FromResult(TreeResult);
                 case "read-tree":
                     File.WriteAllText(Path.Combine(request.WorkingDirectory, "compose.yaml"), "services: {}");
                     return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));

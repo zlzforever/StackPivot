@@ -19,6 +19,8 @@ public sealed class DeploymentDispatcher(
     AuditWriter auditWriter)
 {
     private static readonly SemaphoreSlim DispatchLock = new(1, 1);
+    public static readonly TimeSpan DispatchAcknowledgementTimeout = TimeSpan.FromMinutes(5);
+    public static readonly TimeSpan ExecutionTimeout = TimeSpan.FromMinutes(30);
 
     public async Task DispatchPendingAsync(CancellationToken cancellationToken)
     {
@@ -26,12 +28,20 @@ public sealed class DeploymentDispatcher(
         try
         {
             var pending = await dbContext.ServiceOperationHistories
-                .Where(value => value.TaskStatus == "pending" && value.DispatchedAt == null)
+                .Where(value => value.TaskStatus == "pending")
                 .OrderBy(value => value.LastEventAt)
                 .ToListAsync(cancellationToken);
+            var now = DateTimeOffset.UtcNow;
             foreach (var history in pending)
             {
-                await DispatchOneAsync(history, cancellationToken);
+                if (IsExpired(history, now))
+                {
+                    await MarkFailedAsync(history, "agent_timeout", cancellationToken);
+                }
+                else if (history.DispatchedAt is null)
+                {
+                    await DispatchOneAsync(history, cancellationToken);
+                }
             }
         }
         finally
@@ -44,7 +54,7 @@ public sealed class DeploymentDispatcher(
     {
         ProtocolValidation.EnsureSchemaVersion(accepted.SchemaVersion);
         var history = await FindTaskAsync(accepted.TaskId, accepted.AgentId, cancellationToken);
-        if (history is null || history.TaskStatus != "pending" || history.DispatchedAt is null || history.StartTime is not null)
+        if (history is null || history.TaskStatus != "pending" || history.StartTime is not null)
         {
             return;
         }
@@ -174,6 +184,7 @@ public sealed class DeploymentDispatcher(
                 DateTimeOffset.UtcNow.AddMinutes(5));
             await transport.SendDeployAsync(command, cancellationToken);
             history.DispatchedAt = DateTimeOffset.UtcNow;
+            history.LastEventAt = history.DispatchedAt.Value;
             auditWriter.Add(
                 AuditActions.TaskDispatched,
                 history.RequestId,
@@ -227,6 +238,17 @@ public sealed class DeploymentDispatcher(
             "failed",
             errorCode);
         await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    private static bool IsExpired(ServiceOperationHistory history, DateTimeOffset now)
+    {
+        var lastActivity = history.StartTime is null
+            ? history.DispatchedAt ?? history.LastEventAt
+            : history.LastEventAt;
+        var timeout = history.StartTime is null
+            ? DispatchAcknowledgementTimeout
+            : ExecutionTimeout;
+        return now - lastActivity >= timeout;
     }
 
     private Task<ServiceOperationHistory?> FindTaskAsync(

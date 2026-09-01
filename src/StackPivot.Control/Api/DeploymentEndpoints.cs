@@ -1,9 +1,11 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using StackPivot.Control.Auth;
 using StackPivot.Control.Application.Deployments;
+using StackPivot.Control.Infrastructure.Git;
 using StackPivot.Contracts.Deployments;
 using StackPivot.Contracts.SignalR;
 
@@ -55,8 +57,13 @@ public static class DeploymentEndpoints
                     {
                         return ApiProblem.Create(context, exception.Code, exception.StatusCode, exception.Message, requestId);
                     }
+                    catch (DeploymentValidationException exception)
+                    {
+                        return ApiProblem.Create(context, exception.Code, exception.StatusCode, exception.Message, requestId);
+                    }
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .WithMetadata(new RequireAntiforgeryTokenAttribute(true));
 
         endpoints.MapGet(
                 "/api/deployments/{requestId:guid}",

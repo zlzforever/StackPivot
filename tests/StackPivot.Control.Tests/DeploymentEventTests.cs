@@ -75,6 +75,30 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AcceptedEventIsHandledBeforeDispatchMarkerIsPersisted()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAcceptedAsync(
+            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        Assert.NotNull(history.StartTime);
+        Assert.Null(history.DispatchedAt);
+    }
+
+    [Fact]
     public async Task DispatchSendExceptionFailsTheTaskInsteadOfLeavingItPending()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -135,6 +159,39 @@ public sealed class DeploymentEventTests
         var history = await db.ServiceOperationHistories.SingleAsync();
         Assert.NotNull(history.DispatchedAt);
         Assert.Equal("git-key-v1", history.TokenKeyId);
+    }
+
+    [Fact]
+    public async Task StaleDispatchedTaskIsFailedInsteadOfRemainingActive()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var staleAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchedAt = staleAt;
+        history.LastEventAt = staleAt;
+        await db.SaveChangesAsync();
+
+        var transport = new RecordingTransport();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            transport,
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.SingleAsync(value => value.TaskId == fixture.TaskId);
+        Assert.Equal("failed", history.TaskStatus);
+        Assert.Equal("agent_timeout", history.ErrorCode);
+        Assert.NotNull(history.FinishTime);
+        Assert.Empty(transport.Commands);
+        Assert.Contains(await db.AuditLogs.ToListAsync(), audit =>
+            audit.Action == AuditActions.TaskFailed && audit.ErrorCode == "agent_timeout");
     }
 
     [Fact]

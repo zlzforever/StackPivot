@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -109,7 +110,8 @@ public static class AgentAdminEndpoints
                     await dbContext.SaveChangesAsync(context.RequestAborted);
                     return Results.Json(new AgentKeyIssueView(agent.AgentId, issue.ApiKey, issue.Version, issue.ApiKeyLast4), statusCode: 201);
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .WithMetadata(new RequireAntiforgeryTokenAttribute(true));
 
         endpoints.MapPost(
                 "/api/agent-nodes/{agentId:guid}/rotate-key",
@@ -136,7 +138,8 @@ public static class AgentAdminEndpoints
                         return ApiProblem.Create(context, "resource_not_found", 404, "Agent was not found.");
                     }
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .WithMetadata(new RequireAntiforgeryTokenAttribute(true));
 
         endpoints.MapPost(
                 "/api/agent-nodes/{agentId:guid}/revoke-key",
@@ -163,7 +166,8 @@ public static class AgentAdminEndpoints
                         return ApiProblem.Create(context, "resource_not_found", 404, "Agent was not found.");
                     }
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .WithMetadata(new RequireAntiforgeryTokenAttribute(true));
 
         endpoints.MapPut(
                 "/api/stacks/{stackId:guid}/agent-bindings",
@@ -229,7 +233,8 @@ public static class AgentAdminEndpoints
                     await transaction.CommitAsync(context.RequestAborted);
                     return Results.NoContent();
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .WithMetadata(new RequireAntiforgeryTokenAttribute(true));
 
         return endpoints;
     }

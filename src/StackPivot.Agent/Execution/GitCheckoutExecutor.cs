@@ -251,6 +251,21 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath],
                 cancellationToken,
                 environment);
+            if (tree.TimedOut)
+            {
+                return Failure("git_tree_timeout");
+            }
+
+            if (tree.ExitCode != 0)
+            {
+                return Failure("git_tree_failed");
+            }
+
+            if (tree.OutputTruncated)
+            {
+                return Failure("git_tree_output_truncated");
+            }
+
             IReadOnlyList<string> files;
             try
             {
