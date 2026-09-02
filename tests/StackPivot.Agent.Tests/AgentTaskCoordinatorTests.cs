@@ -105,7 +105,15 @@ public sealed class AgentTaskCoordinatorTests
         Assert.Equal(1, executor.ExecutionCount);
         Assert.Equal(2, firstReporter.Completed.Count);
 
-        await coordinator.HandleAsync(CreateCommand(), new RecordingReporter(), CancellationToken.None);
+        var evictedCommand = CreateCommand();
+        await coordinator.HandleAsync(evictedCommand, new RecordingReporter(), CancellationToken.None);
+        Assert.Equal(2, executor.ExecutionCount);
+
+        var replayReporter = new RecordingReporter();
+        await coordinator.HandleAsync(firstCommand with { AccessToken = "replayed-after-eviction"u8.ToArray() }, replayReporter, CancellationToken.None);
+        Assert.Equal(3, executor.ExecutionCount);
+        Assert.Single(replayReporter.Completed);
+        Assert.True(replayReporter.Completed[0].Success);
 
         var completedTasksField = typeof(AgentTaskCoordinator).GetField(
             "completedTasks",
@@ -114,6 +122,30 @@ public sealed class AgentTaskCoordinatorTests
         var completedTasks = completedTasksField.GetValue(coordinator);
         Assert.NotNull(completedTasks);
         Assert.True((int)completedTasks!.GetType().GetProperty("Count")!.GetValue(completedTasks)! <= 1);
+    }
+
+    [SkippableFact]
+    public async Task ExpiredCompletedTaskIsExecutedAgainInsteadOfReplayed()
+    {
+        TestPlatform.RequireLinux();
+
+        var executor = new LargeOutputExecutor();
+        var coordinator = new AgentTaskCoordinator(
+            AgentId,
+            executor,
+            maxCompletedTasks: 4,
+            completedTaskTtl: TimeSpan.FromMilliseconds(25));
+        var command = CreateCommand();
+
+        await coordinator.HandleAsync(command, new RecordingReporter(), CancellationToken.None);
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+        var replayReporter = new RecordingReporter();
+        await coordinator.HandleAsync(command with { AccessToken = "expired-replay"u8.ToArray() }, replayReporter, CancellationToken.None);
+
+        Assert.Equal(2, executor.ExecutionCount);
+        Assert.Single(replayReporter.Completed);
+        Assert.True(replayReporter.Completed[0].Success);
     }
 
     private static DeployStackCommand CreateCommand(byte[]? accessToken = null)

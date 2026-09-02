@@ -37,6 +37,19 @@ public sealed class SafeDirectoryHandle : IDisposable
         }
     }
 
+    internal IReadOnlyList<string> EnumerateEntryNames()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        return Directory.EnumerateFileSystemEntries(ProcessWorkingDirectory)
+            .Select(Path.GetFileName)
+            .OfType<string>()
+            .ToArray();
+    }
+
     internal static SafeDirectoryHandle OpenOrCreateAbsoluteDirectory(string absolutePath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(absolutePath);
@@ -76,16 +89,28 @@ public sealed class SafeDirectoryHandle : IDisposable
         {
             return null;
         }
+        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.NotDirectory)
+        {
+            return null;
+        }
+        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.SymbolicLinkLoop)
+        {
+            return null;
+        }
     }
 
-    internal SafeDirectoryHandle OpenChildDirectory(string name, bool create)
+    internal SafeDirectoryHandle OpenChildDirectory(string name, bool create, bool inheritHandle = false)
     {
         if (!OperatingSystem.IsLinux())
         {
             throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
         }
 
-        var child = LinuxPathOperations.OpenDirectoryAt(GetFileDescriptor(), name, create);
+        var child = LinuxPathOperations.OpenDirectoryAt(
+            GetFileDescriptor(),
+            name,
+            create,
+            closeOnExec: !inheritHandle);
         return new SafeDirectoryHandle(child, Path.Combine(CanonicalPath, name));
     }
 
@@ -127,6 +152,103 @@ public sealed class SafeDirectoryHandle : IDisposable
         return new FileStream(fileHandle, FileAccess.ReadWrite, bufferSize: 1, isAsync: false);
     }
 
+    internal void DeleteContents()
+    {
+        foreach (var name in EnumerateEntryNames())
+        {
+            if (name is "." or "..")
+            {
+                throw new PathPolicyException("Directory enumeration returned an unsafe entry.");
+            }
+
+            var child = TryOpenChildDirectory(name);
+            if (child is not null)
+            {
+                using (child)
+                {
+                    child.DeleteContents();
+                }
+
+                LinuxPathOperations.DeleteDirectoryAt(GetFileDescriptor(), name);
+            }
+            else
+            {
+                DeleteFile(name);
+            }
+        }
+    }
+
+    internal void DeleteChildDirectory(string name)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        LinuxPathOperations.DeleteDirectoryAt(GetFileDescriptor(), name);
+    }
+
+    internal void EnsurePrivateDirectory()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        LinuxPathOperations.EnsurePrivateDirectory(GetFileDescriptor());
+    }
+
+    internal static TemporaryDirectory CreateTemporaryDirectory(string prefix, bool inheritFinalHandle = false)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(prefix);
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        var parentPath = Path.Combine(Path.GetTempPath(), "stackpivot-private");
+        var parent = OpenOrCreateAbsoluteDirectory(parentPath);
+        try
+        {
+            parent.EnsurePrivateDirectory();
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                var name = $"{prefix}{Guid.NewGuid():N}";
+                SafeDirectoryHandle? child = null;
+                try
+                {
+                    child = parent.OpenChildDirectory(name, create: true, inheritHandle: inheritFinalHandle);
+                    child.EnsurePrivateDirectory();
+                    return new TemporaryDirectory(child, parent, name, Path.Combine(parentPath, name));
+                }
+                catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryExists)
+                {
+                    child?.Dispose();
+                }
+                catch
+                {
+                    child?.Dispose();
+                    try
+                    {
+                        parent.DeleteChildDirectory(name);
+                    }
+                    catch (PathPolicyException cleanupException) when (cleanupException.ErrorNumber == LinuxPathOperations.EntryNotFound)
+                    {
+                    }
+
+                    throw;
+                }
+            }
+
+            throw new PathPolicyException("Unable to create a unique private directory.");
+        }
+        catch
+        {
+            parent.Dispose();
+            throw;
+        }
+    }
+
     public void Dispose()
     {
         Interlocked.Exchange(ref handle, null)?.Dispose();
@@ -139,6 +261,30 @@ public sealed class SafeDirectoryHandle : IDisposable
         ObjectDisposedException.ThrowIf(current is null || current.IsClosed || current.IsInvalid, this);
 
         return checked((int)current.DangerousGetHandle().ToInt64());
+    }
+}
+
+internal sealed class TemporaryDirectory(
+    SafeDirectoryHandle directory,
+    SafeDirectoryHandle parent,
+    string name,
+    string fullPath) : IDisposable
+{
+    public SafeDirectoryHandle Directory { get; } = directory;
+    public string FullPath { get; } = fullPath;
+
+    public void Dispose()
+    {
+        try
+        {
+            Directory.DeleteContents();
+            parent.DeleteChildDirectory(name);
+        }
+        finally
+        {
+            Directory.Dispose();
+            parent.Dispose();
+        }
     }
 }
 
@@ -182,7 +328,7 @@ public sealed class PathPolicy
         try
         {
             var segments = relativePath.Split('/', StringSplitOptions.None);
-            var handle = LinuxPathOperations.OpenDirectoryTree(configuredRoot, segments);
+            var handle = LinuxPathOperations.OpenDirectoryTree(configuredRoot, segments, inheritFinalHandle: true);
             return Task.FromResult(safePath with
             {
                 DirectoryHandle = new SafeDirectoryHandle(handle, safePath.FullPath)
@@ -360,29 +506,61 @@ internal static class LinuxPathOperations
     private const int OpenAppend = 0x400;
     private const int LockExclusive = 2;
     private const int LockNonBlocking = 4;
+    private const int RemoveDirectory = 0x200;
     private const uint DirectoryMode = 0x1C0;
     private const uint FileMode = 0x180;
+    private const uint PrivateDirectoryMode = 0x1C0;
 
     internal const int EntryNotFound = 2;
+    internal const int EntryExists = 17;
+    internal const int NotDirectory = 20;
+    internal const int SymbolicLinkLoop = 40;
     internal const int ResourceBusy = 11;
+
+    internal static void EnsurePrivateDirectory(int fileDescriptor)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        if (fchmod(fileDescriptor, PrivateDirectoryMode) != 0)
+        {
+            throw CreateNativeException("Unable to restrict a private directory.", Marshal.GetLastWin32Error());
+        }
+
+        var mode = File.GetUnixFileMode($"/proc/self/fd/{fileDescriptor}");
+        const UnixFileMode permissionBits = UnixFileMode.UserRead
+            | UnixFileMode.UserWrite
+            | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead
+            | UnixFileMode.GroupWrite
+            | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead
+            | UnixFileMode.OtherWrite
+            | UnixFileMode.OtherExecute;
+        if ((mode & permissionBits) != (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute))
+        {
+            throw new PathPolicyException("Private directory permissions could not be verified.");
+        }
+    }
 
     internal static SafeFileHandle OpenDirectoryTree(
         string absoluteRoot,
-        IReadOnlyList<string> relativeSegments)
+        IReadOnlyList<string> relativeSegments,
+        bool inheritFinalHandle = false)
     {
         var current = OpenRootDirectory();
         try
         {
-            foreach (var segment in GetAbsoluteSegments(absoluteRoot))
+            var allSegments = GetAbsoluteSegments(absoluteRoot).Concat(relativeSegments).ToArray();
+            for (var index = 0; index < allSegments.Length; index++)
             {
-                var next = OpenDirectoryAt(GetFileDescriptor(current), segment, create: true);
-                current.Dispose();
-                current = next;
-            }
-
-            foreach (var segment in relativeSegments)
-            {
-                var next = OpenDirectoryAt(GetFileDescriptor(current), segment, create: true);
+                var next = OpenDirectoryAt(
+                    GetFileDescriptor(current),
+                    allSegments[index],
+                    create: true,
+                    closeOnExec: !inheritFinalHandle || index != allSegments.Length - 1);
                 current.Dispose();
                 current = next;
             }
@@ -396,19 +574,29 @@ internal static class LinuxPathOperations
         }
     }
 
-    internal static SafeFileHandle OpenDirectoryAt(int parentFileDescriptor, string name, bool create)
+    internal static SafeFileHandle OpenDirectoryAt(
+        int parentFileDescriptor,
+        string name,
+        bool create,
+        bool closeOnExec = true)
     {
         ValidateSingleSegment(name, allowGitDirectory: true);
+        var openFlags = OpenReadOnly | OpenDirectory | OpenNoFollow;
+        if (closeOnExec)
+        {
+            openFlags |= OpenCloseOnExec;
+        }
+
         var fileDescriptor = openat(
             parentFileDescriptor,
             name,
-            OpenReadOnly | OpenDirectory | OpenNoFollow | OpenCloseOnExec,
+            openFlags,
             0);
         if (fileDescriptor < 0 && create && Marshal.GetLastWin32Error() == EntryNotFound)
         {
             var mkdirResult = mkdirat(parentFileDescriptor, name, DirectoryMode);
             var mkdirError = Marshal.GetLastWin32Error();
-            if (mkdirResult < 0 && mkdirError != 17)
+            if (mkdirResult < 0 && mkdirError != EntryExists)
             {
                 throw CreateNativeException("Unable to create a managed directory.", mkdirError);
             }
@@ -416,7 +604,7 @@ internal static class LinuxPathOperations
             fileDescriptor = openat(
                 parentFileDescriptor,
                 name,
-                OpenReadOnly | OpenDirectory | OpenNoFollow | OpenCloseOnExec,
+                openFlags,
                 0);
         }
 
@@ -521,12 +709,8 @@ internal static class LinuxPathOperations
                 currentFileDescriptor = GetFileDescriptor(current);
             }
 
-            var finalDescriptor = openat(
-                currentFileDescriptor,
-                segments[^1],
-                OpenReadOnly | OpenNoFollow | OpenCloseOnExec,
-                0);
-            if (finalDescriptor < 0)
+            var result = unlinkat(currentFileDescriptor, segments[^1], 0);
+            if (result < 0)
             {
                 var error = Marshal.GetLastWin32Error();
                 if (error == EntryNotFound)
@@ -534,20 +718,7 @@ internal static class LinuxPathOperations
                     return;
                 }
 
-                throw CreateNativeException("Unable to inspect a managed file before deletion.", error);
-            }
-
-            using (new SafeFileHandle((IntPtr)finalDescriptor, ownsHandle: true))
-            {
-                var result = unlinkat(currentFileDescriptor, segments[^1], 0);
-                if (result < 0)
-                {
-                    var error = Marshal.GetLastWin32Error();
-                    if (error != EntryNotFound)
-                    {
-                        throw CreateNativeException("Unable to delete a managed file.", error);
-                    }
-                }
+                throw CreateNativeException("Unable to delete a managed file.", error);
             }
         }
         catch (PathPolicyException exception) when (exception.ErrorNumber == EntryNotFound)
@@ -557,6 +728,20 @@ internal static class LinuxPathOperations
         finally
         {
             current?.Dispose();
+        }
+    }
+
+    internal static void DeleteDirectoryAt(int parentFileDescriptor, string name)
+    {
+        ValidateSingleSegment(name, allowGitDirectory: true);
+        var result = unlinkat(parentFileDescriptor, name, RemoveDirectory);
+        if (result < 0)
+        {
+            var error = Marshal.GetLastWin32Error();
+            if (error != EntryNotFound)
+            {
+                throw CreateNativeException("Unable to delete a managed directory.", error);
+            }
         }
     }
 
@@ -721,6 +906,9 @@ internal static class LinuxPathOperations
 
     [DllImport("libc", EntryPoint = "flock", SetLastError = true)]
     private static extern int flock(int fileDescriptor, int operation);
+
+    [DllImport("libc", EntryPoint = "fchmod", SetLastError = true)]
+    private static extern int fchmod(int fileDescriptor, uint mode);
     #pragma warning restore CA2101
 }
 

@@ -53,6 +53,8 @@ public sealed class StackExecutorTests
             Assert.True(result.Success);
             Assert.Equal(VersionArguments, processRunner.Requests[0].Arguments);
             Assert.Equal(UpArguments, processRunner.Requests[1].Arguments);
+            Assert.NotEqual(Path.Combine(root, "workspace_one", "stack_web"), processRunner.Requests[1].WorkingDirectory);
+            Assert.True(processRunner.SawComposeFileDuringUp);
             Assert.Equal(GitEvents, events);
             Assert.All(token, value => Assert.Equal(0, value));
         }
@@ -150,6 +152,8 @@ public sealed class StackExecutorTests
         public Task<GitCheckoutResult> MaterializeAsync(GitDeploymentInput input, CancellationToken cancellationToken)
         {
             events.Add("git");
+            Directory.CreateDirectory(input.AgentStackLocalPath);
+            File.WriteAllText(Path.Combine(input.AgentStackLocalPath, "compose.yaml"), "services: {}\n");
             return Task.FromResult(new GitCheckoutResult(true, null, Array.Empty<string>()));
         }
     }

@@ -153,6 +153,42 @@ public sealed class DeploymentEventTests
         Assert.DoesNotContain(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskSucceeded);
     }
 
+    [Theory]
+    [InlineData(false, 0, "completion_exit_code_conflict")]
+    [InlineData(false, 17, "agent_error")]
+    public async Task FailedCompletionAlwaysHasAStableErrorCode(
+        bool success,
+        int exitCode,
+        string expectedErrorCode)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+        history.DispatchedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAcceptedAsync(
+            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(
+            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, success, exitCode, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", history.TaskStatus);
+        Assert.Equal(expectedErrorCode, history.ErrorCode);
+    }
+
     [Fact]
     public async Task LogsAndCompletionBeforeAcceptanceAreIgnored()
     {

@@ -162,13 +162,35 @@ public sealed record AgentOptions(
             || candidate.AbsolutePath != "/hubs/agent"
             || candidate.Query.Length != 0
             || candidate.Fragment.Length != 0
-            || candidate.Authority.Contains('@')
-            || !string.IsNullOrEmpty(candidate.UserInfo))
+            || HasExplicitUserInfo(value!, candidate))
         {
             return false;
         }
 
         uri = candidate;
         return true;
+    }
+
+    private static bool HasExplicitUserInfo(string value, Uri uri)
+    {
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+        {
+            return true;
+        }
+
+        var schemeSeparator = value.IndexOf("://", StringComparison.Ordinal);
+        if (schemeSeparator < 0)
+        {
+            return false;
+        }
+
+        var authorityStart = schemeSeparator + 3;
+        var authorityEnd = value.IndexOfAny(['/', '?', '#'], authorityStart);
+        if (authorityEnd < 0)
+        {
+            authorityEnd = value.Length;
+        }
+
+        return value[authorityStart..authorityEnd].Contains('@', StringComparison.Ordinal);
     }
 }

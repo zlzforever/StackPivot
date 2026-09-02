@@ -84,25 +84,49 @@ public sealed class ComposeExecutor
         Func<ProcessOutputLine, ValueTask>? outputHandler = null,
         SafeDirectoryHandle? workingDirectoryHandle = null)
     {
-        var execution = await processRunner.RunAsync(
-            new ProcessRequest(
-                "docker",
-                ComposeUpArguments,
-                workingDirectory,
-                Timeout: timeout,
-                OutputHandler: outputHandler is null
-                    ? null
-                    : line => outputHandler(new ProcessOutputLine(line.Stream, sanitizer.Sanitize(line.Text))),
-                WorkingDirectoryHandle: workingDirectoryHandle),
-            cancellationToken);
-        var sanitized = Sanitize(execution);
-        var errorCode = execution.TimedOut ? "process_timeout" : execution.ExitCode == 0 ? null : "compose_failed";
-        return new ComposeExecutionResult(
-            execution.ExitCode == 0 && !execution.TimedOut,
-            execution.ExitCode,
-            sanitized.Text,
-            execution.OutputTruncated || sanitized.Truncated,
-            errorCode);
+        try
+        {
+            using var snapshot = workingDirectoryHandle is null
+                ? null
+                : ComposeWorkspaceSnapshot.Create(workingDirectoryHandle, cancellationToken);
+            var processWorkingDirectory = snapshot?.WorkingDirectory ?? workingDirectory;
+            var processWorkingDirectoryHandle = snapshot?.WorkingDirectoryHandle ?? workingDirectoryHandle;
+            var environment = snapshot is null
+                ? null
+                : new Dictionary<string, string?>
+                {
+                    ["COMPOSE_FILE"] = snapshot.ComposeFileName,
+                    ["COMPOSE_PROJECT_NAME"] = Path.GetFileName(workingDirectory.TrimEnd(Path.DirectorySeparatorChar))
+                };
+            var execution = await processRunner.RunAsync(
+                new ProcessRequest(
+                    "docker",
+                    ComposeUpArguments,
+                    processWorkingDirectory,
+                    EnvironmentVariables: environment,
+                    Timeout: timeout,
+                    OutputHandler: outputHandler is null
+                        ? null
+                        : line => outputHandler(new ProcessOutputLine(line.Stream, sanitizer.Sanitize(line.Text))),
+                    WorkingDirectoryHandle: processWorkingDirectoryHandle),
+                cancellationToken);
+            var sanitized = Sanitize(execution);
+            var errorCode = execution.TimedOut ? "process_timeout" : execution.ExitCode == 0 ? null : "compose_failed";
+            return new ComposeExecutionResult(
+                execution.ExitCode == 0 && !execution.TimedOut,
+                execution.ExitCode,
+                sanitized.Text,
+                execution.OutputTruncated || sanitized.Truncated,
+                errorCode);
+        }
+        catch (PathPolicyException)
+        {
+            return new ComposeExecutionResult(false, -1, string.Empty, false, "compose_workspace_unavailable");
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return new ComposeExecutionResult(false, -1, string.Empty, false, "compose_workspace_unavailable");
+        }
     }
 
     private LogSanitizer.SanitizedOutput Sanitize(ProcessResult result)

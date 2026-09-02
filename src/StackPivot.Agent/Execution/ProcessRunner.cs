@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.ComponentModel;
 using System.Text;
 using StackPivot.Agent.Security;
 
@@ -195,9 +196,21 @@ public sealed class ProcessRunner : IProcessRunner
 
     private static void KillProcessTree(Process process)
     {
-        if (!process.HasExited)
+        try
         {
-            process.Kill(entireProcessTree: true);
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (InvalidOperationException)
+        {
+        }
+        catch (ArgumentException)
+        {
+        }
+        catch (Win32Exception)
+        {
         }
     }
 

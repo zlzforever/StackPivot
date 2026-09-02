@@ -165,11 +165,13 @@ public sealed class DeploymentDispatcher(
         }
 
         var now = DateTimeOffset.UtcNow;
-        var completionExitCodeConflict = completed.Success && completed.ExitCode != 0;
-        var taskStatus = completed.Success && completed.ExitCode == 0 ? "success" : "failed";
-        var errorCode = completionExitCodeConflict
+        var completionIsConsistent = completed.Success == (completed.ExitCode == 0);
+        var taskStatus = completionIsConsistent && completed.Success ? "success" : "failed";
+        var errorCode = !completionIsConsistent
             ? "completion_exit_code_conflict"
-            : SanitizeErrorCode(completed.ErrorCode);
+            : taskStatus == "failed"
+                ? SanitizeErrorCode(completed.ErrorCode) ?? "agent_error"
+                : null;
         await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         var updated = await dbContext.ServiceOperationHistories
             .Where(value => value.HistoryId == history.HistoryId

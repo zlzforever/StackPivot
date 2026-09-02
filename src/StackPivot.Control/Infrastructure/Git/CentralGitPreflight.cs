@@ -159,6 +159,12 @@ public sealed class GitCommandRunner : IGitCommandRunner
         catch (InvalidOperationException)
         {
         }
+        catch (ArgumentException)
+        {
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+        }
     }
 
     private static async Task DrainAfterKillAsync(Task<string> stdoutTask, Task<string> stderrTask)
@@ -363,7 +369,10 @@ public sealed class CentralGitPreflight(
             || remote.Any(character => char.IsControl(character) || char.IsWhiteSpace(character))
             || !Uri.TryCreate(remote, UriKind.Absolute, out var uri)
             || !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
-            || !string.IsNullOrEmpty(uri.UserInfo)
+            || HasExplicitUserInfo(remote, uri)
+            || !string.IsNullOrEmpty(uri.Query)
+            || !string.IsNullOrEmpty(uri.Fragment)
+            || !uri.IsDefaultPort
             || string.IsNullOrWhiteSpace(uri.Host))
         {
             return false;
@@ -371,6 +380,29 @@ public sealed class CentralGitPreflight(
 
         host = uri.Host;
         return true;
+    }
+
+    private static bool HasExplicitUserInfo(string remote, Uri uri)
+    {
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+        {
+            return true;
+        }
+
+        var schemeSeparator = remote.IndexOf("://", StringComparison.Ordinal);
+        if (schemeSeparator < 0)
+        {
+            return false;
+        }
+
+        var authorityStart = schemeSeparator + 3;
+        var authorityEnd = remote.IndexOfAny(['/','?','#'], authorityStart);
+        if (authorityEnd < 0)
+        {
+            authorityEnd = remote.Length;
+        }
+
+        return remote[authorityStart..authorityEnd].Contains('@', StringComparison.Ordinal);
     }
 
     private async Task<GitCommandResult> RunGitAsync(

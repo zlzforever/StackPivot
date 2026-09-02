@@ -9,7 +9,7 @@ public sealed class CredentialTransportUnavailableException(string message) : Ex
 
 public sealed class InMemoryGitCredential : IDisposable
 {
-    private const uint MemfdCloseOnExec = 0x0001;
+    private const uint PrivateExecutableMode = 0x1C0;
     private SafeFileHandle? handle;
     private byte[]? token;
 
@@ -43,6 +43,12 @@ public sealed class InMemoryGitCredential : IDisposable
         var tokenCopy = accessToken.ToArray();
         try
         {
+            if (fchmod(fileDescriptor, PrivateExecutableMode) != 0
+                || !HasPrivateExecutableMode(fileDescriptor))
+            {
+                throw new IOException("Unable to set private executable permissions on the askpass program.");
+            }
+
             var script = Encoding.UTF8.GetBytes(BuildScript(userName, tokenCopy));
             RandomAccess.Write(safeHandle, script, 0);
 
@@ -84,6 +90,36 @@ public sealed class InMemoryGitCredential : IDisposable
     {
         return value.Replace("'", "'\\''", StringComparison.Ordinal);
     }
+
+    private static bool HasPrivateExecutableMode(int fileDescriptor)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+
+        try
+        {
+            var mode = File.GetUnixFileMode($"/proc/self/fd/{fileDescriptor}");
+            const UnixFileMode permissionBits = UnixFileMode.UserRead
+                | UnixFileMode.UserWrite
+                | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead
+                | UnixFileMode.GroupWrite
+                | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead
+                | UnixFileMode.OtherWrite
+                | UnixFileMode.OtherExecute;
+            return (mode & permissionBits) == (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    [DllImport("libc", EntryPoint = "fchmod", SetLastError = true)]
+    private static extern int fchmod(int fileDescriptor, uint mode);
 
     [DllImport("libc", EntryPoint = "memfd_create", SetLastError = true)]
     private static extern int memfd_create(byte[] name, uint flags);

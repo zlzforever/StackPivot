@@ -101,6 +101,9 @@ public sealed class CentralGitPreflightTests
     [Theory]
     [InlineData("http://git.example/repository.git")]
     [InlineData("https://user:password@git.example/repository.git")]
+    [InlineData("https://@git.example/repository.git")]
+    [InlineData("https://git.example/repository.git?token=secret")]
+    [InlineData("https://git.example/repository.git#fragment")]
     [InlineData("https://unknown.example/repository.git")]
     [InlineData("https://git.example/repository.git\n--upload-pack=evil")]
     public void RemotePolicyRejectsNonHttpsOrUnconfiguredHosts(string remote)

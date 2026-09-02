@@ -115,6 +115,40 @@ public sealed class AgentConfigurationTests
         });
     }
 
+    [Theory]
+    [InlineData("wss://user:password@control.example/hubs/agent")]
+    [InlineData("wss://@control.example/hubs/agent")]
+    [InlineData("wss://control.example:8443/hubs/agent")]
+    [InlineData("wss://control.example/hubs/agent?token=secret")]
+    [InlineData("wss://control.example/hubs/agent#fragment")]
+    [InlineData("wss://control.example/hubs/agent\n--header=secret")]
+    public void ControlHubUrlRejectsAuthoritySuffixesAndUnsafeCharacters(string controlHubUrl)
+    {
+        var credentialPath = CreateCredentialFile("credential-api-key");
+        try
+        {
+            AgentTestEnvironment.WithRuntimeCredentialPath(credentialPath, () =>
+            {
+                var configuration = BuildConfiguration(
+                    new Dictionary<string, string?>
+                    {
+                        ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
+                        ["STACKPIVOT_CONTROL_HUB_URL"] = controlHubUrl,
+                        ["STACKPIVOT_AGENT_WORK_ROOT"] = "/opt/agent-main"
+                    });
+
+                var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
+
+                Assert.DoesNotContain("credential-api-key", exception.ToString(), StringComparison.Ordinal);
+                Assert.Contains("STACKPIVOT_CONTROL_HUB_URL", exception.Message, StringComparison.Ordinal);
+            });
+        }
+        finally
+        {
+            DeleteCredentialFile(credentialPath);
+        }
+    }
+
     private static IConfiguration BuildConfiguration(IReadOnlyDictionary<string, string?> values) =>
         new ConfigurationBuilder()
             .AddInMemoryCollection(values)

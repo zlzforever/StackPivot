@@ -281,9 +281,10 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             }
 
             var repositoryHandle = gitDirectoryHandle!;
+            using var materializationDirectory = SafeDirectoryHandle.CreateTemporaryDirectory("git-", inheritFinalHandle: true);
             var origin = await RunAsync(
                 safePath.FullPath,
-                RepositoryArguments("remote", "get-url", "origin"),
+                RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "remote", "get-url", "origin"),
                 cancellationToken,
                 handle: repositoryHandle);
             if (origin.TimedOut)
@@ -295,7 +296,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             {
                 var addOrigin = await RunAsync(
                     safePath.FullPath,
-                    RepositoryArguments("remote", "add", "origin", input.GitRepo),
+                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "remote", "add", "origin", input.GitRepo),
                     cancellationToken,
                     handle: repositoryHandle);
                 if (addOrigin.TimedOut)
@@ -339,7 +340,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 };
                 var fetch = await RunAsync(
                     safePath.FullPath,
-                    RepositoryArguments("fetch", "--no-tags", "origin", input.TargetCommitHash),
+                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "fetch", "--no-tags", input.GitRepo, input.TargetCommitHash),
                     cancellationToken,
                     environment,
                     repositoryHandle);
@@ -355,7 +356,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
                 var verify = await RunAsync(
                     safePath.FullPath,
-                    RepositoryArguments("cat-file", "-e", $"{input.TargetCommitHash}^{{commit}}"),
+                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "cat-file", "-e", $"{input.TargetCommitHash}^{{commit}}"),
                     cancellationToken,
                     environment,
                     repositoryHandle);
@@ -371,7 +372,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
                 var tree = await RunAsync(
                     safePath.FullPath,
-                    RepositoryArguments("ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath),
+                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath),
                     cancellationToken,
                     environment,
                     repositoryHandle);
@@ -404,7 +405,6 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 try
                 {
                     oldFiles = ReadPreviousFiles(repositoryHandle);
-                    await RemoveManagedFilesAsync(directoryHandle, oldFiles, cancellationToken);
                     foreach (var file in files)
                     {
                         directoryHandle.ValidateManagedFilePath(file);
@@ -417,7 +417,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
                 var checkout = await RunAsync(
                     safePath.FullPath,
-                    RepositoryArguments("read-tree", "--reset", "-u", $"{input.TargetCommitHash}:{input.StackGitRelativePath}"),
+                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "read-tree", "--reset", "-u", $"{input.TargetCommitHash}:{input.StackGitRelativePath}"),
                     cancellationToken,
                     environment,
                     repositoryHandle);
@@ -433,6 +433,8 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
                 try
                 {
+                    await RemoveManagedFilesAsync(directoryHandle, oldFiles, cancellationToken);
+                    await CopyStagedFilesAsync(materializationDirectory.Directory, directoryHandle, files, cancellationToken);
                     WriteMetadata(
                         repositoryHandle,
                         input.TargetCommitHash,
@@ -457,9 +459,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         }
     }
 
-    private static string[] RepositoryArguments(params string[] arguments)
+    private static string[] RepositoryArguments(
+        string workTree,
+        params string[] arguments)
     {
-        return ["--git-dir=.", "--work-tree=..", .. arguments];
+        return ["--git-dir=.", $"--work-tree={workTree}", .. arguments];
     }
 
     private async Task<ProcessResult> RunAsync(
@@ -516,6 +520,21 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         return Task.CompletedTask;
     }
 
+    private static async Task CopyStagedFilesAsync(
+        SafeDirectoryHandle source,
+        SafeDirectoryHandle destination,
+        IReadOnlyList<string> files,
+        CancellationToken cancellationToken)
+    {
+        foreach (var relative in files)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var sourceFile = source.OpenFile(relative, FileMode.Open, FileAccess.Read);
+            using var destinationFile = destination.OpenFile(relative, FileMode.Create, FileAccess.Write);
+            await sourceFile.CopyToAsync(destinationFile, cancellationToken);
+        }
+    }
+
     private static void WriteMetadata(
         SafeDirectoryHandle gitDirectory,
         string commit,
@@ -549,8 +568,34 @@ public static class CentralRemotePolicy
             && !remote.Any(character => char.IsControl(character) || char.IsWhiteSpace(character))
             && Uri.TryCreate(remote, UriKind.Absolute, out var uri)
             && string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
-            && string.IsNullOrEmpty(uri.UserInfo)
+            && !HasExplicitUserInfo(remote, uri)
+            && string.IsNullOrEmpty(uri.Query)
+            && string.IsNullOrEmpty(uri.Fragment)
+            && uri.IsDefaultPort
             && !string.IsNullOrWhiteSpace(uri.Host)
             && (allowedHosts is null || allowedHosts.Contains(uri.Host));
+    }
+
+    private static bool HasExplicitUserInfo(string remote, Uri uri)
+    {
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+        {
+            return true;
+        }
+
+        var schemeSeparator = remote.IndexOf("://", StringComparison.Ordinal);
+        if (schemeSeparator < 0)
+        {
+            return false;
+        }
+
+        var authorityStart = schemeSeparator + 3;
+        var authorityEnd = remote.IndexOfAny(['/','?','#'], authorityStart);
+        if (authorityEnd < 0)
+        {
+            authorityEnd = remote.Length;
+        }
+
+        return remote[authorityStart..authorityEnd].Contains('@', StringComparison.Ordinal);
     }
 }

@@ -60,6 +60,17 @@ public sealed class GitTreePolicyTests
             new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example" }));
     }
 
+    [Theory]
+    [InlineData("https://@git.example/repository.git")]
+    [InlineData("https://git.example/repository.git?token=secret")]
+    [InlineData("https://git.example/repository.git#fragment")]
+    public void RemoteHostPolicyRejectsExplicitAuthorityAndUrlSuffixes(string remote)
+    {
+        Assert.False(CentralRemotePolicy.IsAllowed(
+            remote,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example" }));
+    }
+
     [SkippableFact]
     public async Task MaterializationUsesReadTreeAndClearsTheCredentialBuffer()
     {
@@ -83,10 +94,11 @@ public sealed class GitTreePolicyTests
                 CancellationToken.None);
 
             Assert.True(result.Success, result.ErrorCode);
-            Assert.Contains(runner.Requests, request => request.Arguments.SequenceEqual(new[]
-            {
-                "--git-dir=.", "--work-tree=..", "read-tree", "--reset", "-u", "0123456789abcdef0123456789abcdef01234567:workspace_one/stack_web"
-            }));
+            Assert.Contains(runner.Requests, request => request.Arguments.Contains("read-tree")
+                && request.Arguments.Contains("--reset")
+                && request.Arguments.Contains("0123456789abcdef0123456789abcdef01234567:workspace_one/stack_web")
+                && request.Arguments.Any(argument => argument.StartsWith("--work-tree=", StringComparison.Ordinal)
+                    && argument.StartsWith("--work-tree=/proc/self/fd/", StringComparison.Ordinal)));
             Assert.DoesNotContain(runner.Requests, request => request.Arguments.Contains("checkout"));
             var repositoryRequests = runner.Requests
                 .Where(request => !request.Arguments.Contains("init"))
@@ -96,8 +108,12 @@ public sealed class GitTreePolicyTests
             {
                 Assert.NotNull(request.WorkingDirectoryHandle);
                 Assert.Contains("--git-dir=.", request.Arguments);
-                Assert.Contains("--work-tree=..", request.Arguments);
+                Assert.DoesNotContain("--work-tree=..", request.Arguments);
+                Assert.Contains(request.Arguments, argument => argument.StartsWith("--work-tree=/proc/self/fd/", StringComparison.Ordinal));
             });
+            var fetch = Assert.Single(runner.Requests, request => request.Arguments.Contains("fetch"));
+            Assert.Contains("https://git.example/repository.git", fetch.Arguments);
+            Assert.DoesNotContain("origin", fetch.Arguments);
             Assert.True(File.Exists(Path.Combine(root, "workspace_one", "stack_web", "compose.yaml")));
             Assert.True(File.Exists(Path.Combine(root, "workspace_one", "stack_web", ".git", "stackpivot-checkout.json")));
             Assert.All(token, value => Assert.Equal(0, value));
@@ -121,7 +137,17 @@ public sealed class GitTreePolicyTests
 
         using var credential = InMemoryGitCredential.Create("git-user", "secret"u8.ToArray());
 
-        Assert.True(File.GetUnixFileMode(credential.AskpassPath).HasFlag(UnixFileMode.UserExecute));
+        var mode = File.GetUnixFileMode(credential.AskpassPath);
+        const UnixFileMode permissionBits = UnixFileMode.UserRead
+            | UnixFileMode.UserWrite
+            | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead
+            | UnixFileMode.GroupWrite
+            | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead
+            | UnixFileMode.OtherWrite
+            | UnixFileMode.OtherExecute;
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, mode & permissionBits);
     }
 
     [SkippableFact]
@@ -351,6 +377,57 @@ public sealed class GitTreePolicyTests
     }
 
     [SkippableFact]
+    public async Task MaterializationWritesThroughTheOpenedDirectoryAfterThePathIsReplaced()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-race-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var originalPath = Path.Combine(root, "workspace_one", "stack_web-original");
+        var outside = Path.Combine(Path.GetTempPath(), "stackpivot-git-race-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stackPath);
+        Directory.CreateDirectory(outside);
+        var runner = new MaterializationRunner
+        {
+            BeforeReadTree = _ =>
+            {
+                Directory.Move(stackPath, originalPath);
+                Directory.CreateSymbolicLink(stackPath, outside);
+            }
+        };
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.True(result.Success, result.ErrorCode);
+            Assert.True(File.Exists(Path.Combine(originalPath, "compose.yaml")));
+            Assert.False(File.Exists(Path.Combine(outside, "compose.yaml")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+
+            if (Directory.Exists(outside))
+            {
+                Directory.Delete(outside, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task NestedSymlinkInIncomingTreeIsRejectedBeforeReadTree()
     {
         TestPlatform.RequireLinux();
@@ -493,6 +570,7 @@ public sealed class GitTreePolicyTests
         string? timeoutCommand = null) : IProcessRunner
     {
         public List<ProcessRequest> Requests { get; } = new();
+        public Action<ProcessRequest>? BeforeReadTree { get; init; }
         private string? TimeoutCommand { get; } = timeoutCommand;
         public ProcessResult TreeResult { get; init; } = new(
             0,
@@ -530,7 +608,11 @@ public sealed class GitTreePolicyTests
                         return Task.FromResult(new ProcessResult(-1, string.Empty, string.Empty, TimedOut: true));
                     }
 
-                    File.WriteAllText(Path.Combine(request.WorkingDirectory, "compose.yaml"), "services: {}");
+                    BeforeReadTree?.Invoke(request);
+                    var workTree = request.Arguments
+                        .Single(argument => argument.StartsWith("--work-tree=", StringComparison.Ordinal))["--work-tree=".Length..];
+                    Directory.CreateDirectory(workTree);
+                    File.WriteAllText(Path.Combine(workTree, "compose.yaml"), "services: {}");
                     return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
                 default:
                     return Task.FromResult(new ProcessResult(1, string.Empty, string.Empty));
