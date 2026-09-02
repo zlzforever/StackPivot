@@ -14,23 +14,25 @@ public sealed class AgentConfigurationTests
         var credentialPath = CreateCredentialFile("credential-api-key\n");
         try
         {
-            var configuration = BuildConfiguration(
-                new Dictionary<string, string?>
-                {
-                    ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
-                    ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
-                    ["STACKPIVOT_AGENT_WORK_ROOT"] = "/opt/agent-main",
-                    ["STACKPIVOT_AGENT_API_KEY_FILE"] = credentialPath,
-                    ["StackPivot:ApiKey"] = "inline-value-must-not-win"
-                });
+            AgentTestEnvironment.WithRuntimeCredentialPath(credentialPath, () =>
+            {
+                var configuration = BuildConfiguration(
+                    new Dictionary<string, string?>
+                    {
+                        ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
+                        ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
+                        ["STACKPIVOT_AGENT_WORK_ROOT"] = "/opt/agent-main",
+                        ["StackPivot:ApiKey"] = "inline-value-must-not-win"
+                    });
 
-            var options = AgentOptions.FromConfiguration(configuration);
+                var options = AgentOptions.FromConfiguration(configuration);
 
-            Assert.Equal(AgentId, options.AgentId);
-            Assert.Equal("wss://control.example/hubs/agent", options.ControlHubUrl);
-            Assert.Equal("/opt/agent-main", options.AgentRoot);
-            Assert.Equal("credential-api-key", options.ApiKey);
-            Assert.DoesNotContain("inline-value-must-not-win", options.ApiKey, StringComparison.Ordinal);
+                Assert.Equal(AgentId, options.AgentId);
+                Assert.Equal("wss://control.example/hubs/agent", options.ControlHubUrl);
+                Assert.Equal("/opt/agent-main", options.AgentRoot);
+                Assert.Equal("credential-api-key", options.ApiKey);
+                Assert.DoesNotContain("inline-value-must-not-win", options.ApiKey, StringComparison.Ordinal);
+            });
         }
         finally
         {
@@ -43,19 +45,22 @@ public sealed class AgentConfigurationTests
     {
         const string secret = "inline-secret-must-not-appear";
         var missingPath = Path.Combine(Path.GetTempPath(), "stackpivot-agent-missing-" + Guid.NewGuid().ToString("N"));
-        var configuration = BuildConfiguration(
-            new Dictionary<string, string?>
-            {
-                ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
-                ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
-                ["STACKPIVOT_AGENT_API_KEY_FILE"] = missingPath,
-                ["StackPivot:ApiKey"] = secret
-            });
+        AgentTestEnvironment.WithRuntimeCredentialPath(null, () =>
+        {
+            var configuration = BuildConfiguration(
+                new Dictionary<string, string?>
+                {
+                    ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
+                    ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
+                    ["StackPivot:ApiKeyFile"] = missingPath,
+                    ["StackPivot:ApiKey"] = secret
+                });
 
-        var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
+            var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
 
-        Assert.DoesNotContain(secret, exception.ToString(), StringComparison.Ordinal);
-        Assert.Contains("STACKPIVOT_AGENT_API_KEY_FILE", exception.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, exception.ToString(), StringComparison.Ordinal);
+            Assert.Contains("STACKPIVOT_AGENT_API_KEY_FILE", exception.Message, StringComparison.Ordinal);
+        });
     }
 
     [Theory]
@@ -67,20 +72,22 @@ public sealed class AgentConfigurationTests
         var credentialPath = CreateCredentialFile(contents);
         try
         {
-            var configuration = BuildConfiguration(
-                new Dictionary<string, string?>
-                {
-                    ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
-                    ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
-                    ["STACKPIVOT_AGENT_API_KEY_FILE"] = credentialPath
-                });
-
-            var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
-
-            if (!string.IsNullOrEmpty(contents))
+            AgentTestEnvironment.WithRuntimeCredentialPath(credentialPath, () =>
             {
-                Assert.DoesNotContain(contents, exception.ToString(), StringComparison.Ordinal);
-            }
+                var configuration = BuildConfiguration(
+                    new Dictionary<string, string?>
+                    {
+                        ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
+                        ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent"
+                    });
+
+                var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
+
+                if (!string.IsNullOrEmpty(contents))
+                {
+                    Assert.DoesNotContain(contents, exception.ToString(), StringComparison.Ordinal);
+                }
+            });
         }
         finally
         {
@@ -89,21 +96,23 @@ public sealed class AgentConfigurationTests
     }
 
     [Fact]
-    public void InlineApiKeyRequiresExplicitOptIn()
+    public void InlineApiKeyNeverEnablesAgent()
     {
-        var configuration = BuildConfiguration(
-            new Dictionary<string, string?>
-            {
-                ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
-                ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
-                ["StackPivot:ApiKey"] = "development-api-key"
-            });
+        AgentTestEnvironment.WithRuntimeCredentialPath(null, () =>
+        {
+            var configuration = BuildConfiguration(
+                new Dictionary<string, string?>
+                {
+                    ["STACKPIVOT_AGENT_ID"] = AgentId.ToString(),
+                    ["STACKPIVOT_CONTROL_HUB_URL"] = "wss://control.example/hubs/agent",
+                    ["StackPivot:ApiKey"] = "development-api-key"
+                });
 
-        var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
-        var options = AgentOptions.FromConfiguration(configuration, allowInlineApiKey: true);
+            var exception = Assert.Throws<InvalidOperationException>(() => AgentOptions.FromConfiguration(configuration));
 
-        Assert.DoesNotContain("development-api-key", exception.ToString(), StringComparison.Ordinal);
-        Assert.Equal("development-api-key", options.ApiKey);
+            Assert.DoesNotContain("development-api-key", exception.ToString(), StringComparison.Ordinal);
+            Assert.Contains("STACKPIVOT_AGENT_API_KEY_FILE", exception.Message, StringComparison.Ordinal);
+        });
     }
 
     private static IConfiguration BuildConfiguration(IReadOnlyDictionary<string, string?> values) =>

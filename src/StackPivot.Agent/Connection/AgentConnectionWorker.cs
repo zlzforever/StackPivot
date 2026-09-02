@@ -21,7 +21,10 @@ public sealed partial class AgentConnectionWorker : BackgroundService
         ILogger<AgentConnectionWorker> logger)
     {
         this.options = options;
-        taskCoordinator = new AgentTaskCoordinator(options.AgentId, executor);
+        taskCoordinator = new AgentTaskCoordinator(
+            options.AgentId,
+            executor,
+            Path.Combine(options.AgentRoot, ".stackpivot-locks"));
         this.logger = logger;
     }
 

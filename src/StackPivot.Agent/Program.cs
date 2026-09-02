@@ -9,9 +9,7 @@ if (!OperatingSystem.IsLinux())
 }
 
 var builder = Host.CreateApplicationBuilder(args);
-var agentOptions = AgentOptions.FromConfiguration(
-    builder.Configuration,
-    allowInlineApiKey: builder.Environment.IsDevelopment());
+var agentOptions = AgentOptions.FromConfiguration(builder.Configuration);
 builder.Services.AddSingleton(agentOptions);
 builder.Services.AddSingleton<PathPolicy>(services => new PathPolicy(services.GetRequiredService<AgentOptions>().AgentRoot));
 builder.Services.AddSingleton<IProcessRunner, ProcessRunner>();

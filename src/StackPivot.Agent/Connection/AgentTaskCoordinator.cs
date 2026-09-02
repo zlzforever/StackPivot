@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using StackPivot.Agent.Execution;
 using StackPivot.Contracts.Agents;
 using StackPivot.Contracts.Deployments;
@@ -17,10 +19,14 @@ public sealed class AgentTaskCoordinator
 {
     private readonly Guid agentId;
     private readonly IStackExecutor executor;
+    private readonly string stackLockDirectory;
     private readonly ConcurrentDictionary<Guid, Lazy<Task<AgentExecutionResult>>> activeTasks = new();
     private readonly ConcurrentDictionary<Guid, AgentExecutionResult> completedTasks = new();
 
-    public AgentTaskCoordinator(Guid agentId, IStackExecutor executor)
+    public AgentTaskCoordinator(
+        Guid agentId,
+        IStackExecutor executor,
+        string? stackLockDirectory = null)
     {
         if (agentId == Guid.Empty)
         {
@@ -29,6 +35,8 @@ public sealed class AgentTaskCoordinator
 
         this.agentId = agentId;
         this.executor = executor ?? throw new ArgumentNullException(nameof(executor));
+        this.stackLockDirectory = stackLockDirectory
+            ?? Path.Combine(Path.GetTempPath(), "stackpivot-agent-locks");
     }
 
     public async Task HandleAsync(
@@ -64,39 +72,52 @@ public sealed class AgentTaskCoordinator
         IAgentTaskReporter reporter,
         CancellationToken cancellationToken)
     {
-        AgentExecutionResult result;
         try
         {
-            await reporter.ReportAcceptedAsync(
-                new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
-                cancellationToken);
-            result = await ExecuteAndStreamAsync(command, reporter, cancellationToken);
+            var lockResult = StackDeploymentLease.TryAcquire(command.AgentStackLocalPath, stackLockDirectory);
+            if (!lockResult.Acquired)
+            {
+                var failure = new AgentExecutionResult(false, -1, string.Empty, false, lockResult.ErrorCode);
+                completedTasks[command.TaskId] = failure;
+                await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
+                return failure;
+            }
 
-            completedTasks[command.TaskId] = result;
-            await reporter.ReportCompletedAsync(CreateCompleted(command, result), cancellationToken);
-            return result;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            result = new AgentExecutionResult(false, -1, string.Empty, false, "agent_execution_failed");
-            completedTasks[command.TaskId] = result;
+            await using var stackLease = lockResult.Lease!;
+            AgentExecutionResult result;
             try
             {
-                await reporter.ReportCompletedAsync(CreateCompleted(command, result), CancellationToken.None);
+                await reporter.ReportAcceptedAsync(
+                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    cancellationToken);
+                result = await ExecuteAndStreamAsync(command, reporter, cancellationToken);
+
+                completedTasks[command.TaskId] = result;
+                await reporter.ReportCompletedAsync(CreateCompleted(command, result), cancellationToken);
+                return result;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
+                throw;
             }
             catch
             {
-                // The connection can close while reporting a failed task.
-            }
+                result = new AgentExecutionResult(false, -1, string.Empty, false, "agent_execution_failed");
+                completedTasks[command.TaskId] = result;
+                try
+                {
+                    await reporter.ReportCompletedAsync(CreateCompleted(command, result), CancellationToken.None);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch
+                {
+                    // The connection can close while reporting a failed task.
+                }
 
-            return result;
+                return result;
+            }
         }
         finally
         {
@@ -194,5 +215,74 @@ public sealed class AgentTaskCoordinator
             result.ErrorCode,
             DateTimeOffset.UtcNow,
             result.LogTruncated);
+    }
+
+    private sealed class StackDeploymentLease : IAsyncDisposable
+    {
+        private readonly FileStream stream;
+
+        private StackDeploymentLease(FileStream stream)
+        {
+            this.stream = stream;
+        }
+
+        public static LeaseResult TryAcquire(string? stackPath, string lockDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(stackPath))
+            {
+                return new LeaseResult(false, null, "invalid_path");
+            }
+
+            string normalizedPath;
+            try
+            {
+                normalizedPath = Path.GetFullPath(stackPath);
+            }
+            catch (ArgumentException)
+            {
+                return new LeaseResult(false, null, "invalid_path");
+            }
+
+            try
+            {
+                Directory.CreateDirectory(lockDirectory);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                return new LeaseResult(false, null, "stack_lock_unavailable");
+            }
+
+            var pathBytes = Encoding.UTF8.GetBytes(normalizedPath);
+            var lockName = Convert.ToHexString(SHA256.HashData(pathBytes)) + ".lock";
+            CryptographicOperations.ZeroMemory(pathBytes);
+            var lockPath = Path.Combine(lockDirectory, lockName);
+            try
+            {
+                var stream = new FileStream(
+                    lockPath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    options: FileOptions.SequentialScan);
+                return new LeaseResult(true, new StackDeploymentLease(stream), null);
+            }
+            catch (IOException)
+            {
+                return new LeaseResult(false, null, "stack_busy");
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                return new LeaseResult(false, null, "stack_lock_unavailable");
+            }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            stream.Dispose();
+            return ValueTask.CompletedTask;
+        }
+
+        public sealed record LeaseResult(bool Acquired, StackDeploymentLease? Lease, string? ErrorCode);
     }
 }

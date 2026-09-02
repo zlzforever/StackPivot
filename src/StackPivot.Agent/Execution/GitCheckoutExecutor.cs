@@ -458,14 +458,10 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
 public static class CentralRemotePolicy
 {
-    public static bool IsAllowed(string? remote)
-    {
-        return IsAllowed(remote, null);
-    }
-
     public static bool IsAllowed(string? remote, IReadOnlySet<string>? allowedHosts)
     {
-        return !string.IsNullOrWhiteSpace(remote)
+        return allowedHosts is { Count: > 0 }
+            && !string.IsNullOrWhiteSpace(remote)
             && !remote.Any(character => char.IsControl(character) || char.IsWhiteSpace(character))
             && Uri.TryCreate(remote, UriKind.Absolute, out var uri)
             && string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)

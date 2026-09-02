@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using StackPivot.Control.Domain.Entities;
 using StackPivot.Control.Infrastructure.Persistence;
 using StackPivot.Contracts.SignalR;
@@ -229,11 +230,28 @@ public sealed class GitCommandRunner : IGitCommandRunner
 
 public sealed class CentralGitOptions
 {
+    public const string AllowedRemoteHostsEnvironmentVariable = "STACKPIVOT_ALLOWED_REMOTE_HOSTS";
+    public const string ControlAllowedRemoteHostsEnvironmentVariable = "STACKPIVOT_CONTROL_ALLOWED_REMOTE_HOSTS";
+
     public string MainRoot { get; init; } = "/opt/main";
     public IReadOnlySet<string> AllowedRemoteHosts { get; init; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public bool RejectSensitiveEnv { get; init; } = true;
     public TimeSpan CommandTimeout { get; init; } = TimeSpan.FromMinutes(2);
     public int MaxOutputBytes { get; init; } = 1024 * 1024;
+
+    public static HashSet<string> ReadAllowedRemoteHosts(IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var value = Environment.GetEnvironmentVariable(AllowedRemoteHostsEnvironmentVariable)
+            ?? configuration[AllowedRemoteHostsEnvironmentVariable]
+            ?? Environment.GetEnvironmentVariable(ControlAllowedRemoteHostsEnvironmentVariable)
+            ?? configuration[ControlAllowedRemoteHostsEnvironmentVariable]
+            ?? configuration["CentralGit:AllowedRemoteHosts"];
+        return (value ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
 }
 
 public interface ICentralGitPreflight
@@ -271,7 +289,10 @@ public sealed class CentralGitPreflight(
 
         var setting = await dbContext.GlobalGitSettings
             .SingleOrDefaultAsync(value => value.Id == 1, cancellationToken);
-        if (setting is null || !IsAllowedRemote(setting.GitRepo, options.AllowedRemoteHosts))
+        var allowedHosts = setting is null
+            ? null
+            : ResolveAllowedRemoteHosts(setting.GitRepo, options.AllowedRemoteHosts);
+        if (setting is null || !IsAllowedRemote(setting.GitRepo, allowedHosts))
         {
             throw new DeploymentValidationException("policy_violation", "Git remote is not allowed.");
         }
@@ -326,16 +347,36 @@ public sealed class CentralGitPreflight(
             setting.TokenKeyId);
     }
 
-    public static bool IsAllowedRemote(string? remote, IReadOnlySet<string> allowedHosts)
+    public static bool IsAllowedRemote(string? remote, IReadOnlySet<string>? allowedHosts)
     {
-        ArgumentNullException.ThrowIfNull(allowedHosts);
-        if (string.IsNullOrWhiteSpace(remote)
-            || remote.Any(character => char.IsControl(character) || char.IsWhiteSpace(character)))
+        if (allowedHosts is null || !TryGetHttpsRemoteHost(remote, out var host))
         {
             return false;
         }
 
-        if (!Uri.TryCreate(remote, UriKind.Absolute, out var uri)
+        return allowedHosts.Contains(host);
+    }
+
+    private static IReadOnlySet<string>? ResolveAllowedRemoteHosts(
+        string remote,
+        IReadOnlySet<string>? configuredHosts)
+    {
+        if (configuredHosts is { Count: > 0 })
+        {
+            return configuredHosts;
+        }
+
+        return TryGetHttpsRemoteHost(remote, out var host)
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase) { host }
+            : null;
+    }
+
+    private static bool TryGetHttpsRemoteHost(string? remote, out string host)
+    {
+        host = string.Empty;
+        if (string.IsNullOrWhiteSpace(remote)
+            || remote.Any(character => char.IsControl(character) || char.IsWhiteSpace(character))
+            || !Uri.TryCreate(remote, UriKind.Absolute, out var uri)
             || !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
             || !string.IsNullOrEmpty(uri.UserInfo)
             || string.IsNullOrWhiteSpace(uri.Host))
@@ -343,7 +384,8 @@ public sealed class CentralGitPreflight(
             return false;
         }
 
-        return allowedHosts.Contains(uri.Host);
+        host = uri.Host;
+        return true;
     }
 
     private async Task<GitCommandResult> RunGitAsync(

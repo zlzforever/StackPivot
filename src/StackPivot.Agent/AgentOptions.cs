@@ -12,12 +12,12 @@ public sealed record AgentOptions(
 {
     public const string DefaultAgentRoot = "/opt/agent-main";
     public const string ApiKeyFileEnvironmentVariable = "STACKPIVOT_AGENT_API_KEY_FILE";
+    public const string AllowedRemoteHostsEnvironmentVariable = "STACKPIVOT_AGENT_ALLOWED_REMOTE_HOSTS";
+    public const string SharedAllowedRemoteHostsEnvironmentVariable = "STACKPIVOT_ALLOWED_REMOTE_HOSTS";
 
-    public IReadOnlySet<string>? AllowedRemoteHosts { get; init; }
+    public IReadOnlySet<string> AllowedRemoteHosts { get; init; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    public static AgentOptions FromConfiguration(
-        IConfiguration configuration,
-        bool allowInlineApiKey = false)
+    public static AgentOptions FromConfiguration(IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
@@ -28,10 +28,10 @@ public sealed record AgentOptions(
         }
 
         var controlHubUrl = ReadValue(configuration, "STACKPIVOT_CONTROL_HUB_URL", "StackPivot:ControlHubUrl");
-        if (!Uri.TryCreate(controlHubUrl, UriKind.Absolute, out var hubUri)
-            || !string.Equals(hubUri.Scheme, Uri.UriSchemeWss, StringComparison.OrdinalIgnoreCase))
+        if (!IsValidControlHubUrl(controlHubUrl, out _))
         {
-            throw new InvalidOperationException("STACKPIVOT_CONTROL_HUB_URL is required and must use wss.");
+            throw new InvalidOperationException(
+                "STACKPIVOT_CONTROL_HUB_URL is required and must be wss on port 443 at /hubs/agent.");
         }
 
         var agentRoot = ReadValue(configuration, "STACKPIVOT_AGENT_WORK_ROOT", "StackPivot:AgentRoot")
@@ -41,10 +41,8 @@ public sealed record AgentOptions(
             throw new InvalidOperationException("STACKPIVOT_AGENT_WORK_ROOT must be /opt/agent-main.");
         }
 
-        var apiKey = ReadApiKey(configuration, allowInlineApiKey);
-        var allowedRemoteHosts = (configuration["StackPivot:AllowedRemoteHosts"] ?? string.Empty)
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var apiKey = ReadApiKey();
+        var allowedRemoteHosts = ReadAllowedRemoteHosts(configuration);
         return new AgentOptions(agentId, controlHubUrl!, apiKey, agentRoot)
         {
             AllowedRemoteHosts = allowedRemoteHosts
@@ -61,20 +59,15 @@ public sealed record AgentOptions(
             ?? configuration[configurationKey];
     }
 
-    private static string ReadApiKey(IConfiguration configuration, bool allowInlineApiKey)
+    private static string ReadApiKey()
     {
-        var credentialPath = ReadValue(configuration, ApiKeyFileEnvironmentVariable, "StackPivot:ApiKeyFile");
-        if (credentialPath is not null)
-        {
-            return ReadCredentialFile(credentialPath);
-        }
-
-        if (!allowInlineApiKey)
+        var credentialPath = Environment.GetEnvironmentVariable(ApiKeyFileEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(credentialPath))
         {
             throw new InvalidOperationException($"{ApiKeyFileEnvironmentVariable} is required.");
         }
 
-        return ValidateApiKey(configuration["StackPivot:ApiKey"]);
+        return ReadCredentialFile(credentialPath);
     }
 
     private static string ReadCredentialFile(string path)
@@ -141,4 +134,41 @@ public sealed record AgentOptions(
             or (>= '0' and <= '9')
             or '-'
             or '_';
+
+    private static HashSet<string> ReadAllowedRemoteHosts(IConfiguration configuration)
+    {
+        var value = Environment.GetEnvironmentVariable(SharedAllowedRemoteHostsEnvironmentVariable)
+            ?? configuration[SharedAllowedRemoteHostsEnvironmentVariable]
+            ?? Environment.GetEnvironmentVariable(AllowedRemoteHostsEnvironmentVariable)
+            ?? configuration[AllowedRemoteHostsEnvironmentVariable]
+            ?? configuration["StackPivot:AllowedRemoteHosts"];
+        return (value ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsValidControlHubUrl(string? value, out Uri? uri)
+    {
+        uri = null;
+        if (string.IsNullOrWhiteSpace(value)
+            || value.Any(character => char.IsControl(character) || char.IsWhiteSpace(character))
+            || value.Contains('?')
+            || value.Contains('#')
+            || !Uri.TryCreate(value, UriKind.Absolute, out var candidate)
+            || !candidate.IsAbsoluteUri
+            || !string.Equals(candidate.Scheme, Uri.UriSchemeWss, StringComparison.OrdinalIgnoreCase)
+            || candidate.Port != 443
+            || string.IsNullOrWhiteSpace(candidate.Host)
+            || candidate.AbsolutePath != "/hubs/agent"
+            || candidate.Query.Length != 0
+            || candidate.Fragment.Length != 0
+            || candidate.Authority.Contains('@')
+            || !string.IsNullOrEmpty(candidate.UserInfo))
+        {
+            return false;
+        }
+
+        uri = candidate;
+        return true;
+    }
 }

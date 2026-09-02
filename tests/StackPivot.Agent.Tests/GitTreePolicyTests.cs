@@ -9,6 +9,9 @@ namespace StackPivot.Agent.Tests;
 
 public sealed class GitTreePolicyTests
 {
+    private static readonly IReadOnlySet<string> AllowedRemoteHosts =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example" };
+
     [Fact]
     public void SensitiveEnvInAnySubdirectoryIsRejected()
     {
@@ -64,7 +67,7 @@ public sealed class GitTreePolicyTests
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner();
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
         var token = "secret"u8.ToArray();
 
         try
@@ -118,7 +121,7 @@ public sealed class GitTreePolicyTests
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(treeOutputTruncated: true);
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
         var token = "secret"u8.ToArray();
 
         try
@@ -159,7 +162,7 @@ public sealed class GitTreePolicyTests
                 "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
                 "tree failed")
         };
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
         var token = "secret"u8.ToArray();
 
         try
@@ -192,7 +195,7 @@ public sealed class GitTreePolicyTests
     {
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(timeoutCommand: "init");
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
         var token = "secret"u8.ToArray();
 
         try
@@ -224,7 +227,7 @@ public sealed class GitTreePolicyTests
     {
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(timeoutCommand: "remote_add");
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
         var token = "secret"u8.ToArray();
 
         try
@@ -265,7 +268,7 @@ public sealed class GitTreePolicyTests
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(timeoutCommand: timeoutCommand);
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
         var token = "secret"u8.ToArray();
 
         try
@@ -307,7 +310,7 @@ public sealed class GitTreePolicyTests
             JsonSerializer.Serialize(new { commit = "old", path = "workspace_one/stack_web", files = new[] { "stale.txt" } }));
 
         var runner = new MaterializationRunner();
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
 
         try
         {
@@ -353,7 +356,7 @@ public sealed class GitTreePolicyTests
                 + "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/config/data.txt\n",
                 string.Empty)
         };
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
 
         try
         {
@@ -393,7 +396,7 @@ public sealed class GitTreePolicyTests
             Path.Combine(gitPath, "stackpivot-checkout.json"),
             Path.Combine(root, "missing-metadata"));
         var runner = new MaterializationRunner();
-        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
 
         try
         {

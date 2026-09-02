@@ -33,13 +33,10 @@ builder.Services.AddScoped<AgentApiKeyAuthenticationService>();
 builder.Services.AddScoped<ISsoIdentityAdapter, HttpContextSsoIdentityAdapter>();
 builder.Services.AddScoped<IUserIdentityService, UserIdentityService>();
 builder.Services.AddScoped<WorkspaceAuthorizationService>();
-var allowedHosts = (builder.Configuration["CentralGit:AllowedRemoteHosts"] ?? string.Empty)
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-    .ToHashSet(StringComparer.OrdinalIgnoreCase);
 builder.Services.AddSingleton(new CentralGitOptions
 {
     MainRoot = builder.Configuration["CentralGit:MainRoot"] ?? "/opt/main",
-    AllowedRemoteHosts = allowedHosts,
+    AllowedRemoteHosts = CentralGitOptions.ReadAllowedRemoteHosts(builder.Configuration),
     RejectSensitiveEnv = !bool.TryParse(builder.Configuration["CentralGit:AllowSensitiveEnv"], out var allowSensitiveEnv) || !allowSensitiveEnv
 });
 var gitKeyText = builder.Configuration["GitCredential:Key"]

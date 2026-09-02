@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using StackPivot.Control.Domain.Entities;
 using StackPivot.Control.Infrastructure.Git;
 using StackPivot.Control.Infrastructure.Persistence;
@@ -11,6 +12,90 @@ public sealed class CentralGitPreflightTests
 {
     private static readonly string[] ExpectedCatFile = ["cat-file", "-e", "0123456789abcdef0123456789abcdef01234567^{commit}"];
     private static readonly string[] ExpectedLsTree = ["ls-tree", "-r", "--name-only", "0123456789abcdef0123456789abcdef01234567", "--", "workspace_one/stack_web"];
+
+    [Fact]
+    public void AllowedRemoteHostsReadFromAnExplicitNonSensitiveEnvironmentSetting()
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                [CentralGitOptions.AllowedRemoteHostsEnvironmentVariable] = "git.example, mirror.example"
+            })
+            .Build();
+
+        var hosts = CentralGitOptions.ReadAllowedRemoteHosts(configuration);
+
+        Assert.Equal(
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example", "mirror.example" },
+            hosts);
+    }
+
+    [Fact]
+    public async Task EmptyAllowlistUsesOnlyTheConfiguredDatabaseRemoteHost()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var workspace = new Workspace { WorkspaceId = Guid.NewGuid(), Name = "workspace_one", DisplayName = "Workspace" };
+        var stack = new Stack { StackId = Guid.NewGuid(), WorkspaceId = workspace.WorkspaceId, FolderName = "stack_web", DisplayName = "Web" };
+        db.AddRange(workspace, stack, new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = "ciphertext",
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        var runner = new RecordingGitRunner(
+            new GitCommandResult(0, string.Empty, string.Empty),
+            new GitCommandResult(0, "workspace_one/stack_web/compose.yaml\n", string.Empty));
+        var preflight = new CentralGitPreflight(db, runner, new CentralGitOptions
+        {
+            MainRoot = "/opt/main"
+        });
+
+        var result = await preflight.ValidateAsync(
+            stack.StackId,
+            "0123456789abcdef0123456789abcdef01234567",
+            CancellationToken.None);
+
+        Assert.Equal("https://git.example/repository.git", result.GitRepo);
+    }
+
+    [Fact]
+    public async Task EmptyAllowlistDoesNotTurnAnInvalidDatabaseRemoteIntoAnAllowedRemote()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var workspace = new Workspace { WorkspaceId = Guid.NewGuid(), Name = "workspace_one", DisplayName = "Workspace" };
+        var stack = new Stack { StackId = Guid.NewGuid(), WorkspaceId = workspace.WorkspaceId, FolderName = "stack_web", DisplayName = "Web" };
+        db.AddRange(workspace, stack, new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "http://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = "ciphertext",
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        var preflight = new CentralGitPreflight(db, new RecordingGitRunner(), new CentralGitOptions
+        {
+            MainRoot = "/opt/main"
+        });
+
+        var exception = await Assert.ThrowsAsync<DeploymentValidationException>(() => preflight.ValidateAsync(
+            stack.StackId,
+            "0123456789abcdef0123456789abcdef01234567",
+            CancellationToken.None));
+
+        Assert.Equal("policy_violation", exception.Code);
+    }
 
     [Theory]
     [InlineData("http://git.example/repository.git")]
