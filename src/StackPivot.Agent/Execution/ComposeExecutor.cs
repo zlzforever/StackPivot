@@ -52,7 +52,17 @@ public sealed class ComposeExecutor
             new ProcessRequest("docker", ComposeVersionArguments, workingDirectory, Timeout: timeout),
             cancellationToken);
         var sanitized = Sanitize(version);
-        if (version.TimedOut || version.ExitCode != 0 || !TryGetMajorVersion(version.StandardOutput, out var major) || major != 2)
+        if (version.TimedOut)
+        {
+            return new ComposeVersionCheck(
+                false,
+                version.ExitCode,
+                sanitized.Text,
+                version.OutputTruncated || sanitized.Truncated,
+                "process_timeout");
+        }
+
+        if (version.ExitCode != 0 || !TryGetMajorVersion(version.StandardOutput, out var major) || major != 2)
         {
             return new ComposeVersionCheck(false, version.ExitCode, sanitized.Text, version.OutputTruncated || sanitized.Truncated, "compose_v2_required");
         }

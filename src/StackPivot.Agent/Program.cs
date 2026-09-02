@@ -9,30 +9,9 @@ if (!OperatingSystem.IsLinux())
 }
 
 var builder = Host.CreateApplicationBuilder(args);
-var agentIdText = builder.Configuration["StackPivot:AgentId"]
-    ?? throw new InvalidOperationException("StackPivot:AgentId is required.");
-var controlHubUrl = builder.Configuration["StackPivot:ControlHubUrl"]
-    ?? throw new InvalidOperationException("StackPivot:ControlHubUrl is required.");
-var apiKey = builder.Configuration["StackPivot:ApiKey"]
-    ?? throw new InvalidOperationException("StackPivot:ApiKey is required.");
-if (!Guid.TryParse(agentIdText, out var agentId))
-{
-    throw new InvalidOperationException("StackPivot:AgentId must be a UUID.");
-}
-
-if (!Uri.TryCreate(controlHubUrl, UriKind.Absolute, out var hubUri)
-    || !string.Equals(hubUri.Scheme, Uri.UriSchemeWss, StringComparison.OrdinalIgnoreCase))
-{
-    throw new InvalidOperationException("StackPivot:ControlHubUrl must use wss.");
-}
-
-var allowedRemoteHosts = (builder.Configuration["StackPivot:AllowedRemoteHosts"] ?? string.Empty)
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-var agentOptions = new AgentOptions(agentId, controlHubUrl, apiKey, "/opt/agent-main")
-{
-    AllowedRemoteHosts = allowedRemoteHosts
-};
+var agentOptions = AgentOptions.FromConfiguration(
+    builder.Configuration,
+    allowInlineApiKey: builder.Environment.IsDevelopment());
 builder.Services.AddSingleton(agentOptions);
 builder.Services.AddSingleton<PathPolicy>(services => new PathPolicy(services.GetRequiredService<AgentOptions>().AgentRoot));
 builder.Services.AddSingleton<IProcessRunner, ProcessRunner>();

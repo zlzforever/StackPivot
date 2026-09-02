@@ -38,6 +38,22 @@ public sealed class ComposeExecutorTests
     }
 
     [Fact]
+    public async Task ComposeVersionTimeoutReturnsProcessTimeout()
+    {
+        var runner = new RecordingProcessRunner(
+            new ProcessResult(-1, string.Empty, string.Empty, TimedOut: true));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        var result = await executor.CheckVersionAsync(
+            "/opt/agent-main/workspace_one/stack_web",
+            CancellationToken.None);
+
+        Assert.False(result.IsSupported);
+        Assert.True(result.ExitCode < 0);
+        Assert.Equal("process_timeout", result.ErrorCode);
+    }
+
+    [Fact]
     public async Task ComposeOutputIsLimitedToOneMebibyteAfterCombiningStreams()
     {
         var line = new string('x', LogSanitizer.MaxLineBytes);

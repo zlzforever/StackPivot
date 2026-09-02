@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -8,6 +9,7 @@ using StackPivot.Control.Application.Audit;
 using StackPivot.Control.Application.Deployments;
 using StackPivot.Control.Authorization;
 using StackPivot.Control.Domain.Entities;
+using StackPivot.Control.Infrastructure.Git;
 using StackPivot.Control.Infrastructure.Persistence;
 using StackPivot.Control.Infrastructure.Security;
 using StackPivot.Contracts.Agents;
@@ -49,6 +51,69 @@ public sealed class DeploymentEventTests
         Assert.Contains("[REDACTED]", history.OutputLog);
         Assert.DoesNotContain("duplicate", history.OutputLog);
         Assert.DoesNotContain("out-of-order", history.OutputLog);
+    }
+
+    [Fact]
+    public async Task AcceptedStreamsAndSuccessfulCompletionPersistLogsAndAuditFields()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+        history.DispatchedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAcceptedAsync(
+            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await dispatcher.HandleLogAsync(
+            new TaskLog(1, fixture.TaskId, fixture.AgentId, 0, "stdout", "pull complete", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await dispatcher.HandleLogAsync(
+            new TaskLog(1, fixture.TaskId, fixture.AgentId, 1, "stderr", "password=\"hunter 2\"", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(
+            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 0, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("success", history.TaskStatus);
+        Assert.Equal(0, history.ExitCode);
+        Assert.NotNull(history.StartTime);
+        Assert.NotNull(history.FinishTime);
+        Assert.Contains("pull complete", history.OutputLog, StringComparison.Ordinal);
+        Assert.Contains("[REDACTED]", history.OutputLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("hunter 2", history.OutputLog, StringComparison.Ordinal);
+        var entries = JsonSerializer.Deserialize<List<DeploymentLogEntryView>>(history.OutputLogEntriesJson)
+            ?? throw new InvalidOperationException("Expected structured deployment logs.");
+        Assert.Equal(
+            ["stdout:pull complete", "stderr:password=[REDACTED]"],
+            entries.Select(entry => entry.Stream + ":" + entry.Line));
+
+        var audits = await db.AuditLogs
+            .Where(value => value.RequestId == history.RequestId)
+            .OrderBy(value => value.CreatedAt)
+            .ToListAsync();
+        Assert.Contains(audits, audit => audit.Action == AuditActions.TaskAccepted
+            && audit.AgentId == history.AgentId
+            && audit.ResourceType == "task"
+            && audit.ResourceId == history.TaskId.ToString()
+            && audit.Result == "accepted");
+        Assert.Contains(audits, audit => audit.Action == AuditActions.TaskSucceeded
+            && audit.AgentId == history.AgentId
+            && audit.ResourceType == "task"
+            && audit.ResourceId == history.TaskId.ToString()
+            && audit.Result == "success"
+            && audit.ErrorCode is null);
     }
 
     [Fact]
@@ -169,6 +234,113 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task SuccessfulDispatchUsesPersistedSnapshotAndClearsTokenAfterSend()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var cryptoProtector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        await db.GlobalGitSettings.AddAsync(new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = cryptoProtector.Protect("git-token", "git-key-v1"),
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        var transport = new SnapshotTransport();
+        var protector = new RecordingCredentialProtector(cryptoProtector);
+        var dispatcher = new DeploymentDispatcher(db, transport, protector, new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        var command = transport.Command ?? throw new InvalidOperationException("Expected a deployment command.");
+        Assert.Equal(history.TaskId, command.TaskId);
+        Assert.Equal(history.RequestId, command.RequestId);
+        Assert.Equal(history.StackId, command.StackId);
+        Assert.Equal(history.AgentId, command.AgentId);
+        Assert.Equal(history.TargetCommitHash, command.TargetCommitHash);
+        Assert.Equal(history.GitRepoSnapshot, command.GitRepo);
+        Assert.Equal(history.GitUserNameSnapshot, command.GitUserName);
+        Assert.Equal(history.StackGitRelativePathSnapshot, command.StackGitRelativePath);
+        Assert.Equal(history.AgentStackLocalPathSnapshot, command.AgentStackLocalPath);
+        Assert.Equal(history.TokenKeyId, protector.UnprotectKeyId);
+        Assert.Equal("git-token", Encoding.UTF8.GetString(transport.AccessTokenBeforeClear));
+        CryptographicOperations.ZeroMemory(transport.AccessTokenBeforeClear);
+        Assert.All(command.AccessToken, value => Assert.Equal(0, value));
+        Assert.DoesNotContain("git-token", JsonSerializer.Serialize(history), StringComparison.Ordinal);
+
+        var audit = Assert.Single(await db.AuditLogs
+            .Where(value => value.Action == AuditActions.TaskDispatched)
+            .ToListAsync());
+        Assert.Equal(history.RequestId, audit.RequestId);
+        Assert.Equal(history.UserId, audit.ActorUserId);
+        Assert.Equal(history.AgentId, audit.AgentId);
+        Assert.Equal("task", audit.ResourceType);
+        Assert.Equal(history.TaskId.ToString(), audit.ResourceId);
+        Assert.Equal("sent", audit.Result);
+        Assert.Null(audit.ErrorCode);
+    }
+
+    [Fact]
+    public async Task FailedDispatchReleasesTargetForAnExplicitlyNewDeployment()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        await db.GlobalGitSettings.AddAsync(new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = protector.Protect("git-token", "git-key-v1"),
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new ThrowingTransport(),
+            protector,
+            new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        var failed = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", failed.TaskStatus);
+        Assert.Equal("agent_offline", failed.ErrorCode);
+
+        var service = new DeploymentService(
+            db,
+            new WorkspaceAuthorizationService(db),
+            new RecoveryPreflight(),
+            new AuditWriter(db));
+        var result = await service.RequestAsync(
+            failed.UserId,
+            failed.StackId,
+            new DeployStackRequest(
+                "abcdef0123456789abcdef0123456789abcdef01",
+                DeploymentMode.BoundAgents,
+                null),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            CancellationToken.None);
+
+        var task = Assert.Single(result.Tasks);
+        Assert.Equal("pending", task.Status);
+        Assert.Equal(1, await db.ServiceOperationHistories.CountAsync(value => value.TaskStatus == "pending"));
+        Assert.Equal(2, await db.ServiceOperationHistories.CountAsync());
+    }
+
+    [Fact]
     public async Task TaskWithoutAConfigurationSnapshotFailsClosedBeforeDispatch()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -245,6 +417,7 @@ public sealed class DeploymentEventTests
 
         Assert.DoesNotContain("hunter 2", sanitized);
         Assert.DoesNotContain("quoted secret", sanitized);
+        Assert.Contains("[REDACTED]", sanitized);
         Assert.Contains("keep=ok", sanitized);
     }
 
@@ -608,6 +781,47 @@ public sealed class DeploymentEventTests
             Commands.Add(command);
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class SnapshotTransport : IAgentTransport
+    {
+        public DeployStackCommand? Command { get; private set; }
+        public byte[] AccessTokenBeforeClear { get; private set; } = Array.Empty<byte>();
+
+        public Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken) => Task.FromResult(true);
+
+        public Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken)
+        {
+            AccessTokenBeforeClear = command.AccessToken.ToArray();
+            Command = command;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingCredentialProtector(IGitCredentialProtector inner) : IGitCredentialProtector
+    {
+        public string? UnprotectKeyId { get; private set; }
+
+        public string Protect(string token) => inner.Protect(token);
+
+        public string Protect(string token, string keyId) => inner.Protect(token, keyId);
+
+        public byte[] Unprotect(string encrypted, string keyId)
+        {
+            UnprotectKeyId = keyId;
+            return inner.Unprotect(encrypted, keyId);
+        }
+    }
+
+    private sealed class RecoveryPreflight : ICentralGitPreflight
+    {
+        public Task<DeploymentPreflight> ValidateAsync(Guid stackId, string fullCommitHash, CancellationToken cancellationToken) =>
+            Task.FromResult(new DeploymentPreflight(
+                "https://git.example/repository.git",
+                "git-user",
+                "workspace_one/stack_web",
+                "/opt/agent-main/workspace_one/stack_web",
+                "git-key-v1"));
     }
 
     private sealed class BlockingTransport : IAgentTransport

@@ -27,6 +27,7 @@ public sealed class LogSanitizerTests
         Assert.DoesNotContain("hunter 2", line);
         Assert.DoesNotContain("quoted secret", line);
         Assert.DoesNotContain("2\"", line);
+        Assert.Contains("[REDACTED]", line);
         Assert.Contains("keep=ok", line);
     }
 

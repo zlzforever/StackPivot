@@ -199,6 +199,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         if (!Directory.Exists(gitDirectory))
         {
             var init = await RunAsync(safePath.FullPath, InitArguments, cancellationToken);
+            if (init.TimedOut)
+            {
+                return Failure("git_init_timeout");
+            }
+
             if (init.ExitCode != 0)
             {
                 return Failure("git_init_failed");
@@ -206,9 +211,19 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         }
 
         var origin = await RunAsync(safePath.FullPath, ["remote", "get-url", "origin"], cancellationToken);
+        if (origin.TimedOut)
+        {
+            return Failure("git_remote_timeout");
+        }
+
         if (origin.ExitCode != 0)
         {
             var addOrigin = await RunAsync(safePath.FullPath, ["remote", "add", "origin", input.GitRepo], cancellationToken);
+            if (addOrigin.TimedOut)
+            {
+                return Failure("git_remote_timeout");
+            }
+
             if (addOrigin.ExitCode != 0)
             {
                 return Failure("git_remote_failed");
@@ -248,6 +263,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["fetch", "--no-tags", "origin", input.TargetCommitHash],
                 cancellationToken,
                 environment);
+            if (fetch.TimedOut)
+            {
+                return Failure("git_fetch_timeout");
+            }
+
             if (fetch.ExitCode != 0)
             {
                 return Failure("git_fetch_failed");
@@ -258,6 +278,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["cat-file", "-e", $"{input.TargetCommitHash}^{{commit}}"],
                 cancellationToken,
                 environment);
+            if (verify.TimedOut)
+            {
+                return Failure("git_verify_timeout");
+            }
+
             if (verify.ExitCode != 0)
             {
                 return Failure("invalid_commit");
@@ -268,14 +293,14 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath],
                 cancellationToken,
                 environment);
-            if (tree.OutputTruncated)
-            {
-                return Failure("git_tree_output_truncated");
-            }
-
             if (tree.TimedOut)
             {
                 return Failure("git_tree_timeout");
+            }
+
+            if (tree.OutputTruncated)
+            {
+                return Failure("git_tree_output_truncated");
             }
 
             if (tree.ExitCode != 0)
@@ -313,6 +338,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["read-tree", "--reset", "-u", $"{input.TargetCommitHash}:{input.StackGitRelativePath}"],
                 cancellationToken,
                 environment);
+            if (checkout.TimedOut)
+            {
+                return Failure("git_materialize_timeout");
+            }
+
             if (checkout.ExitCode != 0)
             {
                 return Failure("git_materialize_failed");

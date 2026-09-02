@@ -9,8 +9,18 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="xunit.skippablefact" Version="1.4.13" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/StackPivot.Agent/StackPivot.Agent.csproj" />
+    <ProjectReference Include="../StackPivot.ProcessHarness/StackPivot.ProcessHarness.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
+  <Target Name="CopyProcessHarness" AfterTargets="Build">
+    <ItemGroup>
+      <ProcessHarnessArtifact Include="$(MSBuildProjectDirectory)/../StackPivot.ProcessHarness/bin/$(Configuration)/net8.0/StackPivot.ProcessHarness.dll" />
+      <ProcessHarnessArtifact Include="$(MSBuildProjectDirectory)/../StackPivot.ProcessHarness/bin/$(Configuration)/net8.0/StackPivot.ProcessHarness.deps.json" />
+      <ProcessHarnessArtifact Include="$(MSBuildProjectDirectory)/../StackPivot.ProcessHarness/bin/$(Configuration)/net8.0/StackPivot.ProcessHarness.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ProcessHarnessArtifact)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

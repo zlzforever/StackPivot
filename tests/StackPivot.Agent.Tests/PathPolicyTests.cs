@@ -30,13 +30,10 @@ public sealed class PathPolicyTests
             policy.ValidateStackPathAsync(relativePath, CancellationToken.None));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task NestedSymlinkInManagedFilePathIsRejected()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
@@ -56,13 +53,10 @@ public sealed class PathPolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task DanglingSymlinkInManagedFilePathIsRejected()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");

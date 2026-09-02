@@ -57,13 +57,10 @@ public sealed class GitTreePolicyTests
             new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example" }));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task MaterializationUsesReadTreeAndClearsTheCredentialBuffer()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner();
@@ -101,12 +98,12 @@ public sealed class GitTreePolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void InMemoryAskpassIsExecutableByGit()
     {
         if (!OperatingSystem.IsLinux())
         {
-            return;
+            throw new Xunit.SkipException("Linux-only test: requires memfd and Linux filesystem semantics.");
         }
 
         using var credential = InMemoryGitCredential.Create("git-user", "secret"u8.ToArray());
@@ -114,13 +111,10 @@ public sealed class GitTreePolicyTests
         Assert.True(File.GetUnixFileMode(credential.AskpassPath).HasFlag(UnixFileMode.UserExecute));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task TruncatedTreeOutputFailsClosedBeforeReadTree()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(treeOutputTruncated: true);
@@ -152,13 +146,10 @@ public sealed class GitTreePolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task FailedTreeCommandFailsClosedBeforeReadTree()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner
@@ -197,12 +188,114 @@ public sealed class GitTreePolicyTests
     }
 
     [Fact]
+    public async Task GitInitTimeoutReturnsStableTimeoutErrorCode()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
+        var runner = new MaterializationRunner(timeoutCommand: "init");
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var token = "secret"u8.ToArray();
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    token,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    Path.Combine(root, "workspace_one", "stack_web")),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("git_init_timeout", result.ErrorCode);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GitRemoteAddTimeoutReturnsStableTimeoutErrorCode()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
+        var runner = new MaterializationRunner(timeoutCommand: "remote_add");
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var token = "secret"u8.ToArray();
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    token,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    Path.Combine(root, "workspace_one", "stack_web")),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("git_remote_timeout", result.ErrorCode);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("remote_get", "git_remote_timeout")]
+    [InlineData("fetch", "git_fetch_timeout")]
+    [InlineData("verify", "git_verify_timeout")]
+    [InlineData("tree", "git_tree_timeout")]
+    [InlineData("materialize", "git_materialize_timeout")]
+    public async Task GitTimeoutAtEachLinuxOnlyStageReturnsStableTimeoutErrorCode(
+        string timeoutCommand,
+        string expectedErrorCode)
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
+        var runner = new MaterializationRunner(timeoutCommand: timeoutCommand);
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5));
+        var token = "secret"u8.ToArray();
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    token,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    Path.Combine(root, "workspace_one", "stack_web")),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal(expectedErrorCode, result.ErrorCode);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task PreviouslyManagedFilesAreRemovedFromTheStackRoot()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
@@ -240,13 +333,10 @@ public sealed class GitTreePolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task NestedSymlinkInIncomingTreeIsRejectedBeforeReadTree()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
@@ -290,13 +380,10 @@ public sealed class GitTreePolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task DanglingCheckoutMetadataSymlinkIsRejectedBeforeReadTree()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
+        TestPlatform.RequireLinux();
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
@@ -342,9 +429,12 @@ public sealed class GitTreePolicyTests
             policy.ValidateManagedFilePathAsync(".git/config", CancellationToken.None));
     }
 
-    private sealed class MaterializationRunner(bool treeOutputTruncated = false) : IProcessRunner
+    private sealed class MaterializationRunner(
+        bool treeOutputTruncated = false,
+        string? timeoutCommand = null) : IProcessRunner
     {
         public List<ProcessRequest> Requests { get; } = new();
+        private string? TimeoutCommand { get; } = timeoutCommand;
         public ProcessResult TreeResult { get; init; } = new(
             0,
             "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
@@ -357,22 +447,38 @@ public sealed class GitTreePolicyTests
             {
                 case "init":
                     Directory.CreateDirectory(Path.Combine(request.WorkingDirectory, ".git"));
-                    return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
+                    return Task.FromResult(TimeoutOr("init", new ProcessResult(0, string.Empty, string.Empty)));
                 case "remote" when request.Arguments.Contains("get-url"):
-                    return Task.FromResult(new ProcessResult(1, string.Empty, string.Empty));
+                    return Task.FromResult(TimeoutOr("remote_get", new ProcessResult(1, string.Empty, string.Empty)));
                 case "remote":
-                    return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
+                    return Task.FromResult(TimeoutOr("remote_add", new ProcessResult(0, string.Empty, string.Empty)));
                 case "fetch":
+                    return Task.FromResult(TimeoutOr("fetch", new ProcessResult(0, string.Empty, string.Empty)));
                 case "cat-file":
-                    return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
+                    return Task.FromResult(TimeoutOr("verify", new ProcessResult(0, string.Empty, string.Empty)));
                 case "ls-tree":
+                    if (TimeoutCommand == "tree")
+                    {
+                        return Task.FromResult(new ProcessResult(-1, string.Empty, string.Empty, TimedOut: true));
+                    }
+
                     return Task.FromResult(TreeResult with { OutputTruncated = treeOutputTruncated || TreeResult.OutputTruncated });
                 case "read-tree":
+                    if (TimeoutCommand == "materialize")
+                    {
+                        return Task.FromResult(new ProcessResult(-1, string.Empty, string.Empty, TimedOut: true));
+                    }
+
                     File.WriteAllText(Path.Combine(request.WorkingDirectory, "compose.yaml"), "services: {}");
                     return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
                 default:
                     return Task.FromResult(new ProcessResult(1, string.Empty, string.Empty));
             }
         }
+
+        private ProcessResult TimeoutOr(string command, ProcessResult result) =>
+            TimeoutCommand == command
+                ? new ProcessResult(-1, string.Empty, string.Empty, TimedOut: true)
+                : result;
     }
 }
