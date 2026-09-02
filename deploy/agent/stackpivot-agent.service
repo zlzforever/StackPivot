@@ -20,10 +20,12 @@ KillMode=control-group
 
 Environment=DOTNET_ENVIRONMENT=Production
 Environment=STACKPIVOT_AGENT_WORK_ROOT=/opt/agent-main
-# The value is a path to the systemd credential, never the credential itself.
-Environment=STACKPIVOT_AGENT_API_KEY_FILE=%d/agent-api-key
+# This file contains only non-sensitive identity and hub settings.
 EnvironmentFile=/etc/stackpivot/agent.env
 LoadCredential=agent-api-key:/etc/stackpivot/agent-api-key
+# The value is a path to the runtime credential, never the credential itself.
+# Keep this after EnvironmentFile so the credential path cannot be overridden there.
+Environment=STACKPIVOT_AGENT_API_KEY_FILE=%d/agent-api-key
 
 UMask=0077
 NoNewPrivileges=yes

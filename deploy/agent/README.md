@@ -24,9 +24,11 @@ unit 假定 .NET 8 Agent 发布文件为 `/opt/stackpivot-agent/StackPivot.Agent
 | `STACKPIVOT_AGENT_ID` | `/etc/stackpivot/agent.env` | 已注册 Agent 的 UUID |
 | `STACKPIVOT_CONTROL_HUB_URL` | `/etc/stackpivot/agent.env` | 必须是 `wss://<control-host>/hubs/agent`，只允许主控 443 出站 |
 | `STACKPIVOT_AGENT_WORK_ROOT` | systemd unit | 固定为 `/opt/agent-main` |
-| `STACKPIVOT_AGENT_API_KEY_FILE` | systemd unit | 指向 systemd credential 路径，不是 key 内容 |
+| `STACKPIVOT_AGENT_API_KEY_FILE` | systemd unit | 固定指向 systemd runtime credential 路径，不是 key 内容 |
 
-API_KEY 使用 `LoadCredential=agent-api-key:/etc/stackpivot/agent-api-key` 注入。源文件必须由 root 拥有、权限为 `0600`，服务停止后 systemd runtime credential 会被清理。API_KEY 不得写入仓库、`agent.env`、命令行参数、URL、query string、日志或异常。
+API_KEY 使用 `LoadCredential=agent-api-key:/etc/stackpivot/agent-api-key` 注入。systemd manager 读取 root-only 源文件，再把名为 `agent-api-key` 的 runtime credential 暴露给 `stackpivot-agent`；服务进程只读取 `STACKPIVOT_AGENT_API_KEY_FILE` 指向的 runtime 路径。源文件必须由 root 拥有、权限为 `0600`，服务停止后 runtime credential 会被清理。API_KEY 不得写入仓库、`agent.env`、命令行参数、URL、query string、日志或异常。
+
+`EnvironmentFile=/etc/stackpivot/agent.env` 只提供 `STACKPIVOT_AGENT_ID` 和 `STACKPIVOT_CONTROL_HUB_URL`。该文件由 systemd manager 以 root 身份读取，即使其权限为 `0600` 也不会阻止非 root 服务启动；服务进程不直接读取它。不要在其中定义 `STACKPIVOT_AGENT_API_KEY_FILE`，unit 会在 `EnvironmentFile` 之后固定设置为 `%d/agent-api-key`，其中 `%d` 是该服务的 runtime credential 目录。
 
 不要在本仓库创建真实的 `agent.env` 或 API_KEY 文件。配置文件和 credential 文件都属于目标主机的外部配置。
 
@@ -74,7 +76,7 @@ sudo install -d -o root -g root -m 0700 /etc/stackpivot
 sudo install -o root -g root -m 0600 /dev/stdin /etc/stackpivot/agent.env
 ```
 
-随后输入下面字段；这些仅是字段格式，不是可提交的配置样例值：
+随后输入下面两个字段；这些仅是字段格式，不是可提交的配置样例值：
 
 ```text
 STACKPIVOT_AGENT_ID=<registered-agent-uuid>
@@ -91,7 +93,7 @@ STACKPIVOT_CONTROL_HUB_URL=wss://<control-host>/hubs/agent
 sudo install -o root -g root -m 0600 /dev/stdin /etc/stackpivot/agent-api-key
 ```
 
-输入完成后结束标准输入。该文件由 unit 的 `LoadCredential` 在服务启动时加载；应用必须只读取 `STACKPIVOT_AGENT_API_KEY_FILE`，不得读取或打印 API_KEY 环境变量。
+输入完成后结束标准输入。该文件由 unit 的 `LoadCredential` 在服务启动时加载；缺少、不可读或为空时 `LoadCredential`/Agent 必须 fail closed。应用必须只读取 `STACKPIVOT_AGENT_API_KEY_FILE`，不得读取或打印 API_KEY 环境变量。不要为 `LoadCredential` 使用忽略缺失错误的 `-` 前缀，也不得退化到明文临时文件。
 
 ### 5. 安装并启动 unit
 
