@@ -1,6 +1,10 @@
 <Router AppAssembly="typeof(Program).Assembly">
     <Found Context="routeData">
-        <RouteView RouteData="routeData" DefaultLayout="typeof(StackPivot.Control.Components.Shared.MainLayout)" />
+        <AuthorizeRouteView RouteData="routeData" DefaultLayout="typeof(StackPivot.Control.Components.Shared.MainLayout)">
+            <NotAuthorized>
+                <p>需要登录。</p>
+            </NotAuthorized>
+        </AuthorizeRouteView>
         <FocusOnNavigate RouteData="routeData" Selector="h1" />
     </Found>
     <NotFound>

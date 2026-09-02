@@ -8,7 +8,10 @@ public sealed record ProcessRequest(
     IReadOnlyList<string> Arguments,
     string WorkingDirectory,
     IReadOnlyDictionary<string, string?>? EnvironmentVariables = null,
-    TimeSpan? Timeout = null);
+    TimeSpan? Timeout = null,
+    Func<ProcessOutputLine, ValueTask>? OutputHandler = null);
+
+public sealed record ProcessOutputLine(string Stream, string Text);
 
 public sealed record ProcessResult(
     int ExitCode,
@@ -25,6 +28,7 @@ public interface IProcessRunner
 public sealed class ProcessRunner : IProcessRunner
 {
     private const int MaxOutputBytes = 1024 * 1024;
+    private const int MaxLineBytes = 16 * 1024;
 
     public async Task<ProcessResult> RunAsync(ProcessRequest request, CancellationToken cancellationToken)
     {
@@ -45,14 +49,20 @@ public sealed class ProcessRunner : IProcessRunner
             ? null
             : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCancellation.Token);
         var waitToken = linkedCancellation?.Token ?? cancellationToken;
-        var stdoutTask = ReadBoundedAsync(process.StandardOutput, waitToken);
-        var stderrTask = ReadBoundedAsync(process.StandardError, waitToken);
+        var budget = new OutputBudget(MaxOutputBytes);
+        var stdoutTask = ReadBoundedAsync(process.StandardOutput, "stdout", budget, request.OutputHandler, waitToken);
+        var stderrTask = ReadBoundedAsync(process.StandardError, "stderr", budget, request.OutputHandler, waitToken);
         try
         {
             await process.WaitForExitAsync(waitToken);
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
-            return new ProcessResult(process.ExitCode, stdout.Text, stderr.Text, false, stdout.Truncated || stderr.Truncated);
+            return new ProcessResult(
+                process.ExitCode,
+                stdout.Text,
+                stderr.Text,
+                false,
+                stdout.Truncated || stderr.Truncated || budget.Truncated);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -95,38 +105,90 @@ public sealed class ProcessRunner : IProcessRunner
         return info;
     }
 
-    private static async Task<BoundedOutput> ReadBoundedAsync(StreamReader reader, CancellationToken cancellationToken)
+    private static async Task<BoundedOutput> ReadBoundedAsync(
+        StreamReader reader,
+        string stream,
+        OutputBudget budget,
+        Func<ProcessOutputLine, ValueTask>? outputHandler,
+        CancellationToken cancellationToken)
     {
-        var builder = new StringBuilder();
+        var output = new StringBuilder();
+        var line = new StringBuilder();
+        var lineBytes = 0;
         var truncated = false;
-        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        var buffer = new char[4096];
+        int count;
+        while ((count = await reader.ReadAsync(buffer.AsMemory(), cancellationToken)) > 0)
         {
-            var bytes = Encoding.UTF8.GetBytes(line);
-            var existingBytes = Encoding.UTF8.GetByteCount(builder.ToString());
-            var remaining = MaxOutputBytes - existingBytes;
-            if (remaining <= 0)
+            for (var index = 0; index < count; index++)
             {
-                truncated = true;
-                continue;
-            }
-
-            if (bytes.Length > remaining)
-            {
-                builder.Append(LogSanitizer.TruncateUtf8(line, remaining));
-                truncated = true;
-            }
-            else
-            {
-                if (builder.Length > 0)
+                var character = buffer[index];
+                if (character == '\n')
                 {
-                    builder.Append('\n');
+                    var separatorBytes = output.Length == 0 ? 0 : 1;
+                    if (!budget.TryReserve(separatorBytes))
+                    {
+                        truncated = true;
+                    }
+                    else
+                    {
+                        if (separatorBytes != 0)
+                        {
+                            output.Append('\n');
+                        }
+
+                        output.Append(line);
+                        if (outputHandler is not null && line.Length > 0)
+                        {
+                            await outputHandler(new ProcessOutputLine(stream, line.ToString()));
+                        }
+                    }
+
+                    line.Clear();
+                    lineBytes = 0;
+                    continue;
                 }
 
-                builder.Append(line);
+                if (character == '\r')
+                {
+                    continue;
+                }
+
+                var characterBytes = Encoding.UTF8.GetByteCount(buffer.AsSpan(index, 1));
+                if (lineBytes >= MaxLineBytes || !budget.TryReserve(characterBytes))
+                {
+                    truncated = true;
+                    continue;
+                }
+
+                line.Append(character);
+                lineBytes += characterBytes;
             }
         }
 
-        return new BoundedOutput(builder.ToString(), truncated);
+        if (line.Length > 0)
+        {
+            var separatorBytes = output.Length == 0 ? 0 : 1;
+            if (budget.TryReserve(separatorBytes))
+            {
+                if (separatorBytes != 0)
+                {
+                    output.Append('\n');
+                }
+
+                output.Append(line);
+                if (outputHandler is not null)
+                {
+                    await outputHandler(new ProcessOutputLine(stream, line.ToString()));
+                }
+            }
+            else
+            {
+                truncated = true;
+            }
+        }
+
+        return new BoundedOutput(output.ToString(), truncated);
     }
 
     private static void KillProcessTree(Process process)
@@ -151,4 +213,40 @@ public sealed class ProcessRunner : IProcessRunner
     }
 
     private sealed record BoundedOutput(string Text, bool Truncated);
+
+    private sealed class OutputBudget(int limit)
+    {
+        private int remaining = limit;
+        private int truncated;
+
+        public bool Truncated => Volatile.Read(ref truncated) != 0;
+
+        private void MarkTruncated()
+        {
+            Interlocked.Exchange(ref truncated, 1);
+        }
+
+        public bool TryReserve(int bytes)
+        {
+            if (bytes == 0)
+            {
+                return true;
+            }
+
+            while (true)
+            {
+                var current = Volatile.Read(ref remaining);
+                if (current < bytes)
+                {
+                    MarkTruncated();
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref remaining, current - bytes, current) == current)
+                {
+                    return true;
+                }
+            }
+        }
+    }
 }

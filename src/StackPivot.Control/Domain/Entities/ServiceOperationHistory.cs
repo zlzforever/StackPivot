@@ -21,7 +21,14 @@ public sealed class ServiceOperationHistory
     public long LastSequence { get; set; } = -1;
     public DateTimeOffset LastEventAt { get; set; }
     public DateTimeOffset? DispatchedAt { get; set; }
+    public DateTimeOffset? DispatchAttemptAt { get; set; }
+    public DateTimeOffset? AcceptedAt { get; set; }
     public string TokenKeyId { get; set; } = string.Empty;
+    public string? GitRepoSnapshot { get; set; }
+    public string? GitUserNameSnapshot { get; set; }
+    public string? StackGitRelativePathSnapshot { get; set; }
+    public string? AgentStackLocalPathSnapshot { get; set; }
+    public string OutputLogEntriesJson { get; set; } = "[]";
 
     public Stack? Stack { get; set; }
 }

@@ -4,4 +4,7 @@ public sealed record AgentOptions(
     Guid AgentId,
     string ControlHubUrl,
     string ApiKey,
-    string AgentRoot);
+    string AgentRoot)
+{
+    public IReadOnlySet<string>? AllowedRemoteHosts { get; init; }
+}

@@ -1,5 +1,6 @@
-using System.Text;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using StackPivot.Control.Application.Audit;
@@ -18,25 +19,56 @@ public sealed class DeploymentDispatcher(
     IGitCredentialProtector credentialProtector,
     AuditWriter auditWriter)
 {
-    private static readonly SemaphoreSlim DispatchLock = new(1, 1);
+    public static readonly TimeSpan AcceptanceTimeout = TimeSpan.FromMinutes(2);
+    public static readonly TimeSpan ExecutionTimeout = TimeSpan.FromHours(1);
 
     public async Task DispatchPendingAsync(CancellationToken cancellationToken)
     {
-        await DispatchLock.WaitAsync(cancellationToken);
-        try
+        var pending = await dbContext.ServiceOperationHistories
+            .AsNoTracking()
+            .Where(value => value.TaskStatus == "pending")
+            .OrderBy(value => value.LastEventAt)
+            .ToListAsync(cancellationToken);
+        foreach (var history in pending)
         {
-            var pending = await dbContext.ServiceOperationHistories
-                .Where(value => value.TaskStatus == "pending" && value.DispatchedAt == null)
-                .OrderBy(value => value.LastEventAt)
-                .ToListAsync(cancellationToken);
-            foreach (var history in pending)
+            var now = DateTimeOffset.UtcNow;
+            if (history.AcceptedAt is not null || history.StartTime is not null)
             {
-                await DispatchOneAsync(history, cancellationToken);
+                if (now - history.LastEventAt >= ExecutionTimeout)
+                {
+                    await MarkFailedAsync(history, "agent_execution_timeout", cancellationToken);
+                }
+
+                continue;
             }
-        }
-        finally
-        {
-            DispatchLock.Release();
+
+            if (history.DispatchedAt is not null)
+            {
+                if (now - history.DispatchedAt >= AcceptanceTimeout)
+                {
+                    await MarkFailedAsync(history, "agent_accept_timeout", cancellationToken);
+                }
+
+                continue;
+            }
+
+            if (history.DispatchAttemptAt is not null)
+            {
+                if (now - history.DispatchAttemptAt >= AcceptanceTimeout)
+                {
+                    await MarkFailedAsync(history, "agent_accept_timeout", cancellationToken);
+                }
+
+                continue;
+            }
+
+            if (!await TryClaimDispatchAsync(history.HistoryId, now, cancellationToken))
+            {
+                continue;
+            }
+
+            history.DispatchAttemptAt = now;
+            await DispatchOneAsync(history, cancellationToken);
         }
     }
 
@@ -44,14 +76,34 @@ public sealed class DeploymentDispatcher(
     {
         ProtocolValidation.EnsureSchemaVersion(accepted.SchemaVersion);
         var history = await FindTaskAsync(accepted.TaskId, accepted.AgentId, cancellationToken);
-        if (history is null || history.TaskStatus != "pending" || history.DispatchedAt is null || history.StartTime is not null)
+        if (history is null
+            || history.TaskStatus != "pending"
+            || (history.DispatchAttemptAt is null && history.DispatchedAt is null)
+            || history.AcceptedAt is not null
+            || history.StartTime is not null)
         {
             return;
         }
 
         var now = DateTimeOffset.UtcNow;
-        history.StartTime = now;
-        history.LastEventAt = now;
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        var updated = await dbContext.ServiceOperationHistories
+            .Where(value => value.HistoryId == history.HistoryId
+                && value.TaskStatus == "pending"
+                && (value.DispatchAttemptAt != null || value.DispatchedAt != null)
+                && value.AcceptedAt == null
+                && value.StartTime == null)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(value => value.AcceptedAt, now)
+                    .SetProperty(value => value.StartTime, now)
+                    .SetProperty(value => value.LastEventAt, now),
+                cancellationToken);
+        if (updated != 1)
+        {
+            return;
+        }
+
         auditWriter.Add(
             AuditActions.TaskAccepted,
             history.RequestId,
@@ -61,6 +113,7 @@ public sealed class DeploymentDispatcher(
             history.TaskId.ToString(),
             "accepted");
         await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task HandleLogAsync(TaskLog log, CancellationToken cancellationToken)
@@ -69,7 +122,7 @@ public sealed class DeploymentDispatcher(
         var history = await FindTaskAsync(log.TaskId, log.AgentId, cancellationToken);
         if (history is null
             || history.TaskStatus != "pending"
-            || history.StartTime is null
+            || (history.AcceptedAt is null && history.StartTime is null)
             || log.Stream is not ("stdout" or "stderr")
             || log.Sequence != history.LastSequence + 1)
         {
@@ -77,31 +130,61 @@ public sealed class DeploymentDispatcher(
         }
 
         var sanitized = DeploymentLogSanitizer.SanitizeLine(log.Line);
-        history.OutputLog = DeploymentLogSanitizer.Append(
+        var outputLog = DeploymentLogSanitizer.Append(
             history.OutputLog,
             sanitized,
             out var truncated);
-        history.LogTruncated |= truncated;
-        history.LastSequence = log.Sequence;
-        history.LastEventAt = DateTimeOffset.UtcNow;
-        await dbContext.SaveChangesAsync(cancellationToken);
+        var logEntries = history.OutputLogEntriesJson;
+        var entriesTruncated = AppendLogEntry(ref logEntries, log.Stream, sanitized);
+        var now = DateTimeOffset.UtcNow;
+        await dbContext.ServiceOperationHistories
+            .Where(value => value.HistoryId == history.HistoryId
+                && value.TaskStatus == "pending"
+                && (value.AcceptedAt != null || value.StartTime != null)
+                && value.LastSequence == log.Sequence - 1)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(value => value.OutputLog, outputLog)
+                    .SetProperty(value => value.OutputLogEntriesJson, logEntries)
+                    .SetProperty(value => value.LogTruncated, history.LogTruncated || truncated || entriesTruncated)
+                    .SetProperty(value => value.LastSequence, log.Sequence)
+                    .SetProperty(value => value.LastEventAt, now),
+                cancellationToken);
     }
 
     public async Task HandleCompletedAsync(TaskCompleted completed, CancellationToken cancellationToken)
     {
         ProtocolValidation.EnsureSchemaVersion(completed.SchemaVersion);
         var history = await FindTaskAsync(completed.TaskId, completed.AgentId, cancellationToken);
-        if (history is null || history.TaskStatus != "pending" || history.StartTime is null)
+        if (history is null
+            || history.TaskStatus != "pending"
+            || (history.AcceptedAt is null && history.StartTime is null))
         {
             return;
         }
 
         var now = DateTimeOffset.UtcNow;
-        history.TaskStatus = completed.Success ? "success" : "failed";
-        history.ExitCode = completed.ExitCode;
-        history.ErrorCode = SanitizeErrorCode(completed.ErrorCode);
-        history.FinishTime = now;
-        history.LastEventAt = now;
+        var taskStatus = completed.Success ? "success" : "failed";
+        var errorCode = SanitizeErrorCode(completed.ErrorCode);
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        var updated = await dbContext.ServiceOperationHistories
+            .Where(value => value.HistoryId == history.HistoryId
+                && value.TaskStatus == "pending"
+                && (value.AcceptedAt != null || value.StartTime != null))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(value => value.TaskStatus, taskStatus)
+                    .SetProperty(value => value.ExitCode, completed.ExitCode)
+                    .SetProperty(value => value.ErrorCode, errorCode)
+                    .SetProperty(value => value.LogTruncated, history.LogTruncated || completed.LogTruncated)
+                    .SetProperty(value => value.FinishTime, now)
+                    .SetProperty(value => value.LastEventAt, now),
+                cancellationToken);
+        if (updated != 1)
+        {
+            return;
+        }
+
         auditWriter.Add(
             completed.Success ? AuditActions.TaskSucceeded : AuditActions.TaskFailed,
             history.RequestId,
@@ -110,8 +193,35 @@ public sealed class DeploymentDispatcher(
             "task",
             history.TaskId.ToString(),
             completed.Success ? "success" : "failed",
-            history.ErrorCode);
+            errorCode);
         await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task HandleAgentDisconnectedAsync(Guid agentId, CancellationToken cancellationToken)
+    {
+        if (agentId == Guid.Empty)
+        {
+            return;
+        }
+
+        var histories = await dbContext.ServiceOperationHistories
+            .AsNoTracking()
+            .Where(value => value.AgentId == agentId && value.TaskStatus == "pending")
+            .ToListAsync(cancellationToken);
+        if (histories.Count == 0)
+        {
+            return;
+        }
+
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        foreach (var history in histories)
+        {
+            await MarkFailedAsync(history, "agent_disconnected", cancellationToken, saveChanges: false);
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task HandleHeartbeatAsync(HeartbeatMessage heartbeat, CancellationToken cancellationToken)
@@ -150,13 +260,34 @@ public sealed class DeploymentDispatcher(
             return;
         }
 
+        if (string.IsNullOrWhiteSpace(history.GitRepoSnapshot)
+            || string.IsNullOrWhiteSpace(history.GitUserNameSnapshot)
+            || string.IsNullOrWhiteSpace(history.StackGitRelativePathSnapshot)
+            || string.IsNullOrWhiteSpace(history.AgentStackLocalPathSnapshot)
+            || string.IsNullOrWhiteSpace(history.TokenKeyId))
+        {
+            await MarkFailedAsync(history, "configuration_snapshot_missing", cancellationToken);
+            return;
+        }
+
+        if (!string.Equals(history.GitRepoSnapshot, setting.GitRepo, StringComparison.Ordinal)
+            || !string.Equals(history.GitUserNameSnapshot, setting.GitUserName, StringComparison.Ordinal)
+            || !string.Equals(history.TokenKeyId, setting.TokenKeyId, StringComparison.Ordinal))
+        {
+            await MarkFailedAsync(history, "git_config_changed", cancellationToken);
+            return;
+        }
+
+        var gitRepo = history.GitRepoSnapshot;
+        var gitUserName = history.GitUserNameSnapshot;
+        var stackGitRelativePath = history.StackGitRelativePathSnapshot;
+        var agentStackLocalPath = history.AgentStackLocalPathSnapshot;
+        var tokenKeyId = history.TokenKeyId;
+
         byte[]? accessToken = null;
         var command = (DeployStackCommand?)null;
         try
         {
-            var tokenKeyId = string.IsNullOrWhiteSpace(history.TokenKeyId)
-                ? setting.TokenKeyId
-                : history.TokenKeyId;
             history.TokenKeyId = tokenKeyId;
             accessToken = credentialProtector.Unprotect(setting.AccessTokenEncrypted, tokenKeyId);
             command = new DeployStackCommand(
@@ -165,24 +296,40 @@ public sealed class DeploymentDispatcher(
                 history.RequestId,
                 history.StackId,
                 history.AgentId,
-                setting.GitRepo,
-                setting.GitUserName,
+                gitRepo,
+                gitUserName,
                 accessToken,
                 history.TargetCommitHash,
-                $"{request.Stack.Workspace.Name}/{request.Stack.FolderName}",
-                $"/opt/agent-main/{request.Stack.Workspace.Name}/{request.Stack.FolderName}",
+                stackGitRelativePath,
+                agentStackLocalPath,
                 DateTimeOffset.UtcNow.AddMinutes(5));
             await transport.SendDeployAsync(command, cancellationToken);
-            history.DispatchedAt = DateTimeOffset.UtcNow;
-            auditWriter.Add(
-                AuditActions.TaskDispatched,
-                history.RequestId,
-                history.UserId,
-                history.AgentId,
-                "task",
-                history.TaskId.ToString(),
-                "sent");
-            await dbContext.SaveChangesAsync(cancellationToken);
+            var dispatchedAt = DateTimeOffset.UtcNow;
+            await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+            var updated = await dbContext.ServiceOperationHistories
+                .Where(value => value.HistoryId == history.HistoryId
+                    && value.TaskStatus == "pending"
+                    && value.DispatchAttemptAt == history.DispatchAttemptAt
+                    && value.DispatchedAt == null)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(value => value.DispatchedAt, dispatchedAt)
+                        .SetProperty(value => value.TokenKeyId, tokenKeyId)
+                        .SetProperty(value => value.LastEventAt, dispatchedAt),
+                    cancellationToken);
+            if (updated == 1)
+            {
+                auditWriter.Add(
+                    AuditActions.TaskDispatched,
+                    history.RequestId,
+                    history.UserId,
+                    history.AgentId,
+                    "task",
+                    history.TaskId.ToString(),
+                    "sent");
+                await dbContext.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -205,18 +352,32 @@ public sealed class DeploymentDispatcher(
     private async Task MarkFailedAsync(
         ServiceOperationHistory history,
         string errorCode,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool saveChanges = true)
     {
         if (history.TaskStatus != "pending")
         {
             return;
         }
 
+        await using var transaction = saveChanges
+            ? await dbContext.Database.BeginTransactionAsync(cancellationToken)
+            : null;
         var now = DateTimeOffset.UtcNow;
-        history.TaskStatus = "failed";
-        history.ErrorCode = errorCode;
-        history.FinishTime = now;
-        history.LastEventAt = now;
+        var updated = await dbContext.ServiceOperationHistories
+            .Where(value => value.HistoryId == history.HistoryId && value.TaskStatus == "pending")
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(value => value.TaskStatus, "failed")
+                    .SetProperty(value => value.ErrorCode, errorCode)
+                    .SetProperty(value => value.FinishTime, now)
+                    .SetProperty(value => value.LastEventAt, now),
+                cancellationToken);
+        if (updated != 1)
+        {
+            return;
+        }
+
         auditWriter.Add(
             AuditActions.TaskFailed,
             history.RequestId,
@@ -226,7 +387,27 @@ public sealed class DeploymentDispatcher(
             history.TaskId.ToString(),
             "failed",
             errorCode);
-        await dbContext.SaveChangesAsync(cancellationToken);
+        if (saveChanges)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await transaction!.CommitAsync(cancellationToken);
+        }
+    }
+
+    private async Task<bool> TryClaimDispatchAsync(
+        Guid historyId,
+        DateTimeOffset attemptAt,
+        CancellationToken cancellationToken)
+    {
+        var updated = await dbContext.ServiceOperationHistories
+            .Where(value => value.HistoryId == historyId
+                && value.TaskStatus == "pending"
+                && value.DispatchAttemptAt == null
+                && value.DispatchedAt == null)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(value => value.DispatchAttemptAt, attemptAt),
+                cancellationToken);
+        return updated == 1;
     }
 
     private Task<ServiceOperationHistory?> FindTaskAsync(
@@ -235,6 +416,7 @@ public sealed class DeploymentDispatcher(
         CancellationToken cancellationToken)
     {
         return dbContext.ServiceOperationHistories
+            .AsNoTracking()
             .SingleOrDefaultAsync(
                 value => value.TaskId == taskId && value.AgentId == agentId,
                 cancellationToken);
@@ -251,6 +433,35 @@ public sealed class DeploymentDispatcher(
             ? errorCode
             : "agent_error";
     }
+
+    private static bool AppendLogEntry(ref string json, string stream, string line)
+    {
+        try
+        {
+            var entries = JsonSerializer.Deserialize<List<DeploymentLogEntryView>>(json)
+                ?? new List<DeploymentLogEntryView>();
+            entries.Add(new DeploymentLogEntryView(stream, line));
+            var serialized = JsonSerializer.Serialize(entries);
+            if (Encoding.UTF8.GetByteCount(serialized) <= DeploymentLogSanitizer.MaxTaskBytes)
+            {
+                json = serialized;
+                return false;
+            }
+
+            return true;
+        }
+        catch (JsonException)
+        {
+            var serialized = JsonSerializer.Serialize(new[] { new DeploymentLogEntryView(stream, line) });
+            if (Encoding.UTF8.GetByteCount(serialized) <= DeploymentLogSanitizer.MaxTaskBytes)
+            {
+                json = serialized;
+                return false;
+            }
+
+            return true;
+        }
+    }
 }
 
 public static partial class DeploymentLogSanitizer
@@ -258,10 +469,10 @@ public static partial class DeploymentLogSanitizer
     public const int MaxLineBytes = 16 * 1024;
     public const int MaxTaskBytes = 1024 * 1024;
 
-    [GeneratedRegex("(?i)(authorization|x-agent-api-key)\\s*[:=]\\s*(?:Bearer\\s+)?[^\\s,;]+(?:\\s+[^\\s,;]+)?", RegexOptions.CultureInvariant)]
+    [GeneratedRegex("(?i)(authorization|x-agent-api-key)\\s*[:=]\\s*(?:Bearer\\s+)?(?:\"[^\"\\r\\n]*\"|'[^'\\r\\n]*'|[^\\s,;]+)", RegexOptions.CultureInvariant)]
     private static partial Regex HeaderSecretPattern();
 
-    [GeneratedRegex("(?i)(password|passwd|pwd|secret|token|api[-_]?key|access[-_]?token|client[-_]?secret)\\s*[:=]\\s*[^\\s,;]+", RegexOptions.CultureInvariant)]
+    [GeneratedRegex("(?i)(password|passwd|pwd|secret|token|api[-_]?key|access[-_]?token|client[-_]?secret)\\s*[:=]\\s*(?:\"[^\"\\r\\n]*\"|'[^'\\r\\n]*'|[^\\s,;]+)", RegexOptions.CultureInvariant)]
     private static partial Regex KeyValueSecretPattern();
 
     public static string SanitizeLine(string? value)

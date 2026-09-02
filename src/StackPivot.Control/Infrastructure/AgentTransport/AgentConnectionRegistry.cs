@@ -15,18 +15,27 @@ public sealed record AgentConnection(
 public sealed class AgentConnectionRegistry
 {
     private readonly ConcurrentDictionary<Guid, AgentConnection> connections = new();
+    private readonly object mutationLock = new();
 
     public async Task RegisterAsync(AgentConnection connection)
     {
         ArgumentNullException.ThrowIfNull(connection);
-        if (connections.TryGetValue(connection.AgentId, out var previous)
-            && !string.Equals(previous.ConnectionId, connection.ConnectionId, StringComparison.Ordinal)
-            && previous.Abort is not null)
+        AgentConnection? previous = null;
+        lock (mutationLock)
+        {
+            if (connections.TryGetValue(connection.AgentId, out var current)
+                && !string.Equals(current.ConnectionId, connection.ConnectionId, StringComparison.Ordinal))
+            {
+                previous = current;
+            }
+
+            connections[connection.AgentId] = connection;
+        }
+
+        if (previous?.Abort is not null)
         {
             await previous.Abort();
         }
-
-        connections[connection.AgentId] = connection;
     }
 
     public Task<AgentConnection?> FindAsync(Guid agentId, CancellationToken cancellationToken)
@@ -42,22 +51,32 @@ public sealed class AgentConnectionRegistry
             && string.Equals(connection.ConnectionId, connectionId, StringComparison.Ordinal);
     }
 
-    public Task RemoveAsync(string connectionId)
+    public async Task<bool> RemoveAsync(string connectionId)
     {
-        foreach (var pair in connections)
+        lock (mutationLock)
         {
-            if (string.Equals(pair.Value.ConnectionId, connectionId, StringComparison.Ordinal))
+            foreach (var pair in connections)
             {
-                connections.TryRemove(pair.Key, out _);
+                if (string.Equals(pair.Value.ConnectionId, connectionId, StringComparison.Ordinal)
+                    && connections.TryRemove(pair.Key, out _))
+                {
+                    return true;
+                }
             }
-        }
 
-        return Task.CompletedTask;
+            return false;
+        }
     }
 
     public async Task DisconnectAsync(Guid agentId)
     {
-        if (connections.TryRemove(agentId, out var connection) && connection.Abort is not null)
+        AgentConnection? connection = null;
+        lock (mutationLock)
+        {
+            connections.TryRemove(agentId, out connection);
+        }
+
+        if (connection?.Abort is not null)
         {
             await connection.Abort();
         }

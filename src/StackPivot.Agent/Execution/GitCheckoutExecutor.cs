@@ -127,15 +127,18 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
     private readonly IProcessRunner processRunner;
     private readonly PathPolicy pathPolicy;
     private readonly TimeSpan timeout;
+    private readonly IReadOnlySet<string>? allowedRemoteHosts;
 
     public GitCheckoutExecutor(
         IProcessRunner processRunner,
         PathPolicy pathPolicy,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        IReadOnlySet<string>? allowedRemoteHosts = null)
     {
         this.processRunner = processRunner ?? throw new ArgumentNullException(nameof(processRunner));
         this.pathPolicy = pathPolicy ?? throw new ArgumentNullException(nameof(pathPolicy));
         this.timeout = timeout;
+        this.allowedRemoteHosts = allowedRemoteHosts;
     }
 
     public async Task<GitCheckoutResult> MaterializeAsync(
@@ -145,7 +148,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         ArgumentNullException.ThrowIfNull(input);
         if (input.AccessToken is null
             || !ProtocolValidation.IsFullCommitHash(input.TargetCommitHash)
-            || !CentralRemotePolicy.IsAllowed(input.GitRepo)
+            || !CentralRemotePolicy.IsAllowed(input.GitRepo, allowedRemoteHosts)
             || input.AccessToken.Length == 0)
         {
             return Failure("invalid_git_input");
@@ -175,9 +178,20 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             return Failure("invalid_path");
         }
 
+        try
+        {
+            safePath = await pathPolicy.ValidateStackPathAsync(input.StackGitRelativePath, cancellationToken);
+        }
+        catch (PathPolicyException)
+        {
+            return Failure("invalid_path");
+        }
+
         Directory.CreateDirectory(safePath.FullPath);
         var gitDirectory = Path.Combine(safePath.FullPath, ".git");
-        if (File.Exists(gitDirectory) || Directory.Exists(gitDirectory) && new DirectoryInfo(gitDirectory).LinkTarget is not null)
+        if (File.Exists(gitDirectory)
+            || new FileInfo(gitDirectory).LinkTarget is not null
+            || new DirectoryInfo(gitDirectory).LinkTarget is not null)
         {
             return Failure("invalid_repository");
         }
@@ -222,9 +236,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["GIT_ASKPASS"] = askpass.AskpassPath,
                 ["GIT_TERMINAL_PROMPT"] = "0",
                 ["GIT_CONFIG_NOSYSTEM"] = "1",
-                ["GIT_CONFIG_COUNT"] = "1",
+                ["GIT_CONFIG_COUNT"] = "2",
                 ["GIT_CONFIG_KEY_0"] = "credential.helper",
-                ["GIT_CONFIG_VALUE_0"] = string.Empty
+                ["GIT_CONFIG_VALUE_0"] = string.Empty,
+                ["GIT_CONFIG_KEY_1"] = "http.followRedirects",
+                ["GIT_CONFIG_VALUE_1"] = "false"
             };
             var fetch = await RunAsync(
                 safePath.FullPath,
@@ -251,6 +267,21 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath],
                 cancellationToken,
                 environment);
+            if (tree.OutputTruncated)
+            {
+                return Failure("git_tree_output_truncated");
+            }
+
+            if (tree.TimedOut)
+            {
+                return Failure("git_tree_timeout");
+            }
+
+            if (tree.ExitCode != 0)
+            {
+                return Failure("git_tree_failed");
+            }
+
             IReadOnlyList<string> files;
             try
             {
@@ -261,8 +292,21 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 return Failure(exception.Code);
             }
 
-            var oldFiles = ReadPreviousFiles(gitDirectory);
-            RemoveManagedFiles(safePath.FullPath, oldFiles);
+            IReadOnlyList<string> oldFiles;
+            try
+            {
+                oldFiles = ReadPreviousFiles(gitDirectory);
+                await RemoveManagedFilesAsync(safePath.FullPath, oldFiles, cancellationToken);
+                var stackPathPolicy = new PathPolicy(safePath.FullPath);
+                foreach (var file in files)
+                {
+                    await stackPathPolicy.ValidateManagedFilePathAsync(file, cancellationToken);
+                }
+            }
+            catch (PathPolicyException)
+            {
+                return Failure("invalid_path");
+            }
             var checkout = await RunAsync(
                 safePath.FullPath,
                 ["read-tree", "--reset", "-u", $"{input.TargetCommitHash}:{input.StackGitRelativePath}"],
@@ -273,7 +317,14 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 return Failure("git_materialize_failed");
             }
 
-            WriteMetadata(gitDirectory, input.TargetCommitHash, input.StackGitRelativePath, files);
+            try
+            {
+                WriteMetadata(gitDirectory, input.TargetCommitHash, input.StackGitRelativePath, files);
+            }
+            catch (PathPolicyException)
+            {
+                return Failure("invalid_path");
+            }
             return new GitCheckoutResult(true, null, files);
         }
         finally
@@ -297,6 +348,12 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
     private static IReadOnlyList<string> ReadPreviousFiles(string gitDirectory)
     {
         var metadataPath = Path.Combine(gitDirectory, "stackpivot-checkout.json");
+        if (new FileInfo(metadataPath).LinkTarget is not null
+            || new DirectoryInfo(metadataPath).LinkTarget is not null)
+        {
+            throw new PathPolicyException("Checkout metadata must not be a symbolic link.");
+        }
+
         if (!File.Exists(metadataPath))
         {
             return Array.Empty<string>();
@@ -313,24 +370,30 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         }
     }
 
-    private static void RemoveManagedFiles(string root, IReadOnlyList<string> files)
+    private static async Task RemoveManagedFilesAsync(
+        string root,
+        IReadOnlyList<string> files,
+        CancellationToken cancellationToken)
     {
+        var pathPolicy = new PathPolicy(root);
         foreach (var relative in files)
         {
-            if (relative.Contains("..", StringComparison.Ordinal)
-                || Path.IsPathFullyQualified(relative))
-            {
-                continue;
-            }
+            var full = await pathPolicy.ValidateManagedFilePathAsync(relative, cancellationToken);
 
-            var full = Path.GetFullPath(relative.Replace('/', Path.DirectorySeparatorChar), root);
-            if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            if (Directory.Exists(full))
             {
-                continue;
+                throw new PathPolicyException("Managed path must be a file.");
             }
 
             if (File.Exists(full))
             {
+                var file = new FileInfo(full);
+                if (file.LinkTarget is not null)
+                {
+                    throw new PathPolicyException("Managed file is a symbolic link.");
+                }
+
+                await pathPolicy.ValidateManagedFilePathAsync(relative, cancellationToken);
                 File.Delete(full);
             }
         }
@@ -342,9 +405,16 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         string path,
         IReadOnlyList<string> files)
     {
+        var metadataPath = Path.Combine(gitDirectory, "stackpivot-checkout.json");
+        if (new FileInfo(metadataPath).LinkTarget is not null
+            || new DirectoryInfo(metadataPath).LinkTarget is not null)
+        {
+            throw new PathPolicyException("Checkout metadata must not be a symbolic link.");
+        }
+
         var metadata = new CheckoutMetadata(commit, path, files);
         var json = JsonSerializer.Serialize(metadata, MetadataJsonOptions);
-        File.WriteAllText(Path.Combine(gitDirectory, "stackpivot-checkout.json"), json);
+        File.WriteAllText(metadataPath, json);
     }
 
     private static GitCheckoutResult Failure(string errorCode)
@@ -359,11 +429,17 @@ public static class CentralRemotePolicy
 {
     public static bool IsAllowed(string? remote)
     {
+        return IsAllowed(remote, null);
+    }
+
+    public static bool IsAllowed(string? remote, IReadOnlySet<string>? allowedHosts)
+    {
         return !string.IsNullOrWhiteSpace(remote)
             && !remote.Any(char.IsControl)
             && Uri.TryCreate(remote, UriKind.Absolute, out var uri)
             && string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
             && string.IsNullOrEmpty(uri.UserInfo)
-            && !string.IsNullOrWhiteSpace(uri.Host);
+            && !string.IsNullOrWhiteSpace(uri.Host)
+            && (allowedHosts is null || allowedHosts.Contains(uri.Host));
     }
 }

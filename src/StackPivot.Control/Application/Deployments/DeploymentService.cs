@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using StackPivot.Control.Application.Audit;
 using StackPivot.Control.Authorization;
@@ -43,8 +44,6 @@ public sealed class DeploymentService(
     ICentralGitPreflight preflight,
     AuditWriter auditWriter) : IDeploymentService
 {
-    private static readonly SemaphoreSlim RequestLock = new(1, 1);
-
     public Task<DeploymentRequestResult> RequestAsync(
         Guid userId,
         Guid stackId,
@@ -68,15 +67,7 @@ public sealed class DeploymentService(
         Guid idempotencyKey,
         CancellationToken cancellationToken)
     {
-        await RequestLock.WaitAsync(cancellationToken);
-        try
-        {
-            return await RequestCoreAsync(userId, stackId, request, requestId, idempotencyKey, cancellationToken);
-        }
-        finally
-        {
-            RequestLock.Release();
-        }
+        return await RequestCoreAsync(userId, stackId, request, requestId, idempotencyKey, cancellationToken);
     }
 
     private async Task<DeploymentRequestResult> RequestCoreAsync(
@@ -213,6 +204,10 @@ public sealed class DeploymentService(
                 UserId = userId,
                 TargetCommitHash = request.TargetCommitHash,
                 TokenKeyId = checkedOut.TokenKeyId,
+                GitRepoSnapshot = checkedOut.GitRepo,
+                GitUserNameSnapshot = checkedOut.GitUserName,
+                StackGitRelativePathSnapshot = checkedOut.StackGitRelativePath,
+                AgentStackLocalPathSnapshot = checkedOut.AgentStackLocalPath,
                 TaskStatus = "pending",
                 CommandText = "docker compose up -d",
                 OutputLog = string.Empty,
@@ -229,8 +224,15 @@ public sealed class DeploymentService(
             "stack",
             stackId.ToString(),
             "accepted");
-        await dbContext.SaveChangesAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        try
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (DbUpdateException exception) when (IsActiveTaskConflict(exception))
+        {
+            throw new DeploymentRequestException("deployment_in_progress", 409, "Deployment is already running.");
+        }
 
         _ = checkedOut;
         return await BuildResultAsync(requestId, cancellationToken);
@@ -287,26 +289,69 @@ public sealed class DeploymentService(
             return null;
         }
 
+        var page = await GetOperationsPageAsync(userId, stackId, limit, null, cancellationToken);
+        return page?.Items;
+    }
+
+    public async Task<DeploymentOperationsPage?> GetOperationsPageAsync(
+        Guid userId,
+        Guid stackId,
+        int limit,
+        string? cursor,
+        CancellationToken cancellationToken)
+    {
+        var stack = await dbContext.Stacks
+            .AsNoTracking()
+            .SingleOrDefaultAsync(value => value.StackId == stackId, cancellationToken);
+        if (stack is null)
+        {
+            return null;
+        }
+
+        var access = await authorization.RequireAsync(
+            userId,
+            stack.WorkspaceId,
+            WorkspacePermission.ReadOnly,
+            cancellationToken);
+        if (!access.IsAllowed)
+        {
+            return null;
+        }
+
+        OperationsCursor? decodedCursor = null;
+        if (!string.IsNullOrWhiteSpace(cursor))
+        {
+            decodedCursor = DecodeCursor(cursor);
+        }
+
         limit = Math.Clamp(limit, 1, 100);
-        return await dbContext.ServiceOperationHistories
+        var query = dbContext.ServiceOperationHistories
             .AsNoTracking()
             .Where(value => value.StackId == stackId)
+            .AsQueryable();
+        if (decodedCursor is not null)
+        {
+            query = query.Where(value => value.LastEventAt < decodedCursor.LastEventAt
+                || value.LastEventAt == decodedCursor.LastEventAt
+                    && value.HistoryId.CompareTo(decodedCursor.HistoryId) < 0);
+        }
+
+        var histories = await query
             .OrderByDescending(value => value.LastEventAt)
-            .Take(limit)
-            .Select(value => new DeploymentTaskView(
-                value.TaskId,
-                value.AgentId,
-                value.OperationType,
-                value.TargetCommitHash,
-                value.TaskStatus,
-                value.CommandText,
-                value.ExitCode,
-                value.StartTime,
-                value.FinishTime,
-                value.OutputLog,
-                value.LogTruncated,
-                value.ErrorCode))
+            .ThenByDescending(value => value.HistoryId)
+            .Take(limit + 1)
             .ToListAsync(cancellationToken);
+        var hasMore = histories.Count > limit;
+        if (hasMore)
+        {
+            histories.RemoveAt(histories.Count - 1);
+        }
+
+        var items = histories.Select(ToView).ToList();
+        var nextCursor = hasMore && histories.Count > 0
+            ? EncodeCursor(new OperationsCursor(histories[^1].LastEventAt, histories[^1].HistoryId))
+            : null;
+        return new DeploymentOperationsPage(items, nextCursor);
     }
 
     private async Task<DeploymentRequestResult> BuildResultAsync(
@@ -333,24 +378,12 @@ public sealed class DeploymentService(
         DeploymentRequestEntity request,
         CancellationToken cancellationToken)
     {
-        var tasks = await dbContext.ServiceOperationHistories
+        var histories = await dbContext.ServiceOperationHistories
             .AsNoTracking()
             .Where(value => value.RequestId == request.RequestId)
             .OrderBy(value => value.AgentId)
-            .Select(value => new DeploymentTaskView(
-                value.TaskId,
-                value.AgentId,
-                value.OperationType,
-                value.TargetCommitHash,
-                value.TaskStatus,
-                value.CommandText,
-                value.ExitCode,
-                value.StartTime,
-                value.FinishTime,
-                value.OutputLog,
-                value.LogTruncated,
-                value.ErrorCode))
             .ToListAsync(cancellationToken);
+        var tasks = histories.Select(ToView).ToList();
         return new DeploymentRequestView(request.RequestId, tasks);
     }
 
@@ -378,5 +411,70 @@ public sealed class DeploymentService(
         var digest = SHA256.HashData(bytes);
         CryptographicOperations.ZeroMemory(bytes);
         return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+
+    private static bool IsActiveTaskConflict(DbUpdateException exception)
+    {
+        return exception.InnerException is Microsoft.Data.Sqlite.SqliteException sqlite
+            && sqlite.SqliteErrorCode == 19
+            && sqlite.Message.Contains("service_operation_history", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IReadOnlyList<DeploymentLogEntryView> ParseLogEntries(string json)
+    {
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<List<DeploymentLogEntryView>>(json)
+                ?? new List<DeploymentLogEntryView>();
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return Array.Empty<DeploymentLogEntryView>();
+        }
+    }
+
+    private static string EncodeCursor(OperationsCursor cursor)
+    {
+        var json = JsonSerializer.Serialize(cursor);
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(json))
+            .Replace('+', '-')
+            .Replace('/', '_')
+            .TrimEnd('=');
+    }
+
+    private static OperationsCursor DecodeCursor(string cursor)
+    {
+        try
+        {
+            var padded = cursor.Replace('-', '+').Replace('_', '/');
+            padded = padded.PadRight(padded.Length + (4 - padded.Length % 4) % 4, '=');
+            var json = Encoding.UTF8.GetString(Convert.FromBase64String(padded));
+            return JsonSerializer.Deserialize<OperationsCursor>(json)
+                ?? throw new FormatException();
+        }
+        catch (Exception exception) when (exception is FormatException or JsonException or ArgumentException)
+        {
+            throw new DeploymentRequestException("invalid_cursor", 422, "Deployment history cursor is invalid.");
+        }
+    }
+
+    private sealed record OperationsCursor(DateTimeOffset LastEventAt, Guid HistoryId);
+
+    private static DeploymentTaskView ToView(ServiceOperationHistory value)
+    {
+        return new DeploymentTaskView(
+            value.TaskId,
+            value.AgentId,
+            value.OperationType,
+            value.TargetCommitHash,
+            value.TaskStatus,
+            value.CommandText,
+            value.ExitCode,
+            value.StartTime,
+            value.FinishTime,
+            value.OutputLog,
+            value.LogTruncated,
+            value.ErrorCode,
+            ParseLogEntries(value.OutputLogEntriesJson));
     }
 }

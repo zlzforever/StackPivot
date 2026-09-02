@@ -2,6 +2,8 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.EntityFrameworkCore;
 using StackPivot.Control.Api;
 using StackPivot.Control.Application.Audit;
@@ -58,11 +60,14 @@ builder.Services.AddSingleton<IAgentTransport, SignalRAgentTransport>();
 builder.Services.AddHostedService<DeploymentDispatchWorker>();
 builder.Services.AddAuthentication(options =>
     {
-        options.DefaultAuthenticateScheme = "sso";
-        options.DefaultChallengeScheme = "sso";
+        options.DefaultAuthenticateScheme = SsoAuthenticationDefaults.CookieScheme;
+        options.DefaultSignInScheme = SsoAuthenticationDefaults.CookieScheme;
+        options.DefaultChallengeScheme = SsoAuthenticationDefaults.Scheme;
     })
-    .AddCookie("sso", options =>
+    .AddCookie(SsoAuthenticationDefaults.CookieScheme, options =>
     {
+        options.Cookie.Name = "StackPivot.SsoSession";
+        options.SlidingExpiration = true;
         options.Events.OnRedirectToLogin = context =>
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -74,6 +79,24 @@ builder.Services.AddAuthentication(options =>
             return Task.CompletedTask;
         };
     })
+    .AddOpenIdConnect(SsoAuthenticationDefaults.Scheme, options =>
+    {
+        options.Authority = builder.Configuration["Sso:Authority"] ?? string.Empty;
+        options.ClientId = builder.Configuration["Sso:ClientId"] ?? string.Empty;
+        options.ClientSecret = builder.Configuration["Sso:ClientSecret"] ?? string.Empty;
+        options.MapInboundClaims = false;
+        options.ResponseType = "code";
+        options.UsePkce = true;
+        options.SaveTokens = false;
+        options.GetClaimsFromUserInfoEndpoint = false;
+        options.SignInScheme = SsoAuthenticationDefaults.CookieScheme;
+        options.RequireHttpsMetadata = true;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            NameClaimType = "sub",
+            RoleClaimType = "role"
+        };
+    })
     .AddScheme<AuthenticationSchemeOptions, AgentApiKeyAuthenticationHandler>(
         AgentApiKeyDefaults.AuthenticationScheme,
         _ => { });
@@ -81,11 +104,12 @@ builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("sso", policy =>
     {
-        policy.AddAuthenticationSchemes("sso");
+        policy.AddAuthenticationSchemes(SsoAuthenticationDefaults.CookieScheme);
         policy.RequireAuthenticatedUser();
     });
 });
 builder.Services.AddProblemDetails();
+builder.Services.AddAntiforgery(options => options.HeaderName = "X-CSRF-TOKEN");
 builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 builder.Services.AddCascadingAuthenticationState();
 builder.Services.AddSignalR()

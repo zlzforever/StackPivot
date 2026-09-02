@@ -62,10 +62,18 @@ public sealed class ComposeExecutor
 
     public async Task<ComposeExecutionResult> ExecuteUpAsync(
         string workingDirectory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<ProcessOutputLine, ValueTask>? outputHandler = null)
     {
         var execution = await processRunner.RunAsync(
-            new ProcessRequest("docker", ComposeUpArguments, workingDirectory, Timeout: timeout),
+            new ProcessRequest(
+                "docker",
+                ComposeUpArguments,
+                workingDirectory,
+                Timeout: timeout,
+                OutputHandler: outputHandler is null
+                    ? null
+                    : line => outputHandler(new ProcessOutputLine(line.Stream, sanitizer.Sanitize(line.Text)))),
             cancellationToken);
         var sanitized = Sanitize(execution);
         var errorCode = execution.TimedOut ? "process_timeout" : execution.ExitCode == 0 ? null : "compose_failed";

@@ -18,6 +18,19 @@ public sealed class LogSanitizerTests
     }
 
     [Fact]
+    public void QuotedSecretValuesIncludingSpacesAreFullyRedacted()
+    {
+        var sanitizer = new LogSanitizer();
+
+        var line = sanitizer.Sanitize("password=\"hunter 2\" token='quoted secret' keep=ok");
+
+        Assert.DoesNotContain("hunter 2", line);
+        Assert.DoesNotContain("quoted secret", line);
+        Assert.DoesNotContain("2\"", line);
+        Assert.Contains("keep=ok", line);
+    }
+
+    [Fact]
     public void ALineIsLimitedTo16Kibibytes()
     {
         var sanitizer = new LogSanitizer();

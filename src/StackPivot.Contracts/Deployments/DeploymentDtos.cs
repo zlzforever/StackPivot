@@ -65,7 +65,16 @@ public sealed record DeploymentTaskView(
     [property: JsonPropertyName("finishedAt")] DateTimeOffset? FinishedAt,
     [property: JsonPropertyName("outputLog")] string OutputLog,
     [property: JsonPropertyName("logTruncated")] bool LogTruncated,
-    [property: JsonPropertyName("errorCode")] string? ErrorCode);
+    [property: JsonPropertyName("errorCode")] string? ErrorCode,
+    [property: JsonPropertyName("logEntries")] IReadOnlyList<DeploymentLogEntryView>? LogEntries = null);
+
+public sealed record DeploymentLogEntryView(
+    [property: JsonPropertyName("stream")] string Stream,
+    [property: JsonPropertyName("line")] string Line);
+
+public sealed record DeploymentOperationsPage(
+    [property: JsonPropertyName("items")] IReadOnlyList<DeploymentTaskView> Items,
+    [property: JsonPropertyName("nextCursor")] string? NextCursor);
 
 public sealed record DeploymentRequestView(
     [property: JsonPropertyName("requestId")] Guid RequestId,

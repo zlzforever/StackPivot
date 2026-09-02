@@ -1,8 +1,10 @@
 @page "/workspaces/{WorkspaceId:guid}/stacks"
+@attribute [Authorize]
 @rendermode InteractiveServer
 @inject StackPivotDbContext DbContext
 @inject AuthenticationStateProvider AuthenticationStateProvider
 @inject WorkspaceAuthorizationService Authorization
+@inject IUserIdentityService UserIdentityService
 
 <PageTitle>Stacks</PageTitle>
 <h1>Stacks</h1>
@@ -43,10 +45,16 @@ else
     protected override async Task OnInitializedAsync()
     {
         var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        var subject = state.User.FindFirst("sub")?.Value;
-        var user = string.IsNullOrWhiteSpace(subject)
-            ? null
-            : await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
+        UserAccount? user;
+        try
+        {
+            user = await UserIdentityService.UpsertFromClaimsAsync(state.User, CancellationToken.None);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            user = null;
+        }
+
         if (user is null || !(await Authorization.RequireAsync(user.UserId, WorkspaceId, WorkspacePermission.ReadOnly, CancellationToken.None)).IsAllowed)
         {
             stacks = new List<StackView>();

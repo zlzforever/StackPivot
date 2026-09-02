@@ -89,10 +89,11 @@ public sealed class AgentHub(
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        await registry.RemoveAsync(Context.ConnectionId);
+        var removed = await registry.RemoveAsync(Context.ConnectionId);
         var identity = Context.User?.FindFirstValue("agent_id");
-        if (Guid.TryParse(identity, out var agentId))
+        if (removed && Guid.TryParse(identity, out var agentId))
         {
+            await dispatcher.HandleAgentDisconnectedAsync(agentId, CancellationToken.None);
             auditWriter.Add(
                 AuditActions.AgentDisconnected,
                 null,

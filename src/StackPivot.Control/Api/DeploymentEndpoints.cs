@@ -6,6 +6,7 @@ using StackPivot.Control.Auth;
 using StackPivot.Control.Application.Deployments;
 using StackPivot.Contracts.Deployments;
 using StackPivot.Contracts.SignalR;
+using StackPivot.Control.Infrastructure.Git;
 
 namespace StackPivot.Control.Api;
 
@@ -17,7 +18,7 @@ public static class DeploymentEndpoints
                 "/api/stacks/{stackId:guid}/deployments",
                 async (Guid stackId, HttpContext context, DeploymentService service, ISsoIdentityAdapter adapter, IUserIdentityService users) =>
                 {
-                    if (!ApiProblem.TryGetRequiredGuidHeader(context.Request, "X-Request-Id", out var requestId)
+                    if (!ApiProblem.TryGetWriteRequestId(context, out var requestId)
                         || !ApiProblem.TryGetRequiredGuidHeader(context.Request, "Idempotency-Key", out var idempotencyKey))
                     {
                         return ApiProblem.Create(context, "invalid_request", 422, "Request UUID headers are required.");
@@ -55,8 +56,13 @@ public static class DeploymentEndpoints
                     {
                         return ApiProblem.Create(context, exception.Code, exception.StatusCode, exception.Message, requestId);
                     }
+                    catch (DeploymentValidationException exception)
+                    {
+                        return ApiProblem.Create(context, exception.Code, exception.StatusCode, exception.Message, requestId);
+                    }
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .RequireCookieAntiforgery();
 
         endpoints.MapGet(
                 "/api/deployments/{requestId:guid}",
@@ -80,16 +86,20 @@ public static class DeploymentEndpoints
 
         endpoints.MapGet(
                 "/api/stacks/{stackId:guid}/operations",
-                async (Guid stackId, HttpContext context, DeploymentService service, ISsoIdentityAdapter adapter, IUserIdentityService users, int? limit) =>
+                async (Guid stackId, HttpContext context, DeploymentService service, ISsoIdentityAdapter adapter, IUserIdentityService users, int? limit, string? cursor) =>
                 {
                     try
                     {
                         var identity = adapter.Require(context);
                         var user = await users.UpsertFromSsoAsync(identity, context.RequestAborted);
-                        var result = await service.GetOperationsAsync(user.UserId, stackId, limit ?? 50, context.RequestAborted);
+                        var result = await service.GetOperationsPageAsync(user.UserId, stackId, limit ?? 50, cursor, context.RequestAborted);
                         return result is null
                             ? ApiProblem.Create(context, "resource_not_found", 404, "Stack was not found.")
                             : Results.Ok(result);
+                    }
+                    catch (DeploymentRequestException exception)
+                    {
+                        return ApiProblem.Create(context, exception.Code, exception.StatusCode, exception.Message);
                     }
                     catch (UnauthorizedAccessException)
                     {

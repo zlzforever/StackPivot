@@ -112,19 +112,17 @@ public static class WorkspaceEndpoints
                             .Include(value => value.Agent)
                             .Where(value => value.StackId == stackId && value.Agent != null && value.Agent.RevokedAt == null)
                             .ToListAsync(context.RequestAborted);
-                        var result = new List<AgentNodeView>(bindings.Count);
+                        var result = new List<DeploymentTargetView>(bindings.Count);
                         foreach (var binding in bindings)
                         {
                             var agent = binding.Agent!;
                             var online = await registry.FindAsync(agent.AgentId, context.RequestAborted) is not null;
-                            result.Add(new AgentNodeView(
+                            result.Add(new DeploymentTargetView(
                                 agent.AgentId,
                                 agent.Name,
                                 online,
                                 agent.LastSeenAt,
-                                ParseCapabilities(agent.CapabilitiesJson),
-                                agent.ApiKeyLast4,
-                                agent.ApiKeyVersion));
+                                ParseCapabilities(agent.CapabilitiesJson)));
                         }
 
                         return Results.Ok(result);

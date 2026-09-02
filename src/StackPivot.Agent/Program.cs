@@ -26,7 +26,13 @@ if (!Uri.TryCreate(controlHubUrl, UriKind.Absolute, out var hubUri)
     throw new InvalidOperationException("StackPivot:ControlHubUrl must use wss.");
 }
 
-var agentOptions = new AgentOptions(agentId, controlHubUrl, apiKey, "/opt/agent-main");
+var allowedRemoteHosts = (builder.Configuration["StackPivot:AllowedRemoteHosts"] ?? string.Empty)
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+var agentOptions = new AgentOptions(agentId, controlHubUrl, apiKey, "/opt/agent-main")
+{
+    AllowedRemoteHosts = allowedRemoteHosts
+};
 builder.Services.AddSingleton(agentOptions);
 builder.Services.AddSingleton<PathPolicy>(services => new PathPolicy(services.GetRequiredService<AgentOptions>().AgentRoot));
 builder.Services.AddSingleton<IProcessRunner, ProcessRunner>();
@@ -34,7 +40,8 @@ builder.Services.AddSingleton<GitCheckoutExecutor>(services =>
     new GitCheckoutExecutor(
         services.GetRequiredService<IProcessRunner>(),
         services.GetRequiredService<PathPolicy>(),
-        TimeSpan.FromMinutes(15)));
+        TimeSpan.FromMinutes(15),
+        services.GetRequiredService<AgentOptions>().AllowedRemoteHosts));
 builder.Services.AddSingleton<ComposeExecutor>(services =>
     new ComposeExecutor(services.GetRequiredService<IProcessRunner>(), TimeSpan.FromMinutes(15)));
 builder.Services.AddSingleton<IStackExecutor, StackExecutor>();

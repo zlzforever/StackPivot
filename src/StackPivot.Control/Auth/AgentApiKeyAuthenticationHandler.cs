@@ -4,6 +4,8 @@ using System.Text.Encodings.Web;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
+using StackPivot.Control.Application.Audit;
 using Microsoft.Extensions.Options;
 using StackPivot.Control.Domain.Entities;
 using StackPivot.Control.Infrastructure.Persistence;
@@ -118,20 +120,46 @@ public sealed class AgentApiKeyManager
     }
 }
 
-public sealed class AgentApiKeyService(StackPivotDbContext dbContext, AgentApiKeyManager manager)
+public sealed class AgentApiKeyService(
+    StackPivotDbContext dbContext,
+    AgentApiKeyManager manager,
+    AuditWriter? auditWriter = null)
 {
-    public async Task<AgentApiKeyIssue> IssueAgentKeyAsync(
-        Guid agentId,
+    public sealed record AgentCreationResult(AgentNode Agent, AgentApiKeyIssue Issue);
+
+    public async Task<AgentCreationResult> CreateAgentWithKeyAsync(
+        string name,
+        string remark,
+        Guid actorUserId,
+        Guid requestId,
         CancellationToken cancellationToken)
     {
-        var agent = await RequireAgentAsync(agentId, cancellationToken);
-        var issue = manager.Issue(agentId, Math.Max(1, agent.ApiKeyVersion + 1));
+        await using var transaction = await BeginTransactionAsync(cancellationToken);
+        var agent = new AgentNode
+        {
+            AgentId = Guid.NewGuid(),
+            Name = name,
+            Remark = remark,
+            CapabilitiesJson = "[]"
+        };
+        dbContext.AgentNodes.Add(agent);
+        await dbContext.SaveChangesAsync(cancellationToken);
+        var issue = manager.Issue(agent.AgentId, 1);
         agent.ApiKeyHash = issue.ApiKeyHash;
         agent.ApiKeyVersion = issue.Version;
         agent.ApiKeyLast4 = issue.ApiKeyLast4;
         agent.RevokedAt = null;
+        AddAudit(AuditActions.AgentKeyCreated, requestId, actorUserId, agent.AgentId, "success");
         await dbContext.SaveChangesAsync(cancellationToken);
-        return issue;
+        await transaction.CommitAsync(cancellationToken);
+        return new AgentCreationResult(agent, issue);
+    }
+
+    public async Task<AgentApiKeyIssue> IssueAgentKeyAsync(
+        Guid agentId,
+        CancellationToken cancellationToken)
+    {
+        return await IssueAgentKeyAsync(agentId, null, null, null, cancellationToken);
     }
 
     public async Task<AgentApiKeyIssue> RotateKeyAsync(Guid agentId, CancellationToken cancellationToken)
@@ -139,11 +167,92 @@ public sealed class AgentApiKeyService(StackPivotDbContext dbContext, AgentApiKe
         return await IssueAgentKeyAsync(agentId, cancellationToken);
     }
 
+    public Task<AgentApiKeyIssue> RotateKeyAsync(
+        Guid agentId,
+        Guid actorUserId,
+        Guid requestId,
+        CancellationToken cancellationToken)
+    {
+        return IssueAgentKeyAsync(agentId, actorUserId, requestId, AuditActions.AgentKeyRotated, cancellationToken);
+    }
+
+    public async Task<AgentApiKeyIssue> IssueAgentKeyAsync(
+        Guid agentId,
+        Guid? actorUserId,
+        Guid? requestId,
+        string? auditAction,
+        CancellationToken cancellationToken)
+    {
+        if (agentId == Guid.Empty)
+        {
+            throw new KeyNotFoundException("Agent was not found.");
+        }
+
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            dbContext.ChangeTracker.Clear();
+            var agent = await RequireAgentAsync(agentId, cancellationToken);
+            var issue = manager.Issue(agentId, Math.Max(1, agent.ApiKeyVersion + 1));
+            agent.ApiKeyHash = issue.ApiKeyHash;
+            agent.ApiKeyVersion = issue.Version;
+            agent.ApiKeyLast4 = issue.ApiKeyLast4;
+            agent.RevokedAt = null;
+            await using var transaction = await BeginTransactionAsync(cancellationToken);
+            try
+            {
+                AddAudit(auditAction, requestId, actorUserId, agentId, "success");
+                await dbContext.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return issue;
+            }
+            catch (DbUpdateConcurrencyException) when (attempt < 4)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException exception) when (IsBusy(exception) && attempt < 4)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+        }
+
+        throw new InvalidOperationException("Agent key operation could not be completed safely.");
+    }
+
     public async Task RevokeKeyAsync(Guid agentId, CancellationToken cancellationToken)
     {
-        var agent = await RequireAgentAsync(agentId, cancellationToken);
-        agent.RevokedAt = DateTimeOffset.UtcNow;
-        await dbContext.SaveChangesAsync(cancellationToken);
+        await RevokeKeyAsync(agentId, null, null, cancellationToken);
+    }
+
+    public async Task RevokeKeyAsync(
+        Guid agentId,
+        Guid? actorUserId,
+        Guid? requestId,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            dbContext.ChangeTracker.Clear();
+            var agent = await RequireAgentAsync(agentId, cancellationToken);
+            agent.RevokedAt = DateTimeOffset.UtcNow;
+            await using var transaction = await BeginTransactionAsync(cancellationToken);
+            try
+            {
+                AddAudit(AuditActions.AgentKeyRevoked, requestId, actorUserId, agentId, "success");
+                await dbContext.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return;
+            }
+            catch (DbUpdateConcurrencyException) when (attempt < 4)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException exception) when (IsBusy(exception) && attempt < 4)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+        }
+
+        throw new InvalidOperationException("Agent key operation could not be completed safely.");
     }
 
     public bool Verify(AgentNode agent, string candidate)
@@ -157,6 +266,53 @@ public sealed class AgentApiKeyService(StackPivotDbContext dbContext, AgentApiKe
         return await dbContext.AgentNodes.SingleOrDefaultAsync(value => value.AgentId == agentId, cancellationToken)
             ?? throw new KeyNotFoundException("Agent was not found.");
     }
+
+    private void AddAudit(
+        string? action,
+        Guid? requestId,
+        Guid? actorUserId,
+        Guid agentId,
+        string result)
+    {
+        if (action is null || auditWriter is null)
+        {
+            return;
+        }
+
+        auditWriter.Add(action, requestId, actorUserId, agentId, "agent", agentId.ToString(), result);
+    }
+
+    private Task<IDbContextTransaction> BeginTransactionAsync(CancellationToken cancellationToken)
+    {
+        return BeginTransactionWithRetryAsync(cancellationToken);
+    }
+
+    private async Task<IDbContextTransaction> BeginTransactionWithRetryAsync(CancellationToken cancellationToken)
+    {
+        Microsoft.Data.Sqlite.SqliteException? lastBusy = null;
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                return await dbContext.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, cancellationToken);
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException exception) when (IsBusy(exception))
+            {
+                lastBusy = exception;
+                if (attempt == 4)
+                {
+                    break;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(25 * (attempt + 1)), cancellationToken);
+            }
+        }
+
+        throw new InvalidOperationException("Agent key transaction could not be started safely.", lastBusy);
+    }
+
+    private static bool IsBusy(Microsoft.Data.Sqlite.SqliteException exception) =>
+        exception.SqliteErrorCode is 5 or 6;
 }
 
 public sealed class AgentApiKeyAuthenticationHandler(

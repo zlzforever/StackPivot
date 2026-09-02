@@ -70,21 +70,7 @@ public sealed class AgentTaskCoordinator
             await reporter.ReportAcceptedAsync(
                 new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
                 cancellationToken);
-            result = await ExecuteSafelyAsync(command, cancellationToken);
-            var sequence = 0L;
-            foreach (var line in result.OutputLog.Split('\n', StringSplitOptions.None))
-            {
-                await reporter.ReportLogAsync(
-                    new TaskLog(
-                        ProtocolVersion.Current,
-                        command.TaskId,
-                        agentId,
-                        sequence++,
-                        "stdout",
-                        line,
-                        DateTimeOffset.UtcNow),
-                    cancellationToken);
-            }
+            result = await ExecuteAndStreamAsync(command, reporter, cancellationToken);
 
             completedTasks[command.TaskId] = result;
             await reporter.ReportCompletedAsync(CreateCompleted(command, result), cancellationToken);
@@ -119,6 +105,64 @@ public sealed class AgentTaskCoordinator
         }
     }
 
+    private async Task<AgentExecutionResult> ExecuteAndStreamAsync(
+        DeployStackCommand command,
+        IAgentTaskReporter reporter,
+        CancellationToken cancellationToken)
+    {
+        var sequence = 0L;
+        if (executor is IStreamingStackExecutor streamingExecutor)
+        {
+            using var logLock = new SemaphoreSlim(1, 1);
+            return await streamingExecutor.ExecuteAsync(
+                command,
+                async entry =>
+                {
+                    if (entry.Stream is not ("stdout" or "stderr"))
+                    {
+                        return;
+                    }
+
+                    await logLock.WaitAsync(cancellationToken);
+                    try
+                    {
+                        await reporter.ReportLogAsync(
+                            new TaskLog(
+                                ProtocolVersion.Current,
+                                command.TaskId,
+                                agentId,
+                                sequence++,
+                                entry.Stream,
+                                entry.Line,
+                                DateTimeOffset.UtcNow),
+                            cancellationToken);
+                    }
+                    finally
+                    {
+                        logLock.Release();
+                    }
+                },
+                cancellationToken);
+        }
+
+        var result = await ExecuteSafelyAsync(command, cancellationToken);
+        foreach (var line in result.OutputLog.Split('\n', StringSplitOptions.None))
+        {
+            await reporter.ReportLogAsync(
+                new TaskLog(
+                    ProtocolVersion.Current,
+                    command.TaskId,
+                    agentId,
+                    sequence++,
+                    "stdout",
+                    line,
+                    DateTimeOffset.UtcNow),
+                cancellationToken);
+        }
+
+        return result;
+    }
+
     private async Task<AgentExecutionResult> ExecuteSafelyAsync(
         DeployStackCommand command,
         CancellationToken cancellationToken)
@@ -148,6 +192,7 @@ public sealed class AgentTaskCoordinator
             result.Success,
             result.ExitCode,
             result.ErrorCode,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            result.LogTruncated);
     }
 }

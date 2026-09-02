@@ -27,6 +27,34 @@ public sealed class PathPolicy
         return Task.FromResult(Validate(relativePath));
     }
 
+    public Task<string> ValidateManagedFilePathAsync(
+        string relativePath,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(relativePath)
+            || relativePath.Any(character => char.IsControl(character) || character is '\\' or ':' or '\0')
+            || Path.IsPathFullyQualified(relativePath))
+        {
+            throw new PathPolicyException("Managed path must be relative and contain no control characters.");
+        }
+
+        var segments = relativePath.Split('/', StringSplitOptions.None);
+        if (segments.Any(segment => string.IsNullOrEmpty(segment) || segment is "." or ".."))
+        {
+            throw new PathPolicyException("Managed path contains an unsafe segment.");
+        }
+
+        var fullPath = Path.GetFullPath(relativePath.Replace('/', Path.DirectorySeparatorChar), configuredRoot);
+        if (!fullPath.StartsWith(configuredRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            throw new PathPolicyException("Managed path escapes the agent root.");
+        }
+
+        EnsureNoSymlinkEscape(segments);
+        return Task.FromResult(fullPath);
+    }
+
     public Task<SafePath> ValidateStackPathAsync(
         string configuredRoot,
         string relativePath,
@@ -67,21 +95,31 @@ public sealed class PathPolicy
 
     private void EnsureNoSymlinkEscape(IReadOnlyList<string> segments)
     {
+        EnsureDirectoryIsNotSymlink(configuredRoot);
         var current = configuredRoot;
         foreach (var segment in segments)
         {
             current = Path.Combine(current, segment);
-            var directory = new DirectoryInfo(current);
-            if (directory.Exists && directory.LinkTarget is not null)
+            var entry = new FileInfo(current);
+            if (entry.LinkTarget is not null)
             {
                 throw new PathPolicyException("Stack path contains a symbolic link.");
             }
 
-            var file = new FileInfo(current);
-            if (file.Exists && file.LinkTarget is not null)
+            var directory = new DirectoryInfo(current);
+            if (directory.LinkTarget is not null)
             {
                 throw new PathPolicyException("Stack path contains a symbolic link.");
             }
+        }
+    }
+
+    private static void EnsureDirectoryIsNotSymlink(string path)
+    {
+        var directory = new DirectoryInfo(path);
+        if (directory.LinkTarget is not null)
+        {
+            throw new PathPolicyException("Agent root contains a symbolic link.");
         }
     }
 }

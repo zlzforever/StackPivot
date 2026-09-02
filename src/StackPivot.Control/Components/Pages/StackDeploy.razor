@@ -1,9 +1,11 @@
 @page "/stacks/{StackId:guid}/deploy"
+@attribute [Authorize]
 @rendermode InteractiveServer
 @inject StackPivotDbContext DbContext
 @inject AuthenticationStateProvider AuthenticationStateProvider
 @inject WorkspaceAuthorizationService Authorization
 @inject IDeploymentService DeploymentService
+@inject IUserIdentityService UserIdentityService
 
 <PageTitle>部署 Stack</PageTitle>
 <h1>部署</h1>
@@ -70,13 +72,17 @@ else
     protected override async Task OnInitializedAsync()
     {
         var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        var subject = state.User.FindFirst("sub")?.Value;
-        if (string.IsNullOrWhiteSpace(subject))
+        UserAccount? user;
+        try
         {
+            user = await UserIdentityService.UpsertFromClaimsAsync(state.User, CancellationToken.None);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            stack = null;
             return;
         }
 
-        var user = await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
         stack = await DbContext.Stacks.AsNoTracking().SingleOrDefaultAsync(value => value.StackId == StackId);
         if (user is null || stack is null)
         {

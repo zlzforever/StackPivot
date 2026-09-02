@@ -18,14 +18,41 @@ public interface IStackExecutor
         CancellationToken cancellationToken);
 }
 
+public sealed record AgentLogEntry(string Stream, string Line);
+
+public interface IStreamingStackExecutor
+{
+    Task<AgentExecutionResult> ExecuteAsync(
+        DeployStackCommand command,
+        Func<AgentLogEntry, ValueTask> logHandler,
+        CancellationToken cancellationToken);
+}
+
 public sealed class StackExecutor(
     AgentOptions agentOptions,
     PathPolicy pathPolicy,
     ComposeExecutor composeExecutor,
-    IGitCheckoutExecutor gitCheckoutExecutor) : IStackExecutor
+    IGitCheckoutExecutor gitCheckoutExecutor) : IStackExecutor, IStreamingStackExecutor
 {
     public async Task<AgentExecutionResult> ExecuteAsync(
         DeployStackCommand command,
+        CancellationToken cancellationToken)
+    {
+        return await ExecuteCoreAsync(command, null, cancellationToken);
+    }
+
+    public async Task<AgentExecutionResult> ExecuteAsync(
+        DeployStackCommand command,
+        Func<AgentLogEntry, ValueTask> logHandler,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(logHandler);
+        return await ExecuteCoreAsync(command, logHandler, cancellationToken);
+    }
+
+    private async Task<AgentExecutionResult> ExecuteCoreAsync(
+        DeployStackCommand command,
+        Func<AgentLogEntry, ValueTask>? logHandler,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
@@ -108,7 +135,12 @@ public sealed class StackExecutor(
                 return Failure(gitResult.ErrorCode ?? "git_failed");
             }
 
-            var composeResult = await composeExecutor.ExecuteUpAsync(safePath.FullPath, cancellationToken);
+            var composeResult = await composeExecutor.ExecuteUpAsync(
+                safePath.FullPath,
+                cancellationToken,
+                logHandler is null
+                    ? null
+                    : output => logHandler(new AgentLogEntry(output.Stream, output.Text)));
             return new AgentExecutionResult(
                 composeResult.Success,
                 composeResult.ExitCode,

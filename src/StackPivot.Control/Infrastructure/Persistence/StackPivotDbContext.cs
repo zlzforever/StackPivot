@@ -120,7 +120,7 @@ public sealed class StackPivotDbContext(DbContextOptions<StackPivotDbContext> op
         entity.Property(value => value.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
         entity.Property(value => value.Remark).HasColumnName("remark").HasMaxLength(500).IsRequired();
         entity.Property(value => value.ApiKeyHash).HasColumnName("api_key_hash").HasMaxLength(100).IsRequired();
-        entity.Property(value => value.ApiKeyVersion).HasColumnName("api_key_version");
+        entity.Property(value => value.ApiKeyVersion).HasColumnName("api_key_version").IsConcurrencyToken();
         entity.Property(value => value.ApiKeyLast4).HasColumnName("api_key_last4").HasMaxLength(4);
         entity.Property(value => value.RevokedAt).HasColumnName("revoked_at");
         entity.Property(value => value.LastSeenAt).HasColumnName("last_seen_at");
@@ -185,7 +185,17 @@ public sealed class StackPivotDbContext(DbContextOptions<StackPivotDbContext> op
         entity.Property(value => value.LastSequence).HasColumnName("last_sequence");
         entity.Property(value => value.LastEventAt).HasColumnName("last_event_at");
         entity.Property(value => value.DispatchedAt).HasColumnName("dispatched_at");
+        entity.Property(value => value.DispatchAttemptAt).HasColumnName("dispatch_attempt_at");
+        entity.Property(value => value.AcceptedAt).HasColumnName("accepted_at");
         entity.Property(value => value.TokenKeyId).HasColumnName("token_key_id").HasMaxLength(100).IsRequired();
+        entity.Property(value => value.GitRepoSnapshot).HasColumnName("git_repo_snapshot").HasMaxLength(1000);
+        entity.Property(value => value.GitUserNameSnapshot).HasColumnName("git_user_name_snapshot").HasMaxLength(200);
+        entity.Property(value => value.StackGitRelativePathSnapshot).HasColumnName("stack_git_relative_path_snapshot").HasMaxLength(200);
+        entity.Property(value => value.AgentStackLocalPathSnapshot).HasColumnName("agent_stack_local_path_snapshot").HasMaxLength(1000);
+        entity.Property(value => value.OutputLogEntriesJson).HasColumnName("output_log_entries_json").IsRequired();
+        entity.HasIndex(value => new { value.StackId, value.AgentId })
+            .IsUnique()
+            .HasFilter("task_status = 'pending'");
         entity.HasIndex(value => value.TaskId).IsUnique();
         entity.HasIndex(value => value.RequestId);
         entity.HasIndex(value => new { value.StackId, value.LastEventAt });

@@ -1,8 +1,10 @@
 @page "/"
 @page "/workspaces"
+@attribute [Authorize]
 @rendermode InteractiveServer
 @inject StackPivotDbContext DbContext
 @inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IUserIdentityService UserIdentityService
 
 <PageTitle>Workspaces</PageTitle>
 <h1>Workspaces</h1>
@@ -35,15 +37,12 @@ else
     protected override async Task OnInitializedAsync()
     {
         var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        var subject = state.User.FindFirst("sub")?.Value;
-        if (string.IsNullOrWhiteSpace(subject))
+        UserAccount user;
+        try
         {
-            workspaces = new List<WorkspaceView>();
-            return;
+            user = await UserIdentityService.UpsertFromClaimsAsync(state.User, CancellationToken.None);
         }
-
-        var user = await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
-        if (user is null)
+        catch (UnauthorizedAccessException)
         {
             workspaces = new List<WorkspaceView>();
             return;

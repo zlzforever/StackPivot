@@ -64,6 +64,19 @@ public sealed class AgentTaskCoordinatorTests
         Assert.All(secondCommand.AccessToken, value => Assert.Equal(0, value));
     }
 
+    [Fact]
+    public async Task StreamingExecutorReportsBothStreamsBeforeCompletionAndPreservesTruncation()
+    {
+        var coordinator = new AgentTaskCoordinator(AgentId, new StreamingExecutor());
+        var reporter = new RecordingReporter();
+
+        await coordinator.HandleAsync(CreateCommand(), reporter, CancellationToken.None);
+
+        Assert.Equal(["stdout:first", "stderr:second"], reporter.Logs.Select(log => log.Stream + ":" + log.Line));
+        Assert.Single(reporter.Completed);
+        Assert.True(reporter.Completed[0].LogTruncated);
+    }
+
     private static DeployStackCommand CreateCommand(byte[]? accessToken = null)
     {
         return new DeployStackCommand(
@@ -104,6 +117,22 @@ public sealed class AgentTaskCoordinatorTests
         {
             ExecutionCount++;
             throw new InvalidOperationException("test failure");
+        }
+    }
+
+    private sealed class StreamingExecutor : IStackExecutor, IStreamingStackExecutor
+    {
+        public Task<AgentExecutionResult> ExecuteAsync(DeployStackCommand command, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public async Task<AgentExecutionResult> ExecuteAsync(
+            DeployStackCommand command,
+            Func<AgentLogEntry, ValueTask> logHandler,
+            CancellationToken cancellationToken)
+        {
+            await logHandler(new AgentLogEntry("stdout", "first"));
+            await logHandler(new AgentLogEntry("stderr", "second"));
+            return new AgentExecutionResult(true, 0, string.Empty, true);
         }
     }
 

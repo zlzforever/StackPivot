@@ -1,12 +1,15 @@
+using System.Data.Common;
 using System.Security.Claims;
 using System.Text;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.AspNetCore.Http;
 using StackPivot.Control.Auth;
 using StackPivot.Control.Authorization;
 using StackPivot.Control.Domain.Entities;
 using StackPivot.Control.Infrastructure.Persistence;
+using StackPivot.Control.Application.Audit;
 using Xunit;
 
 namespace StackPivot.Control.Tests;
@@ -50,6 +53,30 @@ public sealed class AuthAndPermissionTests
         Assert.Equal("sso-subject", identity.Subject);
         Assert.Equal("alice", identity.UserName);
         Assert.Contains("platform-admin", identity.Roles);
+    }
+
+    [Fact]
+    public void SsoAdapterRejectsClaimsFromAnUnauthenticatedPrincipal()
+    {
+        var context = new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim("sub", "untrusted") }))
+        };
+
+        Assert.Throws<UnauthorizedAccessException>(() => new HttpContextSsoIdentityAdapter().Require(context));
+    }
+
+    [Fact]
+    public void SsoAdapterRejectsAnAuthenticatedPrincipalFromAnotherScheme()
+    {
+        var context = new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(
+                new[] { new Claim("sub", "local-subject") },
+                "local-cookie"))
+        };
+
+        Assert.Throws<UnauthorizedAccessException>(() => new HttpContextSsoIdentityAdapter().Require(context));
     }
 
     [Fact]
@@ -122,6 +149,132 @@ public sealed class AuthAndPermissionTests
             Assert.True(readOnlyResult.ResourceNotFound);
             Assert.False(unknownResult.IsAllowed);
             Assert.True(unknownResult.ResourceNotFound);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentKeyRotationsUseDistinctVersionsAndAudits()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using (var seed = new StackPivotDbContext(options))
+        {
+            await seed.Database.EnsureCreatedAsync();
+            seed.AgentNodes.Add(new AgentNode
+            {
+                AgentId = Guid.Parse("00000000-0000-0000-0000-000000000010"),
+                Name = "agent",
+                ApiKeyHash = "initial-hash",
+                ApiKeyVersion = 1
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        await using var firstDb = new StackPivotDbContext(options);
+        await using var secondDb = new StackPivotDbContext(options);
+        var agentId = Guid.Parse("00000000-0000-0000-0000-000000000010");
+        var actorId = Guid.NewGuid();
+        var first = new AgentApiKeyService(firstDb, new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests")), new AuditWriter(firstDb));
+        var second = new AgentApiKeyService(secondDb, new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests")), new AuditWriter(secondDb));
+
+        var results = await Task.WhenAll(
+            first.RotateKeyAsync(agentId, actorId, Guid.NewGuid(), CancellationToken.None),
+            second.RotateKeyAsync(agentId, actorId, Guid.NewGuid(), CancellationToken.None));
+
+        Assert.Equal(2, results.Select(value => value.Version).Distinct().Count());
+        await using var verify = new StackPivotDbContext(options);
+        Assert.Equal(3, (await verify.AgentNodes.SingleAsync()).ApiKeyVersion);
+        Assert.Equal(2, await verify.AuditLogs.CountAsync(value => value.Action == AuditActions.AgentKeyRotated));
+    }
+
+    [Fact]
+    public async Task RevokeRetriesAfterAConcurrentRotationAndKeepsBothAudits()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-key-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        var barrier = new SaveChangesBarrier();
+        var agentId = Guid.Parse("00000000-0000-0000-0000-000000000010");
+        var actorId = Guid.NewGuid();
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            await using (var seed = new StackPivotDbContext(baseOptions))
+            {
+                await seed.Database.EnsureCreatedAsync();
+                seed.AgentNodes.Add(new AgentNode
+                {
+                    AgentId = agentId,
+                    Name = "agent",
+                    ApiKeyHash = "initial-hash",
+                    ApiKeyVersion = 1
+                });
+                await seed.SaveChangesAsync();
+            }
+
+            var rotateOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(barrier)
+                .Options;
+            await using var revokeDb = new StackPivotDbContext(baseOptions);
+            await using var rotateDb = new StackPivotDbContext(rotateOptions);
+            barrier.Target = rotateDb;
+            barrier.Enabled = true;
+            var revokeService = new AgentApiKeyService(
+                revokeDb,
+                new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests")),
+                new AuditWriter(revokeDb));
+            var rotateService = new AgentApiKeyService(
+                rotateDb,
+                new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests")),
+                new AuditWriter(rotateDb));
+
+            var rotate = rotateService.RotateKeyAsync(agentId, actorId, Guid.NewGuid(), CancellationToken.None);
+            await barrier.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var revoke = revokeService.RevokeKeyAsync(agentId, actorId, Guid.NewGuid(), CancellationToken.None);
+            barrier.Enabled = false;
+            barrier.Release.TrySetResult(true);
+            var rotated = await rotate;
+            await revoke;
+
+            await using var verify = new StackPivotDbContext(baseOptions);
+            var agent = await verify.AgentNodes.SingleAsync();
+            Assert.Equal(2, rotated.Version);
+            Assert.Equal(2, agent.ApiKeyVersion);
+            Assert.NotNull(agent.RevokedAt);
+            Assert.Equal(1, await verify.AuditLogs.CountAsync(value => value.Action == AuditActions.AgentKeyRotated));
+            Assert.Equal(1, await verify.AuditLogs.CountAsync(value => value.Action == AuditActions.AgentKeyRevoked));
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    private sealed class SaveChangesBarrier : SaveChangesInterceptor
+    {
+        public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public StackPivotDbContext? Target { get; set; }
+        public bool Enabled { get; set; }
+
+        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Enabled && ReferenceEquals(eventData.Context, Target))
+            {
+                Started.TrySetResult(true);
+                await Release.Task.WaitAsync(cancellationToken);
+            }
+
+            return result;
         }
     }
 }

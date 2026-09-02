@@ -163,6 +163,173 @@ public sealed class DeploymentServiceTests
         Assert.Equal(409, exception.StatusCode);
     }
 
+    [Fact]
+    public async Task RequestPersistsPreflightSnapshotOnEveryTask()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await DeploymentFixture.SeedAsync(db);
+        var service = new DeploymentService(db, new WorkspaceAuthorizationService(db), new SnapshotPreflight(), new AuditWriter(db));
+
+        await service.RequestAsync(
+            fixture.UserId,
+            fixture.StackId,
+            new DeployStackRequest("0123456789abcdef0123456789abcdef01234567", DeploymentMode.BoundAgents, null),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            CancellationToken.None);
+
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        Assert.Equal("https://snapshotted.example/repository.git", history.GitRepoSnapshot);
+        Assert.Equal("snapshot-user", history.GitUserNameSnapshot);
+        Assert.Equal("workspace_snapshot/stack_snapshot", history.StackGitRelativePathSnapshot);
+        Assert.Equal("/opt/agent-main/workspace_snapshot/stack_snapshot", history.AgentStackLocalPathSnapshot);
+        Assert.Equal("snapshot-key-v7", history.TokenKeyId);
+    }
+
+    [Fact]
+    public async Task OperationsUseOpaqueCursorWithStableTieBreaking()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await DeploymentFixture.SeedAsync(db);
+        var request = new DeploymentRequestEntity
+        {
+            RequestId = Guid.NewGuid(),
+            StackId = fixture.StackId,
+            UserId = fixture.UserId,
+            IdempotencyKey = Guid.NewGuid().ToString(),
+            RequestFingerprint = "cursor-fixture",
+            TargetCommitHash = "0123456789abcdef0123456789abcdef01234567",
+            Mode = DeploymentMode.BoundAgents,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.DeploymentRequests.Add(request);
+        var firstTime = DateTimeOffset.UtcNow.AddMinutes(-1);
+        for (var index = 0; index < 3; index++)
+        {
+            db.ServiceOperationHistories.Add(new ServiceOperationHistory
+            {
+                HistoryId = Guid.NewGuid(),
+                TaskId = Guid.NewGuid(),
+                RequestId = request.RequestId,
+                StackId = fixture.StackId,
+                AgentId = Guid.NewGuid(),
+                UserId = fixture.UserId,
+                TargetCommitHash = "0123456789abcdef0123456789abcdef01234567",
+                TaskStatus = "success",
+                OutputLog = string.Empty,
+                LastSequence = -1,
+                LastEventAt = firstTime
+            });
+        }
+
+        await db.SaveChangesAsync();
+        var service = new DeploymentService(db, new WorkspaceAuthorizationService(db), new FakePreflight(), new AuditWriter(db));
+
+        var first = await service.GetOperationsPageAsync(fixture.UserId, fixture.StackId, 2, null, CancellationToken.None);
+        var firstPage = first ?? throw new InvalidOperationException("Expected an operations page.");
+        var second = await service.GetOperationsPageAsync(fixture.UserId, fixture.StackId, 2, firstPage.NextCursor, CancellationToken.None);
+        var secondPage = second ?? throw new InvalidOperationException("Expected a second operations page.");
+
+        Assert.Equal(2, firstPage.Items.Count);
+        Assert.False(string.IsNullOrWhiteSpace(firstPage.NextCursor));
+        Assert.Single(secondPage.Items);
+        Assert.Null(secondPage.NextCursor);
+        Assert.DoesNotContain(firstPage.NextCursor!, "0123456789abcdef", StringComparison.Ordinal);
+        Assert.DoesNotContain(secondPage.Items[0].TaskId, firstPage.Items.Select(item => item.TaskId));
+    }
+
+    [Fact]
+    public async Task ConcurrentContextsAllowOnlyOnePendingDeploymentForTheSameTarget()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-deployment-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        var preflight = new ConcurrentPreflight();
+        var request = new DeployStackRequest(
+            "0123456789abcdef0123456789abcdef01234567",
+            DeploymentMode.BoundAgents,
+            null);
+        try
+        {
+            var options = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            DeploymentFixture fixture;
+            await using (var seed = new StackPivotDbContext(options))
+            {
+                await seed.Database.EnsureCreatedAsync();
+                fixture = await DeploymentFixture.SeedAsync(seed);
+            }
+
+            await using var firstDb = new StackPivotDbContext(options);
+            await using var secondDb = new StackPivotDbContext(options);
+            var firstService = new DeploymentService(
+                firstDb,
+                new WorkspaceAuthorizationService(firstDb),
+                preflight,
+                new AuditWriter(firstDb));
+            var secondService = new DeploymentService(
+                secondDb,
+                new WorkspaceAuthorizationService(secondDb),
+                preflight,
+                new AuditWriter(secondDb));
+
+            var first = CaptureAsync(() => firstService.RequestAsync(
+                fixture.UserId,
+                fixture.StackId,
+                request,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                CancellationToken.None));
+            var second = CaptureAsync(() => secondService.RequestAsync(
+                fixture.UserId,
+                fixture.StackId,
+                request,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                CancellationToken.None));
+            await preflight.BothReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            preflight.Release.TrySetResult(true);
+            var results = await Task.WhenAll(first, second);
+
+            Assert.Single(results, value => value.Exception is null);
+            var conflict = Assert.Single(results, value => value.Exception is not null).Exception;
+            var requestException = Assert.IsType<DeploymentRequestException>(conflict);
+            Assert.Equal("deployment_in_progress", requestException.Code);
+            Assert.Equal(409, requestException.StatusCode);
+
+            await using var verify = new StackPivotDbContext(options);
+            Assert.Equal(1, await verify.ServiceOperationHistories.CountAsync(value => value.TaskStatus == "pending"));
+        }
+        finally
+        {
+            preflight.Release.TrySetResult(true);
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    private static async Task<CapturedResult> CaptureAsync(Func<Task<DeploymentRequestResult>> operation)
+    {
+        try
+        {
+            return new CapturedResult(await operation(), null);
+        }
+        catch (Exception exception)
+        {
+            return new CapturedResult(null, exception);
+        }
+    }
+
     private sealed class FakePreflight : ICentralGitPreflight
     {
         public int CallCount { get; private set; }
@@ -181,6 +348,48 @@ public sealed class DeploymentServiceTests
                 "git-key-v1"));
         }
     }
+
+    private sealed class SnapshotPreflight : ICentralGitPreflight
+    {
+        public Task<DeploymentPreflight> ValidateAsync(Guid stackId, string fullCommitHash, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new DeploymentPreflight(
+                "https://snapshotted.example/repository.git",
+                "snapshot-user",
+                "workspace_snapshot/stack_snapshot",
+                "/opt/agent-main/workspace_snapshot/stack_snapshot",
+                "snapshot-key-v7"));
+        }
+    }
+
+    private sealed class ConcurrentPreflight : ICentralGitPreflight
+    {
+        private int reached;
+
+        public TaskCompletionSource<bool> BothReached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<DeploymentPreflight> ValidateAsync(
+            Guid stackId,
+            string fullCommitHash,
+            CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref reached) == 2)
+            {
+                BothReached.TrySetResult(true);
+            }
+
+            await Release.Task.WaitAsync(cancellationToken);
+            return new DeploymentPreflight(
+                "https://git.example/repository.git",
+                "git-user",
+                "workspace_one/stack_web",
+                "/opt/agent-main/workspace_one/stack_web",
+                "git-key-v1");
+        }
+    }
+
+    private sealed record CapturedResult(DeploymentRequestResult? Result, Exception? Exception);
 
     private sealed record DeploymentFixture(Guid UserId, Guid StackId)
     {

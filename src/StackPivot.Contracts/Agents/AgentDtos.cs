@@ -53,7 +53,8 @@ public sealed record TaskCompleted(
     [property: JsonPropertyName("success")] bool Success,
     [property: JsonPropertyName("exitCode")] int? ExitCode,
     [property: JsonPropertyName("errorCode")] string? ErrorCode,
-    [property: JsonPropertyName("finishedAt")] DateTimeOffset FinishedAt) : IProtocolMessage;
+    [property: JsonPropertyName("finishedAt")] DateTimeOffset FinishedAt,
+    [property: JsonPropertyName("logTruncated")] bool LogTruncated = false) : IProtocolMessage;
 
 public sealed record HeartbeatMessage(
     [property: JsonPropertyName("schemaVersion")] int SchemaVersion,

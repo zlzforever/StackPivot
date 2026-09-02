@@ -18,6 +18,13 @@ public sealed record StackView(
     [property: JsonPropertyName("folderName")] string FolderName,
     [property: JsonPropertyName("displayName")] string DisplayName);
 
+public sealed record DeploymentTargetView(
+    [property: JsonPropertyName("agentId")] Guid AgentId,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("online")] bool Online,
+    [property: JsonPropertyName("lastSeenAt")] DateTimeOffset? LastSeenAt,
+    [property: JsonPropertyName("capabilities")] IReadOnlyList<string> Capabilities);
+
 public sealed record AgentCreateRequest(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("remark")] string? Remark = null);

@@ -29,4 +29,55 @@ public sealed class PathPolicyTests
         await Assert.ThrowsAsync<PathPolicyException>(() =>
             policy.ValidateStackPathAsync(relativePath, CancellationToken.None));
     }
+
+    [Fact]
+    public async Task NestedSymlinkInManagedFilePathIsRejected()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        Directory.CreateDirectory(Path.Combine(root, "outside"));
+        Directory.CreateSymbolicLink(Path.Combine(stackPath, "config"), Path.Combine(root, "outside"));
+        var policy = new PathPolicy(root);
+
+        try
+        {
+            await Assert.ThrowsAsync<PathPolicyException>(() =>
+                policy.ValidateManagedFilePathAsync("workspace_one/stack_web/config/secret.txt", CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DanglingSymlinkInManagedFilePathIsRejected()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.CreateSymbolicLink(Path.Combine(stackPath, "config"), Path.Combine(root, "missing"));
+        var policy = new PathPolicy(root);
+
+        try
+        {
+            await Assert.ThrowsAsync<PathPolicyException>(() =>
+                policy.ValidateManagedFilePathAsync("workspace_one/stack_web/config/secret.txt", CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }

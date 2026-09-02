@@ -62,8 +62,13 @@ public static class AgentAdminEndpoints
 
         endpoints.MapPost(
                 "/api/agent-nodes",
-                async (HttpContext context, StackPivotDbContext dbContext, AgentApiKeyService keyService, AuditWriter auditWriter, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
+                async (HttpContext context, StackPivotDbContext dbContext, AgentApiKeyService keyService, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
                 {
+                    if (!ApiProblem.TryGetWriteRequestId(context, out var requestId))
+                    {
+                        return ApiProblem.Create(context, "invalid_request", 422, "X-Request-Id is required.");
+                    }
+
                     var admin = await RequireAdminAsync(context, dbContext, users, adapter);
                     if (admin is not null)
                     {
@@ -79,42 +84,42 @@ public static class AgentAdminEndpoints
                     }
                     catch (JsonException)
                     {
-                        return ApiProblem.Create(context, "invalid_request", 422, "Agent request is invalid.");
+                        return ApiProblem.Create(context, "invalid_request", 422, "Agent request is invalid.", requestId);
                     }
 
                     var name = request.Name?.Trim();
                     if (string.IsNullOrWhiteSpace(name) || name.Length > 100 || name.Any(char.IsControl))
                     {
-                        return ApiProblem.Create(context, "invalid_request", 422, "Agent name is invalid.");
+                        return ApiProblem.Create(context, "invalid_request", 422, "Agent name is invalid.", requestId);
                     }
 
                     if (request.Remark is { Length: > 500 } || request.Remark?.Any(char.IsControl) == true)
                     {
-                        return ApiProblem.Create(context, "invalid_request", 422, "Agent remark is invalid.");
+                        return ApiProblem.Create(context, "invalid_request", 422, "Agent remark is invalid.", requestId);
                     }
 
                     var identity = adapter.Require(context);
                     var user = await users.UpsertFromSsoAsync(identity, context.RequestAborted);
-                    var agent = new AgentNode
-                    {
-                        AgentId = Guid.NewGuid(),
-                        Name = name,
-                        Remark = request.Remark?.Trim() ?? string.Empty,
-                        CapabilitiesJson = "[]"
-                    };
-                    dbContext.AgentNodes.Add(agent);
-                    await dbContext.SaveChangesAsync(context.RequestAborted);
-                    var issue = await keyService.IssueAgentKeyAsync(agent.AgentId, context.RequestAborted);
-                    auditWriter.Add(AuditActions.AgentKeyCreated, null, user.UserId, agent.AgentId, "agent", agent.AgentId.ToString(), "success");
-                    await dbContext.SaveChangesAsync(context.RequestAborted);
-                    return Results.Json(new AgentKeyIssueView(agent.AgentId, issue.ApiKey, issue.Version, issue.ApiKeyLast4), statusCode: 201);
+                    var created = await keyService.CreateAgentWithKeyAsync(
+                        name,
+                        request.Remark?.Trim() ?? string.Empty,
+                        user.UserId,
+                        requestId,
+                        context.RequestAborted);
+                    return Results.Json(new AgentKeyIssueView(created.Agent.AgentId, created.Issue.ApiKey, created.Issue.Version, created.Issue.ApiKeyLast4), statusCode: 201);
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .RequireCookieAntiforgery();
 
         endpoints.MapPost(
                 "/api/agent-nodes/{agentId:guid}/rotate-key",
-                async (Guid agentId, HttpContext context, StackPivotDbContext dbContext, AgentApiKeyService keyService, AgentConnectionRegistry registry, AuditWriter auditWriter, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
+                async (Guid agentId, HttpContext context, StackPivotDbContext dbContext, AgentApiKeyService keyService, AgentConnectionRegistry registry, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
                 {
+                    if (!ApiProblem.TryGetWriteRequestId(context, out var requestId))
+                    {
+                        return ApiProblem.Create(context, "invalid_request", 422, "X-Request-Id is required.");
+                    }
+
                     var admin = await RequireAdminAsync(context, dbContext, users, adapter);
                     if (admin is not null)
                     {
@@ -125,23 +130,27 @@ public static class AgentAdminEndpoints
                     var user = await users.UpsertFromSsoAsync(identity, context.RequestAborted);
                     try
                     {
-                        var issue = await keyService.RotateKeyAsync(agentId, context.RequestAborted);
+                        var issue = await keyService.RotateKeyAsync(agentId, user.UserId, requestId, context.RequestAborted);
                         await registry.DisconnectAsync(agentId);
-                        auditWriter.Add(AuditActions.AgentKeyRotated, null, user.UserId, agentId, "agent", agentId.ToString(), "success");
-                        await dbContext.SaveChangesAsync(context.RequestAborted);
                         return Results.Ok(new AgentKeyIssueView(agentId, issue.ApiKey, issue.Version, issue.ApiKeyLast4));
                     }
                     catch (KeyNotFoundException)
                     {
-                        return ApiProblem.Create(context, "resource_not_found", 404, "Agent was not found.");
+                        return ApiProblem.Create(context, "resource_not_found", 404, "Agent was not found.", requestId);
                     }
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .RequireCookieAntiforgery();
 
         endpoints.MapPost(
                 "/api/agent-nodes/{agentId:guid}/revoke-key",
-                async (Guid agentId, HttpContext context, StackPivotDbContext dbContext, AgentApiKeyService keyService, AgentConnectionRegistry registry, AuditWriter auditWriter, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
+                async (Guid agentId, HttpContext context, StackPivotDbContext dbContext, AgentApiKeyService keyService, AgentConnectionRegistry registry, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
                 {
+                    if (!ApiProblem.TryGetWriteRequestId(context, out var requestId))
+                    {
+                        return ApiProblem.Create(context, "invalid_request", 422, "X-Request-Id is required.");
+                    }
+
                     var admin = await RequireAdminAsync(context, dbContext, users, adapter);
                     if (admin is not null)
                     {
@@ -152,23 +161,27 @@ public static class AgentAdminEndpoints
                     var user = await users.UpsertFromSsoAsync(identity, context.RequestAborted);
                     try
                     {
-                        await keyService.RevokeKeyAsync(agentId, context.RequestAborted);
+                        await keyService.RevokeKeyAsync(agentId, user.UserId, requestId, context.RequestAborted);
                         await registry.DisconnectAsync(agentId);
-                        auditWriter.Add(AuditActions.AgentKeyRevoked, null, user.UserId, agentId, "agent", agentId.ToString(), "success");
-                        await dbContext.SaveChangesAsync(context.RequestAborted);
                         return Results.NoContent();
                     }
                     catch (KeyNotFoundException)
                     {
-                        return ApiProblem.Create(context, "resource_not_found", 404, "Agent was not found.");
+                        return ApiProblem.Create(context, "resource_not_found", 404, "Agent was not found.", requestId);
                     }
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .RequireCookieAntiforgery();
 
         endpoints.MapPut(
                 "/api/stacks/{stackId:guid}/agent-bindings",
                 async (Guid stackId, HttpContext context, StackPivotDbContext dbContext, IUserIdentityService users, ISsoIdentityAdapter adapter) =>
                 {
+                    if (!ApiProblem.TryGetWriteRequestId(context, out var requestId))
+                    {
+                        return ApiProblem.Create(context, "invalid_request", 422, "X-Request-Id is required.");
+                    }
+
                     var admin = await RequireAdminAsync(context, dbContext, users, adapter);
                     if (admin is not null)
                     {
@@ -184,7 +197,7 @@ public static class AgentAdminEndpoints
                     }
                     catch (JsonException)
                     {
-                        return ApiProblem.Create(context, "invalid_request", 422, "Binding request is invalid.");
+                        return ApiProblem.Create(context, "invalid_request", 422, "Binding request is invalid.", requestId);
                     }
 
                     var stack = await dbContext.Stacks.SingleOrDefaultAsync(value => value.StackId == stackId, context.RequestAborted);
@@ -192,7 +205,7 @@ public static class AgentAdminEndpoints
                         || request.AgentIds is null
                         || request.AgentIds.Distinct().Count() != request.AgentIds.Count)
                     {
-                        return ApiProblem.Create(context, "resource_not_found", 404, "Stack was not found.");
+                        return ApiProblem.Create(context, "resource_not_found", 404, "Stack was not found.", requestId);
                     }
 
                     var agents = await dbContext.AgentNodes
@@ -200,7 +213,7 @@ public static class AgentAdminEndpoints
                         .ToListAsync(context.RequestAborted);
                     if (agents.Count != request.AgentIds.Count)
                     {
-                        return ApiProblem.Create(context, "invalid_target", 422, "One or more agents are invalid.");
+                        return ApiProblem.Create(context, "invalid_target", 422, "One or more agents are invalid.", requestId);
                     }
 
                     var identity = adapter.Require(context);
@@ -218,6 +231,7 @@ public static class AgentAdminEndpoints
                     dbContext.AuditLogs.Add(new AuditLog
                     {
                         AuditId = Guid.NewGuid(),
+                        RequestId = requestId,
                         ActorUserId = user.UserId,
                         Action = "agent_binding_updated",
                         ResourceType = "stack",
@@ -229,7 +243,8 @@ public static class AgentAdminEndpoints
                     await transaction.CommitAsync(context.RequestAborted);
                     return Results.NoContent();
                 })
-            .RequireAuthorization("sso");
+            .RequireAuthorization("sso")
+            .RequireCookieAntiforgery();
 
         return endpoints;
     }

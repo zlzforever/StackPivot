@@ -36,6 +36,11 @@ public static class ApiProblem
             && value != Guid.Empty;
     }
 
+    public static bool TryGetWriteRequestId(HttpContext context, out Guid requestId)
+    {
+        return TryGetRequiredGuidHeader(context.Request, "X-Request-Id", out requestId);
+    }
+
     public static Guid? TryGetRequestId(HttpContext context)
     {
         return TryGetRequiredGuidHeader(context.Request, "X-Request-Id", out var requestId)

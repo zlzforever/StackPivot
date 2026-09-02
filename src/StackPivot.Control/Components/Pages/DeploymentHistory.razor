@@ -1,8 +1,10 @@
 @page "/stacks/{StackId:guid}/history"
+@attribute [Authorize]
 @rendermode InteractiveServer
 @inject StackPivotDbContext DbContext
 @inject AuthenticationStateProvider AuthenticationStateProvider
 @inject WorkspaceAuthorizationService Authorization
+@inject IUserIdentityService UserIdentityService
 
 <PageTitle>部署历史</PageTitle>
 <h1>部署历史</h1>
@@ -45,10 +47,15 @@ else
     protected override async Task OnInitializedAsync()
     {
         var state = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        var subject = state.User.FindFirst("sub")?.Value;
-        var user = string.IsNullOrWhiteSpace(subject)
-            ? null
-            : await DbContext.Users.AsNoTracking().SingleOrDefaultAsync(value => value.SsoSubject == subject);
+        UserAccount? user;
+        try
+        {
+            user = await UserIdentityService.UpsertFromClaimsAsync(state.User, CancellationToken.None);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            user = null;
+        }
         var stack = await DbContext.Stacks.AsNoTracking().SingleOrDefaultAsync(value => value.StackId == StackId);
         if (user is null || stack is null || !(await Authorization.RequireAsync(user.UserId, stack.WorkspaceId, WorkspacePermission.ReadOnly, CancellationToken.None)).IsAllowed)
         {

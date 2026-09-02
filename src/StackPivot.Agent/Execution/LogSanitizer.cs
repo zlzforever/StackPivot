@@ -97,9 +97,9 @@ public sealed partial class LogSanitizer(params string[] secrets)
 
     public sealed record SanitizedOutput(string Text, bool Truncated);
 
-    [GeneratedRegex("(?i)(authorization|x-agent-api-key)\\s*:\\s*(?:Bearer\\s+)?[^\\s,;]+(?:\\s+[^\\s,;]+)?", RegexOptions.CultureInvariant)]
+    [GeneratedRegex("(?i)(authorization|x-agent-api-key)\\s*:\\s*(?:Bearer\\s+)?(?:\"[^\"\\r\\n]*\"|'[^'\\r\\n]*'|[^\\s,;]+)", RegexOptions.CultureInvariant)]
     private static partial Regex AuthorizationPattern();
 
-    [GeneratedRegex("(?i)(password|passwd|pwd|secret|token|api[-_]?key|access[-_]?token|client[-_]?secret)\\s*[:=]\\s*[^\\s,;]+", RegexOptions.CultureInvariant)]
+    [GeneratedRegex("(?i)(password|passwd|pwd|secret|token|api[-_]?key|access[-_]?token|client[-_]?secret)\\s*[:=]\\s*(?:\"[^\"\\r\\n]*\"|'[^'\\r\\n]*'|[^\\s,;]+)", RegexOptions.CultureInvariant)]
     private static partial Regex KeyValuePattern();
 }
