@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using StackPivot.Control.Infrastructure.Persistence;
 
@@ -10,9 +11,11 @@ using StackPivot.Control.Infrastructure.Persistence;
 namespace StackPivot.Control.Infrastructure.Persistence.Migrations
 {
     [DbContext(typeof(StackPivotDbContext))]
-    partial class StackPivotDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260902145816_AddDispatcherStatusIndex")]
+    partial class AddDispatcherStatusIndex
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.11");

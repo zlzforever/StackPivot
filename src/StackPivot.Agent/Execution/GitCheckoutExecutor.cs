@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text;
 using System.Security.Cryptography;
 using StackPivot.Agent.Security;
 using StackPivot.Contracts.Deployments;
@@ -12,7 +13,8 @@ public sealed record GitDeploymentInput(
     byte[] AccessToken,
     string TargetCommitHash,
     string StackGitRelativePath,
-    string AgentStackLocalPath);
+    string AgentStackLocalPath,
+    SafeDirectoryHandle? WorkingDirectoryHandle = null);
 
 public sealed record GitCheckoutResult(
     bool Success,
@@ -122,7 +124,7 @@ public static class GitTreePolicy
 
 public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 {
-    private static readonly string[] InitArguments = ["init"];
+    private static readonly string[] InitArguments = ["init", "--bare"];
     private static readonly JsonSerializerOptions MetadataJsonOptions = new();
     private readonly IProcessRunner processRunner;
     private readonly PathPolicy pathPolicy;
@@ -146,23 +148,31 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
-        if (input.AccessToken is null
-            || !ProtocolValidation.IsFullCommitHash(input.TargetCommitHash)
-            || !CentralRemotePolicy.IsAllowed(input.GitRepo, allowedRemoteHosts)
-            || input.AccessToken.Length == 0)
+        try
         {
-            return Failure("invalid_git_input");
-        }
+            if (!OperatingSystem.IsLinux())
+            {
+                return Failure("platform_unsupported");
+            }
 
+            if (input.AccessToken is null
+                || !ProtocolValidation.IsFullCommitHash(input.TargetCommitHash)
+                || !CentralRemotePolicy.IsAllowed(input.GitRepo, allowedRemoteHosts)
+                || input.AccessToken.Length == 0)
+            {
+                return Failure("invalid_git_input");
+            }
+
+        SafePath? ownedSafePath = null;
         SafePath safePath;
         try
         {
-            safePath = await pathPolicy.ValidateStackPathAsync(input.StackGitRelativePath, cancellationToken);
+            var validatedPath = await pathPolicy.ValidateStackPathAsync(input.StackGitRelativePath, cancellationToken);
             try
             {
                 if (!string.Equals(
                         Path.GetFullPath(input.AgentStackLocalPath),
-                        safePath.FullPath,
+                        validatedPath.FullPath,
                         StringComparison.Ordinal))
                 {
                     return Failure("invalid_path");
@@ -178,274 +188,348 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             return Failure("invalid_path");
         }
 
-        try
-        {
-            safePath = await pathPolicy.ValidateStackPathAsync(input.StackGitRelativePath, cancellationToken);
-        }
-        catch (PathPolicyException)
-        {
-            return Failure("invalid_path");
-        }
-
-        Directory.CreateDirectory(safePath.FullPath);
-        var gitDirectory = Path.Combine(safePath.FullPath, ".git");
-        if (File.Exists(gitDirectory)
-            || new FileInfo(gitDirectory).LinkTarget is not null
-            || new DirectoryInfo(gitDirectory).LinkTarget is not null)
-        {
-            return Failure("invalid_repository");
-        }
-
-        if (!Directory.Exists(gitDirectory))
-        {
-            var init = await RunAsync(safePath.FullPath, InitArguments, cancellationToken);
-            if (init.TimedOut)
-            {
-                return Failure("git_init_timeout");
-            }
-
-            if (init.ExitCode != 0)
-            {
-                return Failure("git_init_failed");
-            }
-        }
-
-        var origin = await RunAsync(safePath.FullPath, ["remote", "get-url", "origin"], cancellationToken);
-        if (origin.TimedOut)
-        {
-            return Failure("git_remote_timeout");
-        }
-
-        if (origin.ExitCode != 0)
-        {
-            var addOrigin = await RunAsync(safePath.FullPath, ["remote", "add", "origin", input.GitRepo], cancellationToken);
-            if (addOrigin.TimedOut)
-            {
-                return Failure("git_remote_timeout");
-            }
-
-            if (addOrigin.ExitCode != 0)
-            {
-                return Failure("git_remote_failed");
-            }
-        }
-        else if (!string.Equals(origin.StandardOutput.Trim(), input.GitRepo, StringComparison.Ordinal))
-        {
-            return Failure("git_remote_changed");
-        }
-
-        InMemoryGitCredential? askpass = null;
-        try
-        {
-            askpass = InMemoryGitCredential.Create(input.GitUserName, input.AccessToken);
-        }
-        catch (CredentialTransportUnavailableException)
-        {
-            return Failure("credential_transport_unavailable");
-        }
-
-        try
-        {
-            var environment = new Dictionary<string, string?>
-            {
-                ["GIT_ASKPASS"] = askpass.AskpassPath,
-                ["GIT_TERMINAL_PROMPT"] = "0",
-                ["GIT_CONFIG_NOSYSTEM"] = "1",
-                ["GIT_CONFIG_NOGLOBAL"] = "1",
-                ["GIT_CONFIG_COUNT"] = "2",
-                ["GIT_CONFIG_KEY_0"] = "credential.helper",
-                ["GIT_CONFIG_VALUE_0"] = string.Empty,
-                ["GIT_CONFIG_KEY_1"] = "http.followRedirects",
-                ["GIT_CONFIG_VALUE_1"] = "false"
-            };
-            var fetch = await RunAsync(
-                safePath.FullPath,
-                ["fetch", "--no-tags", "origin", input.TargetCommitHash],
-                cancellationToken,
-                environment);
-            if (fetch.TimedOut)
-            {
-                return Failure("git_fetch_timeout");
-            }
-
-            if (fetch.ExitCode != 0)
-            {
-                return Failure("git_fetch_failed");
-            }
-
-            var verify = await RunAsync(
-                safePath.FullPath,
-                ["cat-file", "-e", $"{input.TargetCommitHash}^{{commit}}"],
-                cancellationToken,
-                environment);
-            if (verify.TimedOut)
-            {
-                return Failure("git_verify_timeout");
-            }
-
-            if (verify.ExitCode != 0)
-            {
-                return Failure("invalid_commit");
-            }
-
-            var tree = await RunAsync(
-                safePath.FullPath,
-                ["ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath],
-                cancellationToken,
-                environment);
-            if (tree.TimedOut)
-            {
-                return Failure("git_tree_timeout");
-            }
-
-            if (tree.OutputTruncated)
-            {
-                return Failure("git_tree_output_truncated");
-            }
-
-            if (tree.ExitCode != 0)
-            {
-                return Failure("git_tree_failed");
-            }
-
-            IReadOnlyList<string> files;
             try
             {
-                files = GitTreePolicy.Validate(tree.StandardOutput, input.StackGitRelativePath);
-            }
-            catch (GitTreePolicyException exception)
-            {
-                return Failure(exception.Code);
-            }
-
-            IReadOnlyList<string> oldFiles;
-            try
-            {
-                oldFiles = ReadPreviousFiles(gitDirectory);
-                await RemoveManagedFilesAsync(safePath.FullPath, oldFiles, cancellationToken);
-                var stackPathPolicy = new PathPolicy(safePath.FullPath);
-                foreach (var file in files)
+                if (input.WorkingDirectoryHandle is null)
                 {
-                    await stackPathPolicy.ValidateManagedFilePathAsync(file, cancellationToken);
+                    ownedSafePath = await pathPolicy.OpenStackPathAsync(input.StackGitRelativePath, cancellationToken);
+                    safePath = ownedSafePath;
+                }
+                else
+                {
+                    if (!string.Equals(
+                            input.WorkingDirectoryHandle.CanonicalPath,
+                            Path.GetFullPath(input.AgentStackLocalPath),
+                            StringComparison.Ordinal))
+                    {
+                        return Failure("invalid_path");
+                    }
+
+                    safePath = new SafePath(
+                        Path.GetFullPath(input.AgentStackLocalPath),
+                        input.StackGitRelativePath,
+                        input.WorkingDirectoryHandle);
                 }
             }
             catch (PathPolicyException)
             {
                 return Failure("invalid_path");
             }
-            var checkout = await RunAsync(
-                safePath.FullPath,
-                ["read-tree", "--reset", "-u", $"{input.TargetCommitHash}:{input.StackGitRelativePath}"],
-                cancellationToken,
-                environment);
-            if (checkout.TimedOut)
-            {
-                return Failure("git_materialize_timeout");
-            }
-
-            if (checkout.ExitCode != 0)
-            {
-                return Failure("git_materialize_failed");
-            }
 
             try
             {
-                WriteMetadata(gitDirectory, input.TargetCommitHash, input.StackGitRelativePath, files);
+                return await MaterializeInDirectoryAsync(input, safePath, cancellationToken);
             }
             catch (PathPolicyException)
             {
                 return Failure("invalid_path");
             }
-            return new GitCheckoutResult(true, null, files);
+            finally
+            {
+                if (ownedSafePath is not null)
+                {
+                    await ownedSafePath.DisposeAsync();
+                }
+            }
         }
         finally
         {
-            askpass?.Dispose();
-            CryptographicOperations.ZeroMemory(input.AccessToken);
+            if (input.AccessToken is not null)
+            {
+                CryptographicOperations.ZeroMemory(input.AccessToken);
+            }
         }
+    }
+
+    private async Task<GitCheckoutResult> MaterializeInDirectoryAsync(
+        GitDeploymentInput input,
+        SafePath safePath,
+        CancellationToken cancellationToken)
+    {
+        var directoryHandle = safePath.DirectoryHandle;
+        if (directoryHandle is null)
+        {
+            return Failure("path_handle_unavailable");
+        }
+
+        SafeDirectoryHandle? gitDirectoryHandle = null;
+        try
+        {
+            gitDirectoryHandle = directoryHandle.TryOpenChildDirectory(".git");
+            if (gitDirectoryHandle is null)
+            {
+                gitDirectoryHandle = directoryHandle.OpenChildDirectory(".git", create: true);
+                var init = await RunAsync(
+                    safePath.FullPath,
+                    InitArguments,
+                    cancellationToken,
+                    handle: gitDirectoryHandle);
+                if (init.TimedOut)
+                {
+                    return Failure("git_init_timeout");
+                }
+
+                if (init.ExitCode != 0)
+                {
+                    return Failure("git_init_failed");
+                }
+            }
+
+            if (gitDirectoryHandle is null)
+            {
+                return Failure("invalid_repository");
+            }
+
+            var repositoryHandle = gitDirectoryHandle!;
+            var origin = await RunAsync(
+                safePath.FullPath,
+                RepositoryArguments("remote", "get-url", "origin"),
+                cancellationToken,
+                handle: repositoryHandle);
+            if (origin.TimedOut)
+            {
+                return Failure("git_remote_timeout");
+            }
+
+            if (origin.ExitCode != 0)
+            {
+                var addOrigin = await RunAsync(
+                    safePath.FullPath,
+                    RepositoryArguments("remote", "add", "origin", input.GitRepo),
+                    cancellationToken,
+                    handle: repositoryHandle);
+                if (addOrigin.TimedOut)
+                {
+                    return Failure("git_remote_timeout");
+                }
+
+                if (addOrigin.ExitCode != 0)
+                {
+                    return Failure("git_remote_failed");
+                }
+            }
+            else if (!string.Equals(origin.StandardOutput.Trim(), input.GitRepo, StringComparison.Ordinal))
+            {
+                return Failure("git_remote_changed");
+            }
+
+            InMemoryGitCredential? askpass = null;
+            try
+            {
+                askpass = InMemoryGitCredential.Create(input.GitUserName, input.AccessToken);
+            }
+            catch (CredentialTransportUnavailableException)
+            {
+                return Failure("credential_transport_unavailable");
+            }
+
+            try
+            {
+                var environment = new Dictionary<string, string?>
+                {
+                    ["GIT_ASKPASS"] = askpass.AskpassPath,
+                    ["GIT_TERMINAL_PROMPT"] = "0",
+                    ["GIT_CONFIG_NOSYSTEM"] = "1",
+                    ["GIT_CONFIG_NOGLOBAL"] = "1",
+                    ["GIT_CONFIG_COUNT"] = "2",
+                    ["GIT_CONFIG_KEY_0"] = "credential.helper",
+                    ["GIT_CONFIG_VALUE_0"] = string.Empty,
+                    ["GIT_CONFIG_KEY_1"] = "http.followRedirects",
+                    ["GIT_CONFIG_VALUE_1"] = "false"
+                };
+                var fetch = await RunAsync(
+                    safePath.FullPath,
+                    RepositoryArguments("fetch", "--no-tags", "origin", input.TargetCommitHash),
+                    cancellationToken,
+                    environment,
+                    repositoryHandle);
+                if (fetch.TimedOut)
+                {
+                    return Failure("git_fetch_timeout");
+                }
+
+                if (fetch.ExitCode != 0)
+                {
+                    return Failure("git_fetch_failed");
+                }
+
+                var verify = await RunAsync(
+                    safePath.FullPath,
+                    RepositoryArguments("cat-file", "-e", $"{input.TargetCommitHash}^{{commit}}"),
+                    cancellationToken,
+                    environment,
+                    repositoryHandle);
+                if (verify.TimedOut)
+                {
+                    return Failure("git_verify_timeout");
+                }
+
+                if (verify.ExitCode != 0)
+                {
+                    return Failure("invalid_commit");
+                }
+
+                var tree = await RunAsync(
+                    safePath.FullPath,
+                    RepositoryArguments("ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath),
+                    cancellationToken,
+                    environment,
+                    repositoryHandle);
+                if (tree.TimedOut)
+                {
+                    return Failure("git_tree_timeout");
+                }
+
+                if (tree.OutputTruncated)
+                {
+                    return Failure("git_tree_output_truncated");
+                }
+
+                if (tree.ExitCode != 0)
+                {
+                    return Failure("git_tree_failed");
+                }
+
+                IReadOnlyList<string> files;
+                try
+                {
+                    files = GitTreePolicy.Validate(tree.StandardOutput, input.StackGitRelativePath);
+                }
+                catch (GitTreePolicyException exception)
+                {
+                    return Failure(exception.Code);
+                }
+
+                IReadOnlyList<string> oldFiles;
+                try
+                {
+                    oldFiles = ReadPreviousFiles(repositoryHandle);
+                    await RemoveManagedFilesAsync(directoryHandle, oldFiles, cancellationToken);
+                    foreach (var file in files)
+                    {
+                        directoryHandle.ValidateManagedFilePath(file);
+                    }
+                }
+                catch (PathPolicyException)
+                {
+                    return Failure("invalid_path");
+                }
+
+                var checkout = await RunAsync(
+                    safePath.FullPath,
+                    RepositoryArguments("read-tree", "--reset", "-u", $"{input.TargetCommitHash}:{input.StackGitRelativePath}"),
+                    cancellationToken,
+                    environment,
+                    repositoryHandle);
+                if (checkout.TimedOut)
+                {
+                    return Failure("git_materialize_timeout");
+                }
+
+                if (checkout.ExitCode != 0)
+                {
+                    return Failure("git_materialize_failed");
+                }
+
+                try
+                {
+                    WriteMetadata(
+                        repositoryHandle,
+                        input.TargetCommitHash,
+                        input.StackGitRelativePath,
+                        files);
+                }
+                catch (PathPolicyException)
+                {
+                    return Failure("invalid_path");
+                }
+
+                return new GitCheckoutResult(true, null, files);
+            }
+            finally
+            {
+                askpass?.Dispose();
+            }
+        }
+        finally
+        {
+            gitDirectoryHandle?.Dispose();
+        }
+    }
+
+    private static string[] RepositoryArguments(params string[] arguments)
+    {
+        return ["--git-dir=.", "--work-tree=..", .. arguments];
     }
 
     private async Task<ProcessResult> RunAsync(
         string workingDirectory,
         IReadOnlyList<string> arguments,
         CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, string?>? environment = null)
+        IReadOnlyDictionary<string, string?>? environment = null,
+        SafeDirectoryHandle? handle = null)
     {
         return await processRunner.RunAsync(
-            new ProcessRequest("git", arguments, workingDirectory, environment, timeout),
+            new ProcessRequest(
+                "git",
+                arguments,
+                workingDirectory,
+                EnvironmentVariables: environment,
+                Timeout: timeout,
+                WorkingDirectoryHandle: handle),
             cancellationToken);
     }
 
-    private static IReadOnlyList<string> ReadPreviousFiles(string gitDirectory)
+    private static IReadOnlyList<string> ReadPreviousFiles(SafeDirectoryHandle gitDirectory)
     {
-        var metadataPath = Path.Combine(gitDirectory, "stackpivot-checkout.json");
-        if (new FileInfo(metadataPath).LinkTarget is not null
-            || new DirectoryInfo(metadataPath).LinkTarget is not null)
-        {
-            throw new PathPolicyException("Checkout metadata must not be a symbolic link.");
-        }
-
-        if (!File.Exists(metadataPath))
-        {
-            return Array.Empty<string>();
-        }
-
         try
         {
-            var metadata = JsonSerializer.Deserialize<CheckoutMetadata>(File.ReadAllText(metadataPath));
-            return metadata?.Files ?? Array.Empty<string>();
+            using var file = gitDirectory.OpenFile("stackpivot-checkout.json", FileMode.Open, FileAccess.Read);
+            using var reader = new StreamReader(file, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            try
+            {
+                var metadata = JsonSerializer.Deserialize<CheckoutMetadata>(reader.ReadToEnd());
+                return metadata?.Files ?? Array.Empty<string>();
+            }
+            catch (JsonException)
+            {
+                return Array.Empty<string>();
+            }
         }
-        catch (JsonException)
+        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
         {
             return Array.Empty<string>();
         }
     }
 
-    private static async Task RemoveManagedFilesAsync(
-        string root,
+    private static Task RemoveManagedFilesAsync(
+        SafeDirectoryHandle root,
         IReadOnlyList<string> files,
         CancellationToken cancellationToken)
     {
-        var pathPolicy = new PathPolicy(root);
         foreach (var relative in files)
         {
-            var full = await pathPolicy.ValidateManagedFilePathAsync(relative, cancellationToken);
-
-            if (Directory.Exists(full))
-            {
-                throw new PathPolicyException("Managed path must be a file.");
-            }
-
-            if (File.Exists(full))
-            {
-                var file = new FileInfo(full);
-                if (file.LinkTarget is not null)
-                {
-                    throw new PathPolicyException("Managed file is a symbolic link.");
-                }
-
-                await pathPolicy.ValidateManagedFilePathAsync(relative, cancellationToken);
-                File.Delete(full);
-            }
+            cancellationToken.ThrowIfCancellationRequested();
+            root.DeleteFile(relative);
         }
+
+        return Task.CompletedTask;
     }
 
     private static void WriteMetadata(
-        string gitDirectory,
+        SafeDirectoryHandle gitDirectory,
         string commit,
         string path,
         IReadOnlyList<string> files)
     {
-        var metadataPath = Path.Combine(gitDirectory, "stackpivot-checkout.json");
-        if (new FileInfo(metadataPath).LinkTarget is not null
-            || new DirectoryInfo(metadataPath).LinkTarget is not null)
-        {
-            throw new PathPolicyException("Checkout metadata must not be a symbolic link.");
-        }
-
         var metadata = new CheckoutMetadata(commit, path, files);
         var json = JsonSerializer.Serialize(metadata, MetadataJsonOptions);
-        File.WriteAllText(metadataPath, json);
+        using var file = gitDirectory.OpenFile("stackpivot-checkout.json", FileMode.Create, FileAccess.Write);
+        using var writer = new StreamWriter(
+            file,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            bufferSize: 4096);
+        writer.Write(json);
     }
 
     private static GitCheckoutResult Failure(string errorCode)

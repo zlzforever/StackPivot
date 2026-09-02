@@ -85,9 +85,19 @@ public sealed class GitTreePolicyTests
             Assert.True(result.Success, result.ErrorCode);
             Assert.Contains(runner.Requests, request => request.Arguments.SequenceEqual(new[]
             {
-                "read-tree", "--reset", "-u", "0123456789abcdef0123456789abcdef01234567:workspace_one/stack_web"
+                "--git-dir=.", "--work-tree=..", "read-tree", "--reset", "-u", "0123456789abcdef0123456789abcdef01234567:workspace_one/stack_web"
             }));
             Assert.DoesNotContain(runner.Requests, request => request.Arguments.Contains("checkout"));
+            var repositoryRequests = runner.Requests
+                .Where(request => !request.Arguments.Contains("init"))
+                .ToArray();
+            Assert.NotEmpty(repositoryRequests);
+            Assert.All(repositoryRequests, request =>
+            {
+                Assert.NotNull(request.WorkingDirectoryHandle);
+                Assert.Contains("--git-dir=.", request.Arguments);
+                Assert.Contains("--work-tree=..", request.Arguments);
+            });
             Assert.True(File.Exists(Path.Combine(root, "workspace_one", "stack_web", "compose.yaml")));
             Assert.True(File.Exists(Path.Combine(root, "workspace_one", "stack_web", ".git", "stackpivot-checkout.json")));
             Assert.All(token, value => Assert.Equal(0, value));
@@ -190,9 +200,11 @@ public sealed class GitTreePolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task GitInitTimeoutReturnsStableTimeoutErrorCode()
     {
+        TestPlatform.RequireLinux();
+
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(timeoutCommand: "init");
         var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
@@ -222,9 +234,11 @@ public sealed class GitTreePolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task GitRemoteAddTimeoutReturnsStableTimeoutErrorCode()
     {
+        TestPlatform.RequireLinux();
+
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N"));
         var runner = new MaterializationRunner(timeoutCommand: "remote_add");
         var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
@@ -432,6 +446,48 @@ public sealed class GitTreePolicyTests
             policy.ValidateManagedFilePathAsync(".git/config", CancellationToken.None));
     }
 
+    [SkippableFact]
+    public async Task MaterializationFailsClosedOnUnsupportedOperatingSystem()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            throw new Xunit.SkipException("Linux-only Agent implementation test.");
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-platform-" + Guid.NewGuid().ToString("N"));
+        var token = "secret"u8.ToArray();
+        try
+        {
+            var executor = new GitCheckoutExecutor(
+                new MaterializationRunner(),
+                new PathPolicy(root),
+                TimeSpan.FromSeconds(5),
+                AllowedRemoteHosts);
+
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    token,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    Path.Combine(root, "workspace_one", "stack_web")),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("platform_unsupported", result.ErrorCode);
+            Assert.Empty(Directory.Exists(root) ? Directory.EnumerateFileSystemEntries(root) : []);
+        }
+        finally
+        {
+            Assert.All(token, value => Assert.Equal(0, value));
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private sealed class MaterializationRunner(
         bool treeOutputTruncated = false,
         string? timeoutCommand = null) : IProcessRunner
@@ -446,7 +502,9 @@ public sealed class GitTreePolicyTests
         public Task<ProcessResult> RunAsync(ProcessRequest request, CancellationToken cancellationToken)
         {
             Requests.Add(request);
-            switch (request.Arguments[0])
+            var command = request.Arguments.First(argument =>
+                argument is "init" or "remote" or "fetch" or "cat-file" or "ls-tree" or "read-tree");
+            switch (command)
             {
                 case "init":
                     Directory.CreateDirectory(Path.Combine(request.WorkingDirectory, ".git"));

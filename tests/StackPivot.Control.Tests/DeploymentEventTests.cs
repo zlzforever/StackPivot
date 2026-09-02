@@ -117,6 +117,43 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task SuccessfulCompletionWithNonZeroExitCodeIsRecordedAsFailed()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+        history.DispatchedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAcceptedAsync(
+            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(
+            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 17, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", history.TaskStatus);
+        Assert.Equal(17, history.ExitCode);
+        Assert.Equal("completion_exit_code_conflict", history.ErrorCode);
+        Assert.Contains(await db.AuditLogs.ToListAsync(), audit =>
+            audit.Action == AuditActions.TaskFailed
+            && audit.Result == "failed"
+            && audit.ErrorCode == "completion_exit_code_conflict");
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskSucceeded);
+    }
+
+    [Fact]
     public async Task LogsAndCompletionBeforeAcceptanceAreIgnored()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");

@@ -13,9 +13,11 @@ public sealed class StackExecutorTests
     private static readonly string[] UpArguments = ["compose", "up", "-d"];
     private static readonly string[] GitEvents = ["git"];
 
-    [Fact]
+    [SkippableFact]
     public async Task ValidTaskChecksComposeBeforeGitAndClearsToken()
     {
+        TestPlatform.RequireLinux();
+
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try

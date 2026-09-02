@@ -1,3 +1,4 @@
+using System.Reflection;
 using StackPivot.Agent;
 using StackPivot.Agent.Connection;
 using StackPivot.Agent.Execution;
@@ -12,9 +13,11 @@ public sealed class AgentTaskCoordinatorTests
 {
     private static readonly Guid AgentId = Guid.Parse("00000000-0000-0000-0000-000000000001");
 
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrentCommandsForOneTaskExecuteOnlyOnce()
     {
+        TestPlatform.RequireLinux();
+
         var executor = new BlockingExecutor();
         var coordinator = new AgentTaskCoordinator(AgentId, executor);
         var firstReporter = new RecordingReporter();
@@ -40,9 +43,11 @@ public sealed class AgentTaskCoordinatorTests
         Assert.All(secondCommand.AccessToken, value => Assert.Equal(0, value));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task ExecutorExceptionIsReportedAndTaskCanBeReplayedWithoutReexecution()
     {
+        TestPlatform.RequireLinux();
+
         var executor = new ThrowingExecutor();
         var coordinator = new AgentTaskCoordinator(AgentId, executor);
         var firstReporter = new RecordingReporter();
@@ -58,15 +63,18 @@ public sealed class AgentTaskCoordinatorTests
         Assert.Single(firstReporter.Completed);
         Assert.False(firstReporter.Completed[0].Success);
         Assert.Equal("agent_execution_failed", firstReporter.Completed[0].ErrorCode);
+        Assert.Single(secondReporter.Accepted);
         Assert.Single(secondReporter.Completed);
         Assert.Equal(firstReporter.Completed[0].Success, secondReporter.Completed[0].Success);
         Assert.All(firstCommand.AccessToken, value => Assert.Equal(0, value));
         Assert.All(secondCommand.AccessToken, value => Assert.Equal(0, value));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task StreamingExecutorReportsBothStreamsBeforeCompletionAndPreservesTruncation()
     {
+        TestPlatform.RequireLinux();
+
         var coordinator = new AgentTaskCoordinator(AgentId, new StreamingExecutor());
         var reporter = new RecordingReporter();
 
@@ -75,6 +83,37 @@ public sealed class AgentTaskCoordinatorTests
         Assert.Equal(["stdout:first", "stderr:second"], reporter.Logs.Select(log => log.Stream + ":" + log.Line));
         Assert.Single(reporter.Completed);
         Assert.True(reporter.Completed[0].LogTruncated);
+    }
+
+    [SkippableFact]
+    public async Task CompletedTaskCacheIsBoundedAndCachedTasksRemainIdempotent()
+    {
+        TestPlatform.RequireLinux();
+
+        var executor = new LargeOutputExecutor();
+        var coordinator = new AgentTaskCoordinator(
+            AgentId,
+            executor,
+            maxCompletedTasks: 1,
+            completedTaskTtl: TimeSpan.FromMinutes(1));
+        var firstCommand = CreateCommand();
+        var firstReporter = new RecordingReporter();
+
+        await coordinator.HandleAsync(firstCommand, firstReporter, CancellationToken.None);
+        await coordinator.HandleAsync(firstCommand with { AccessToken = "replay"u8.ToArray() }, firstReporter, CancellationToken.None);
+
+        Assert.Equal(1, executor.ExecutionCount);
+        Assert.Equal(2, firstReporter.Completed.Count);
+
+        await coordinator.HandleAsync(CreateCommand(), new RecordingReporter(), CancellationToken.None);
+
+        var completedTasksField = typeof(AgentTaskCoordinator).GetField(
+            "completedTasks",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(completedTasksField);
+        var completedTasks = completedTasksField.GetValue(coordinator);
+        Assert.NotNull(completedTasks);
+        Assert.True((int)completedTasks!.GetType().GetProperty("Count")!.GetValue(completedTasks)! <= 1);
     }
 
     private static DeployStackCommand CreateCommand(byte[]? accessToken = null)
@@ -133,6 +172,20 @@ public sealed class AgentTaskCoordinatorTests
             await logHandler(new AgentLogEntry("stdout", "first"));
             await logHandler(new AgentLogEntry("stderr", "second"));
             return new AgentExecutionResult(true, 0, string.Empty, true);
+        }
+    }
+
+    private sealed class LargeOutputExecutor : IStackExecutor
+    {
+        private static readonly string Output = new('x', 1024 * 1024);
+        public int ExecutionCount { get; private set; }
+
+        public Task<AgentExecutionResult> ExecuteAsync(
+            DeployStackCommand command,
+            CancellationToken cancellationToken)
+        {
+            ExecutionCount++;
+            return Task.FromResult(new AgentExecutionResult(true, 0, Output, false));
         }
     }
 

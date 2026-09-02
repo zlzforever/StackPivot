@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using StackPivot.Agent.Security;
 
 namespace StackPivot.Agent.Execution;
 
@@ -9,7 +10,8 @@ public sealed record ProcessRequest(
     string WorkingDirectory,
     IReadOnlyDictionary<string, string?>? EnvironmentVariables = null,
     TimeSpan? Timeout = null,
-    Func<ProcessOutputLine, ValueTask>? OutputHandler = null);
+    Func<ProcessOutputLine, ValueTask>? OutputHandler = null,
+    SafeDirectoryHandle? WorkingDirectoryHandle = null);
 
 public sealed record ProcessOutputLine(string Stream, string Text);
 
@@ -83,7 +85,7 @@ public sealed class ProcessRunner : IProcessRunner
         var info = new ProcessStartInfo
         {
             FileName = request.FileName,
-            WorkingDirectory = request.WorkingDirectory,
+            WorkingDirectory = request.WorkingDirectoryHandle?.ProcessWorkingDirectory ?? request.WorkingDirectory,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,

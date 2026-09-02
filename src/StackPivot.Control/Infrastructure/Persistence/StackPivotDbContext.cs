@@ -198,6 +198,7 @@ public sealed class StackPivotDbContext(DbContextOptions<StackPivotDbContext> op
             .HasFilter("task_status = 'pending'");
         entity.HasIndex(value => value.TaskId).IsUnique();
         entity.HasIndex(value => value.RequestId);
+        entity.HasIndex(value => new { value.TaskStatus, value.LastEventAt });
         entity.HasIndex(value => new { value.StackId, value.LastEventAt });
         entity.HasIndex(value => new { value.AgentId, value.LastEventAt });
         entity.HasOne(value => value.Stack)

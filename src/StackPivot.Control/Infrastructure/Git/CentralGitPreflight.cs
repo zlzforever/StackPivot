@@ -230,10 +230,12 @@ public sealed class GitCommandRunner : IGitCommandRunner
 
 public sealed class CentralGitOptions
 {
+    public const string FixedMainRoot = "/opt/main";
     public const string AllowedRemoteHostsEnvironmentVariable = "STACKPIVOT_ALLOWED_REMOTE_HOSTS";
     public const string ControlAllowedRemoteHostsEnvironmentVariable = "STACKPIVOT_CONTROL_ALLOWED_REMOTE_HOSTS";
 
-    public string MainRoot { get; init; } = "/opt/main";
+    // Kept for source compatibility; the preflight runner deliberately ignores this value.
+    public string MainRoot { get; init; } = FixedMainRoot;
     public IReadOnlySet<string> AllowedRemoteHosts { get; init; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public bool RejectSensitiveEnv { get; init; } = true;
     public TimeSpan CommandTimeout { get; init; } = TimeSpan.FromMinutes(2);
@@ -289,10 +291,7 @@ public sealed class CentralGitPreflight(
 
         var setting = await dbContext.GlobalGitSettings
             .SingleOrDefaultAsync(value => value.Id == 1, cancellationToken);
-        var allowedHosts = setting is null
-            ? null
-            : ResolveAllowedRemoteHosts(setting.GitRepo, options.AllowedRemoteHosts);
-        if (setting is null || !IsAllowedRemote(setting.GitRepo, allowedHosts))
+        if (setting is null || !IsAllowedRemote(setting.GitRepo, options.AllowedRemoteHosts))
         {
             throw new DeploymentValidationException("policy_violation", "Git remote is not allowed.");
         }
@@ -357,20 +356,6 @@ public sealed class CentralGitPreflight(
         return allowedHosts.Contains(host);
     }
 
-    private static IReadOnlySet<string>? ResolveAllowedRemoteHosts(
-        string remote,
-        IReadOnlySet<string>? configuredHosts)
-    {
-        if (configuredHosts is { Count: > 0 })
-        {
-            return configuredHosts;
-        }
-
-        return TryGetHttpsRemoteHost(remote, out var host)
-            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase) { host }
-            : null;
-    }
-
     private static bool TryGetHttpsRemoteHost(string? remote, out string host)
     {
         host = string.Empty;
@@ -394,7 +379,7 @@ public sealed class CentralGitPreflight(
     {
         try
         {
-            return await gitCommandRunner.RunAsync(options.MainRoot, arguments, cancellationToken);
+            return await gitCommandRunner.RunAsync(CentralGitOptions.FixedMainRoot, arguments, cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using StackPivot.Agent.Execution;
+using StackPivot.Agent.Security;
 using Xunit;
 
 namespace StackPivot.Agent.Tests;
@@ -44,6 +45,53 @@ public sealed class ProcessRunnerTests
         Assert.False(result.OutputTruncated);
         Assert.Equal(["alpha", "beta"], lines.Select(line => line.Text));
         Assert.All(lines, line => Assert.Equal("stdout", line.Stream));
+    }
+
+    [SkippableFact]
+    public async Task DirectoryHandleKeepsAProcessInTheOpenedDirectoryAfterPathReplacement()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-process-fd-" + Guid.NewGuid().ToString("N"));
+        var outside = Path.Combine(Path.GetTempPath(), "stackpivot-process-outside-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var movedStackPath = Path.Combine(root, "workspace_one", "stack_web-original");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            var policy = new PathPolicy(root);
+            await using var safePath = await policy.OpenStackPathAsync(
+                "workspace_one/stack_web",
+                CancellationToken.None);
+            Directory.Move(stackPath, movedStackPath);
+            Directory.CreateSymbolicLink(stackPath, outside);
+
+            var result = await new ProcessRunner().RunAsync(
+                new ProcessRequest(
+                    "pwd",
+                    [],
+                    safePath.FullPath,
+                    WorkingDirectoryHandle: safePath.DirectoryHandle),
+                CancellationToken.None);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.Contains("stack_web-original", result.StandardOutput, StringComparison.Ordinal);
+            Assert.DoesNotContain("stackpivot-process-outside", result.StandardOutput, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+
+            if (Directory.Exists(outside))
+            {
+                Directory.Delete(outside, recursive: true);
+            }
+        }
     }
 
     [Fact]

@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using StackPivot.Agent.Execution;
+using StackPivot.Agent.Security;
 using StackPivot.Contracts.Agents;
 using StackPivot.Contracts.Deployments;
 using StackPivot.Contracts.SignalR;
@@ -20,13 +21,18 @@ public sealed class AgentTaskCoordinator
     private readonly Guid agentId;
     private readonly IStackExecutor executor;
     private readonly string stackLockDirectory;
+    private readonly int maxCompletedTasks;
+    private readonly TimeSpan completedTaskTtl;
+    private readonly object completedTasksGate = new();
     private readonly ConcurrentDictionary<Guid, Lazy<Task<AgentExecutionResult>>> activeTasks = new();
-    private readonly ConcurrentDictionary<Guid, AgentExecutionResult> completedTasks = new();
+    private readonly ConcurrentDictionary<Guid, CachedExecutionResult> completedTasks = new();
 
     public AgentTaskCoordinator(
         Guid agentId,
         IStackExecutor executor,
-        string? stackLockDirectory = null)
+        string? stackLockDirectory = null,
+        int maxCompletedTasks = 1024,
+        TimeSpan? completedTaskTtl = null)
     {
         if (agentId == Guid.Empty)
         {
@@ -37,6 +43,14 @@ public sealed class AgentTaskCoordinator
         this.executor = executor ?? throw new ArgumentNullException(nameof(executor));
         this.stackLockDirectory = stackLockDirectory
             ?? Path.Combine(Path.GetTempPath(), "stackpivot-agent-locks");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxCompletedTasks);
+
+        this.maxCompletedTasks = maxCompletedTasks;
+        this.completedTaskTtl = completedTaskTtl ?? TimeSpan.FromMinutes(15);
+        if (this.completedTaskTtl <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(completedTaskTtl));
+        }
     }
 
     public async Task HandleAsync(
@@ -49,8 +63,11 @@ public sealed class AgentTaskCoordinator
 
         try
         {
-            if (completedTasks.TryGetValue(command.TaskId, out var completed))
+            if (TryGetCompleted(command.TaskId, out var completed))
             {
+                await reporter.ReportAcceptedAsync(
+                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    cancellationToken);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, completed), cancellationToken);
                 return;
             }
@@ -74,27 +91,38 @@ public sealed class AgentTaskCoordinator
     {
         try
         {
+            if (!OperatingSystem.IsLinux())
+            {
+                var failure = new AgentExecutionResult(false, -1, string.Empty, false, "platform_unsupported");
+                await reporter.ReportAcceptedAsync(
+                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    cancellationToken);
+                CacheCompleted(command.TaskId, failure);
+                await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
+                return failure;
+            }
+
             var lockResult = StackDeploymentLease.TryAcquire(command.AgentStackLocalPath, stackLockDirectory);
             if (!lockResult.Acquired)
             {
                 var failure = new AgentExecutionResult(false, -1, string.Empty, false, lockResult.ErrorCode);
-                completedTasks[command.TaskId] = failure;
+                await reporter.ReportAcceptedAsync(
+                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    cancellationToken);
+                CacheCompleted(command.TaskId, failure);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
                 return failure;
             }
 
             await using var stackLease = lockResult.Lease!;
+            await reporter.ReportAcceptedAsync(
+                new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                cancellationToken);
+
             AgentExecutionResult result;
             try
             {
-                await reporter.ReportAcceptedAsync(
-                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
-                    cancellationToken);
                 result = await ExecuteAndStreamAsync(command, reporter, cancellationToken);
-
-                completedTasks[command.TaskId] = result;
-                await reporter.ReportCompletedAsync(CreateCompleted(command, result), cancellationToken);
-                return result;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -103,21 +131,11 @@ public sealed class AgentTaskCoordinator
             catch
             {
                 result = new AgentExecutionResult(false, -1, string.Empty, false, "agent_execution_failed");
-                completedTasks[command.TaskId] = result;
-                try
-                {
-                    await reporter.ReportCompletedAsync(CreateCompleted(command, result), CancellationToken.None);
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                catch
-                {
-                    // The connection can close while reporting a failed task.
-                }
-
-                return result;
             }
+
+            CacheCompleted(command.TaskId, result);
+            await reporter.ReportCompletedAsync(CreateCompleted(command, result), cancellationToken);
+            return result;
         }
         finally
         {
@@ -217,6 +235,59 @@ public sealed class AgentTaskCoordinator
             result.LogTruncated);
     }
 
+    private bool TryGetCompleted(Guid taskId, out AgentExecutionResult result)
+    {
+        lock (completedTasksGate)
+        {
+            if (!completedTasks.TryGetValue(taskId, out var cached))
+            {
+                result = null!;
+                return false;
+            }
+
+            if (cached.ExpiresAt <= DateTimeOffset.UtcNow)
+            {
+                completedTasks.TryRemove(taskId, out _);
+                result = null!;
+                return false;
+            }
+
+            result = cached.Result;
+            return true;
+        }
+    }
+
+    private void CacheCompleted(Guid taskId, AgentExecutionResult result)
+    {
+        var cached = new CachedExecutionResult(
+            result with { OutputLog = string.Empty },
+            DateTimeOffset.UtcNow.Add(completedTaskTtl));
+        lock (completedTasksGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var pair in completedTasks)
+            {
+                if (pair.Value.ExpiresAt <= now)
+                {
+                    completedTasks.TryRemove(pair.Key, out _);
+                }
+            }
+
+            completedTasks[taskId] = cached;
+            while (completedTasks.Count > maxCompletedTasks)
+            {
+                var oldest = completedTasks
+                    .OrderBy(pair => pair.Value.ExpiresAt)
+                    .First();
+                completedTasks.TryRemove(oldest.Key, out _);
+            }
+        }
+    }
+
+    private sealed record CachedExecutionResult(
+        AgentExecutionResult Result,
+        DateTimeOffset ExpiresAt);
+
     private sealed class StackDeploymentLease : IAsyncDisposable
     {
         private readonly FileStream stream;
@@ -228,6 +299,11 @@ public sealed class AgentTaskCoordinator
 
         public static LeaseResult TryAcquire(string? stackPath, string lockDirectory)
         {
+            if (!OperatingSystem.IsLinux())
+            {
+                return new LeaseResult(false, null, "stack_lock_unavailable");
+            }
+
             if (string.IsNullOrWhiteSpace(stackPath))
             {
                 return new LeaseResult(false, null, "invalid_path");
@@ -243,35 +319,24 @@ public sealed class AgentTaskCoordinator
                 return new LeaseResult(false, null, "invalid_path");
             }
 
-            try
-            {
-                Directory.CreateDirectory(lockDirectory);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-            {
-                return new LeaseResult(false, null, "stack_lock_unavailable");
-            }
-
             var pathBytes = Encoding.UTF8.GetBytes(normalizedPath);
             var lockName = Convert.ToHexString(SHA256.HashData(pathBytes)) + ".lock";
             CryptographicOperations.ZeroMemory(pathBytes);
-            var lockPath = Path.Combine(lockDirectory, lockName);
             try
             {
-                var stream = new FileStream(
-                    lockPath,
-                    FileMode.OpenOrCreate,
-                    FileAccess.ReadWrite,
-                    FileShare.None,
-                    bufferSize: 1,
-                    options: FileOptions.SequentialScan);
+                using var lockDirectoryHandle = SafeDirectoryHandle.OpenOrCreateAbsoluteDirectory(lockDirectory);
+                var stream = lockDirectoryHandle.OpenLockFile(lockName);
                 return new LeaseResult(true, new StackDeploymentLease(stream), null);
             }
-            catch (IOException)
+            catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.ResourceBusy)
             {
                 return new LeaseResult(false, null, "stack_busy");
             }
-            catch (Exception exception) when (exception is UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            catch (Exception exception) when (exception is PathPolicyException
+                or IOException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or NotSupportedException)
             {
                 return new LeaseResult(false, null, "stack_lock_unavailable");
             }

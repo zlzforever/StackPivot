@@ -12,9 +12,11 @@ public sealed class AgentTaskCoordinatorLockTests
 {
     private static readonly Guid AgentId = Guid.Parse("00000000-0000-0000-0000-000000000001");
 
-    [Fact]
+    [SkippableFact]
     public async Task DifferentTaskIdsForOneStackAreSerializedAcrossCoordinatorInstances()
     {
+        TestPlatform.RequireLinux();
+
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-lock-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
         var lockDirectory = Path.Combine(root, "locks");
@@ -33,7 +35,8 @@ public sealed class AgentTaskCoordinatorLockTests
         {
             Assert.Same(second, await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(5))));
             Assert.Equal(0, secondExecutor.ExecutionCount);
-            Assert.Empty(secondReporter.Accepted);
+            Assert.Single(secondReporter.Accepted);
+            Assert.Equal(secondReporter.Completed[0].TaskId, secondReporter.Accepted[0].TaskId);
             var busy = Assert.Single(secondReporter.Completed);
             Assert.False(busy.Success);
             Assert.Equal("stack_busy", busy.ErrorCode);
@@ -49,9 +52,11 @@ public sealed class AgentTaskCoordinatorLockTests
         Assert.True(Assert.Single(firstReporter.Completed).Success);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task BusyFailureReporterDoesNotLeaveTheTaskPermanentlyActive()
     {
+        TestPlatform.RequireLinux();
+
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-lock-replay-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
         var lockDirectory = Path.Combine(root, "locks");
@@ -85,6 +90,8 @@ public sealed class AgentTaskCoordinatorLockTests
             await secondCoordinator.HandleAsync(command, replayReporter, CancellationToken.None);
 
             var replay = Assert.Single(replayReporter.Completed);
+            var replayAccepted = Assert.Single(replayReporter.Accepted);
+            Assert.Equal(replay.TaskId, replayAccepted.TaskId);
             Assert.False(replay.Success);
             Assert.Equal("stack_busy", replay.ErrorCode);
         }
@@ -92,6 +99,96 @@ public sealed class AgentTaskCoordinatorLockTests
         {
             firstExecutor.Release.TrySetResult(true);
             await first;
+            DeleteDirectory(root);
+        }
+    }
+
+    [SkippableFact]
+    public async Task LockUnavailableIsAcceptedBeforeFailure()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-lock-unavailable-" + Guid.NewGuid().ToString("N"));
+        var lockPath = Path.Combine(root, "lock-file");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(lockPath, string.Empty);
+        try
+        {
+            var reporter = new RecordingReporter();
+            var coordinator = new AgentTaskCoordinator(AgentId, new ImmediateExecutor(), lockPath);
+
+            await coordinator.HandleAsync(CreateCommand(Path.Combine(root, "workspace_one", "stack_web")), reporter, CancellationToken.None);
+
+            var accepted = Assert.Single(reporter.Accepted);
+            var completed = Assert.Single(reporter.Completed);
+            Assert.Equal(completed.TaskId, accepted.TaskId);
+            Assert.False(completed.Success);
+            Assert.Equal("stack_lock_unavailable", completed.ErrorCode);
+        }
+        finally
+        {
+            DeleteDirectory(root);
+        }
+    }
+
+    [SkippableFact]
+    public async Task FailedAcceptanceIsNotCachedForReplay()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-lock-acceptance-" + Guid.NewGuid().ToString("N"));
+        var lockPath = Path.Combine(root, "lock-file");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(lockPath, string.Empty);
+        var command = CreateCommand(Path.Combine(root, "workspace_one", "stack_web"));
+        try
+        {
+            var coordinator = new AgentTaskCoordinator(AgentId, new ImmediateExecutor(), lockPath);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                coordinator.HandleAsync(command, new ThrowingAcceptedReporter(), CancellationToken.None));
+
+            var replayReporter = new RecordingReporter();
+            await coordinator.HandleAsync(command, replayReporter, CancellationToken.None);
+
+            var accepted = Assert.Single(replayReporter.Accepted);
+            var completed = Assert.Single(replayReporter.Completed);
+            Assert.Equal(completed.TaskId, accepted.TaskId);
+            Assert.False(completed.Success);
+            Assert.Equal("stack_lock_unavailable", completed.ErrorCode);
+        }
+        finally
+        {
+            DeleteDirectory(root);
+        }
+    }
+
+    [SkippableFact]
+    public async Task SymlinkedLockDirectoryFailsClosed()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-lock-symlink-" + Guid.NewGuid().ToString("N"));
+        var outside = Path.Combine(root, "outside");
+        var lockDirectory = Path.Combine(root, "locks");
+        Directory.CreateDirectory(outside);
+        Directory.CreateSymbolicLink(lockDirectory, outside);
+        try
+        {
+            var reporter = new RecordingReporter();
+            var coordinator = new AgentTaskCoordinator(AgentId, new ImmediateExecutor(), lockDirectory);
+
+            await coordinator.HandleAsync(CreateCommand(Path.Combine(root, "workspace_one", "stack_web")), reporter, CancellationToken.None);
+
+            var accepted = Assert.Single(reporter.Accepted);
+            var completed = Assert.Single(reporter.Completed);
+            Assert.Equal(completed.TaskId, accepted.TaskId);
+            Assert.False(completed.Success);
+            Assert.Equal("stack_lock_unavailable", completed.ErrorCode);
+            Assert.Empty(Directory.EnumerateFileSystemEntries(outside));
+        }
+        finally
+        {
             DeleteDirectory(root);
         }
     }
@@ -181,5 +278,16 @@ public sealed class AgentTaskCoordinatorLockTests
 
         public Task ReportCompletedAsync(TaskCompleted completed, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("report failed");
+    }
+
+    private sealed class ThrowingAcceptedReporter : IAgentTaskReporter
+    {
+        public Task ReportAcceptedAsync(TaskAccepted accepted, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("acceptance report failed");
+
+        public Task ReportLogAsync(TaskLog log, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task ReportCompletedAsync(TaskCompleted completed, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("completion report must not be attempted");
     }
 }

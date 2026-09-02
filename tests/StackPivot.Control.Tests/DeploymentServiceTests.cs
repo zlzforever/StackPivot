@@ -318,6 +318,80 @@ public sealed class DeploymentServiceTests
         }
     }
 
+    [Fact]
+    public async Task ConcurrentContextsWithTheSameIdempotencyKeyReturnTheWinningRequest()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-idempotency-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        var preflight = new WinnerVisiblePreflight();
+        var request = new DeployStackRequest(
+            "0123456789abcdef0123456789abcdef01234567",
+            DeploymentMode.BoundAgents,
+            null);
+        var idempotencyKey = Guid.NewGuid();
+        try
+        {
+            var options = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            DeploymentFixture fixture;
+            await using (var seed = new StackPivotDbContext(options))
+            {
+                await seed.Database.EnsureCreatedAsync();
+                fixture = await DeploymentFixture.SeedAsync(seed);
+            }
+
+            await using var firstDb = new StackPivotDbContext(options);
+            await using var secondDb = new StackPivotDbContext(options);
+            var firstService = new DeploymentService(
+                firstDb,
+                new WorkspaceAuthorizationService(firstDb),
+                preflight,
+                new AuditWriter(firstDb));
+            var secondService = new DeploymentService(
+                secondDb,
+                new WorkspaceAuthorizationService(secondDb),
+                preflight,
+                new AuditWriter(secondDb));
+
+            var first = CaptureAsync(() => firstService.RequestAsync(
+                fixture.UserId,
+                fixture.StackId,
+                request,
+                Guid.NewGuid(),
+                idempotencyKey,
+                CancellationToken.None));
+            var second = CaptureAsync(() => secondService.RequestAsync(
+                fixture.UserId,
+                fixture.StackId,
+                request,
+                Guid.NewGuid(),
+                idempotencyKey,
+                CancellationToken.None));
+            await preflight.FirstReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await preflight.SecondReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            preflight.ReleaseFirst.TrySetResult(true);
+            await first;
+            preflight.ReleaseSecond.TrySetResult(true);
+            var results = await Task.WhenAll(first, second);
+
+            Assert.All(results, value => Assert.Null(value.Exception));
+            Assert.Equal(results[0].Result!.RequestId, results[1].Result!.RequestId);
+            await using var verify = new StackPivotDbContext(options);
+            Assert.Equal(1, await verify.DeploymentRequests.CountAsync());
+            Assert.Equal(1, await verify.ServiceOperationHistories.CountAsync());
+        }
+        finally
+        {
+            preflight.ReleaseFirst.TrySetResult(true);
+            preflight.ReleaseSecond.TrySetResult(true);
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
     private static async Task<CapturedResult> CaptureAsync(Func<Task<DeploymentRequestResult>> operation)
     {
         try
@@ -380,6 +454,41 @@ public sealed class DeploymentServiceTests
             }
 
             await Release.Task.WaitAsync(cancellationToken);
+            return new DeploymentPreflight(
+                "https://git.example/repository.git",
+                "git-user",
+                "workspace_one/stack_web",
+                "/opt/agent-main/workspace_one/stack_web",
+                "git-key-v1");
+        }
+    }
+
+    private sealed class WinnerVisiblePreflight : ICentralGitPreflight
+    {
+        private int reached;
+
+        public TaskCompletionSource<bool> FirstReached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> SecondReached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReleaseFirst { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReleaseSecond { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<DeploymentPreflight> ValidateAsync(
+            Guid stackId,
+            string fullCommitHash,
+            CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref reached) == 1)
+            {
+                FirstReached.TrySetResult(true);
+                await SecondReached.Task.WaitAsync(cancellationToken);
+                await ReleaseFirst.Task.WaitAsync(cancellationToken);
+            }
+            else
+            {
+                SecondReached.TrySetResult(true);
+                await ReleaseSecond.Task.WaitAsync(cancellationToken);
+            }
+
             return new DeploymentPreflight(
                 "https://git.example/repository.git",
                 "git-user",

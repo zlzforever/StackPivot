@@ -31,7 +31,7 @@ public sealed class CentralGitPreflightTests
     }
 
     [Fact]
-    public async Task EmptyAllowlistUsesOnlyTheConfiguredDatabaseRemoteHost()
+    public async Task EmptyAllowlistRejectsTheConfiguredDatabaseRemoteHost()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -57,12 +57,13 @@ public sealed class CentralGitPreflightTests
             MainRoot = "/opt/main"
         });
 
-        var result = await preflight.ValidateAsync(
+        var exception = await Assert.ThrowsAsync<DeploymentValidationException>(() => preflight.ValidateAsync(
             stack.StackId,
             "0123456789abcdef0123456789abcdef01234567",
-            CancellationToken.None);
+            CancellationToken.None));
 
-        Assert.Equal("https://git.example/repository.git", result.GitRepo);
+        Assert.Equal("policy_violation", exception.Code);
+        Assert.Empty(runner.Arguments);
     }
 
     [Fact]
@@ -224,6 +225,43 @@ public sealed class CentralGitPreflightTests
     }
 
     [Fact]
+    public async Task PreflightAlwaysRunsGitFromTheFixedMainRoot()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var workspace = new Workspace { WorkspaceId = Guid.NewGuid(), Name = "workspace_one", DisplayName = "Workspace" };
+        var stack = new Stack { StackId = Guid.NewGuid(), WorkspaceId = workspace.WorkspaceId, FolderName = "stack_web", DisplayName = "Web" };
+        db.AddRange(workspace, stack, new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = "ciphertext",
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        var runner = new RecordingGitRunner(
+            new GitCommandResult(0, string.Empty, string.Empty),
+            new GitCommandResult(0, "workspace_one/stack_web/compose.yaml\n", string.Empty));
+        var preflight = new CentralGitPreflight(db, runner, new CentralGitOptions
+        {
+            MainRoot = "/tmp/should-not-be-used",
+            AllowedRemoteHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example" }
+        });
+
+        await preflight.ValidateAsync(
+            stack.StackId,
+            "0123456789abcdef0123456789abcdef01234567",
+            CancellationToken.None);
+
+        Assert.Equal(2, runner.WorkingDirectories.Count);
+        Assert.All(runner.WorkingDirectories, path => Assert.Equal("/opt/main", path));
+    }
+
+    [Fact]
     public async Task PreflightMapsGitTimeoutToStable422Error()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -263,9 +301,11 @@ public sealed class CentralGitPreflightTests
     {
         private int resultIndex;
         public List<IReadOnlyList<string>> Arguments { get; } = new();
+        public List<string> WorkingDirectories { get; } = new();
 
         public Task<GitCommandResult> RunAsync(string workingDirectory, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
         {
+            WorkingDirectories.Add(workingDirectory);
             Arguments.Add(arguments.ToArray());
             return Task.FromResult(results[Math.Min(resultIndex++, results.Length - 1)]);
         }

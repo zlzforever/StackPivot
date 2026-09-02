@@ -165,8 +165,11 @@ public sealed class DeploymentDispatcher(
         }
 
         var now = DateTimeOffset.UtcNow;
-        var taskStatus = completed.Success ? "success" : "failed";
-        var errorCode = SanitizeErrorCode(completed.ErrorCode);
+        var completionExitCodeConflict = completed.Success && completed.ExitCode != 0;
+        var taskStatus = completed.Success && completed.ExitCode == 0 ? "success" : "failed";
+        var errorCode = completionExitCodeConflict
+            ? "completion_exit_code_conflict"
+            : SanitizeErrorCode(completed.ErrorCode);
         await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         var updated = await dbContext.ServiceOperationHistories
             .Where(value => value.HistoryId == history.HistoryId
@@ -187,13 +190,13 @@ public sealed class DeploymentDispatcher(
         }
 
         auditWriter.Add(
-            completed.Success ? AuditActions.TaskSucceeded : AuditActions.TaskFailed,
+            taskStatus == "success" ? AuditActions.TaskSucceeded : AuditActions.TaskFailed,
             history.RequestId,
             history.UserId,
             history.AgentId,
             "task",
             history.TaskId.ToString(),
-            completed.Success ? "success" : "failed",
+            taskStatus,
             errorCode);
         await dbContext.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);

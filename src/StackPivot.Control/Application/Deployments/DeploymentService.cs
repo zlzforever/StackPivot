@@ -148,17 +148,6 @@ public sealed class DeploymentService(
         }
 
         var targetIds = targets.Select(value => value.AgentId).ToArray();
-        var active = await dbContext.ServiceOperationHistories
-            .AnyAsync(
-                value => value.StackId == stackId
-                    && value.TaskStatus == "pending"
-                    && targetIds.Contains(value.AgentId),
-                cancellationToken);
-        if (active)
-        {
-            throw new DeploymentRequestException("deployment_in_progress", 409, "Deployment is already running.");
-        }
-
         var checkedOut = await preflight.ValidateAsync(stackId, request.TargetCommitHash, cancellationToken);
         await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         existing = await dbContext.DeploymentRequests
@@ -177,6 +166,17 @@ public sealed class DeploymentService(
 
             await transaction.CommitAsync(cancellationToken);
             return await BuildResultAsync(existing.RequestId, cancellationToken);
+        }
+
+        var active = await dbContext.ServiceOperationHistories
+            .AnyAsync(
+                value => value.StackId == stackId
+                    && value.TaskStatus == "pending"
+                    && targetIds.Contains(value.AgentId),
+                cancellationToken);
+        if (active)
+        {
+            throw new DeploymentRequestException("deployment_in_progress", 409, "Deployment is already running.");
         }
 
         var now = DateTimeOffset.UtcNow;
@@ -229,12 +229,39 @@ public sealed class DeploymentService(
             await dbContext.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }
-        catch (DbUpdateException exception) when (IsActiveTaskConflict(exception))
+        catch (DbUpdateException exception) when (IsActiveTaskConflict(exception) || IsIdempotencyConflict(exception))
         {
-            throw new DeploymentRequestException("deployment_in_progress", 409, "Deployment is already running.");
+            await transaction.RollbackAsync(CancellationToken.None);
+            dbContext.ChangeTracker.Clear();
+            if (IsActiveTaskConflict(exception))
+            {
+                throw new DeploymentRequestException("deployment_in_progress", 409, "Deployment is already running.");
+            }
+
+            var winner = await dbContext.DeploymentRequests
+                .AsNoTracking()
+                .SingleOrDefaultAsync(
+                    value => value.UserId == userId && value.IdempotencyKey == idempotencyKey.ToString(),
+                    CancellationToken.None);
+            if (winner is null)
+            {
+                throw new DeploymentRequestException(
+                    "idempotency_conflict",
+                    409,
+                    "The idempotent deployment request could not be resolved.");
+            }
+
+            if (!string.Equals(winner.RequestFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                throw new DeploymentRequestException(
+                    "idempotency_key_reused",
+                    409,
+                    "Idempotency key was used with a different request.");
+            }
+
+            return await BuildResultAsync(winner.RequestId, cancellationToken);
         }
 
-        _ = checkedOut;
         return await BuildResultAsync(requestId, cancellationToken);
     }
 
@@ -418,6 +445,14 @@ public sealed class DeploymentService(
         return exception.InnerException is Microsoft.Data.Sqlite.SqliteException sqlite
             && sqlite.SqliteErrorCode == 19
             && sqlite.Message.Contains("service_operation_history", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsIdempotencyConflict(DbUpdateException exception)
+    {
+        return exception.InnerException is Microsoft.Data.Sqlite.SqliteException sqlite
+            && sqlite.SqliteErrorCode == 19
+            && sqlite.Message.Contains("deployment_request", StringComparison.OrdinalIgnoreCase)
+            && sqlite.Message.Contains("idempotency_key", StringComparison.OrdinalIgnoreCase);
     }
 
     private static IReadOnlyList<DeploymentLogEntryView> ParseLogEntries(string json)

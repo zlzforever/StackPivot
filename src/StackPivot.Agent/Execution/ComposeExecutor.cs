@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using StackPivot.Agent.Security;
 
 namespace StackPivot.Agent.Execution;
 
@@ -33,23 +34,30 @@ public sealed class ComposeExecutor
 
     public async Task<ComposeExecutionResult> ExecuteAsync(
         string workingDirectory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SafeDirectoryHandle? workingDirectoryHandle = null)
     {
-        var version = await CheckVersionAsync(workingDirectory, cancellationToken);
+        var version = await CheckVersionAsync(workingDirectory, cancellationToken, workingDirectoryHandle);
         if (!version.IsSupported)
         {
             return new ComposeExecutionResult(false, version.ExitCode, version.OutputLog, version.LogTruncated, version.ErrorCode);
         }
 
-        return await ExecuteUpAsync(workingDirectory, cancellationToken);
+        return await ExecuteUpAsync(workingDirectory, cancellationToken, workingDirectoryHandle: workingDirectoryHandle);
     }
 
     public async Task<ComposeVersionCheck> CheckVersionAsync(
         string workingDirectory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SafeDirectoryHandle? workingDirectoryHandle = null)
     {
         var version = await processRunner.RunAsync(
-            new ProcessRequest("docker", ComposeVersionArguments, workingDirectory, Timeout: timeout),
+            new ProcessRequest(
+                "docker",
+                ComposeVersionArguments,
+                workingDirectory,
+                Timeout: timeout,
+                WorkingDirectoryHandle: workingDirectoryHandle),
             cancellationToken);
         var sanitized = Sanitize(version);
         if (version.TimedOut)
@@ -73,7 +81,8 @@ public sealed class ComposeExecutor
     public async Task<ComposeExecutionResult> ExecuteUpAsync(
         string workingDirectory,
         CancellationToken cancellationToken,
-        Func<ProcessOutputLine, ValueTask>? outputHandler = null)
+        Func<ProcessOutputLine, ValueTask>? outputHandler = null,
+        SafeDirectoryHandle? workingDirectoryHandle = null)
     {
         var execution = await processRunner.RunAsync(
             new ProcessRequest(
@@ -83,7 +92,8 @@ public sealed class ComposeExecutor
                 Timeout: timeout,
                 OutputHandler: outputHandler is null
                     ? null
-                    : line => outputHandler(new ProcessOutputLine(line.Stream, sanitizer.Sanitize(line.Text)))),
+                    : line => outputHandler(new ProcessOutputLine(line.Stream, sanitizer.Sanitize(line.Text))),
+                WorkingDirectoryHandle: workingDirectoryHandle),
             cancellationToken);
         var sanitized = Sanitize(execution);
         var errorCode = execution.TimedOut ? "process_timeout" : execution.ExitCode == 0 ? null : "compose_failed";

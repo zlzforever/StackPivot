@@ -84,18 +84,10 @@ public sealed class StackExecutor(
                 return Failure("invalid_commit");
             }
 
-            SafePath safePath;
+            SafePath? safePath = null;
             try
             {
-                safePath = await pathPolicy.ValidateStackPathAsync(command.StackGitRelativePath, cancellationToken);
-            }
-            catch (PathPolicyException)
-            {
-                return Failure("invalid_path");
-            }
-
-            try
-            {
+                safePath = await pathPolicy.OpenStackPathAsync(command.StackGitRelativePath, cancellationToken);
                 if (!string.Equals(
                         Path.GetFullPath(command.AgentStackLocalPath),
                         safePath.FullPath,
@@ -103,50 +95,61 @@ public sealed class StackExecutor(
                 {
                     return Failure("invalid_path");
                 }
+
+                var composeVersion = await composeExecutor.CheckVersionAsync(
+                    safePath.FullPath,
+                    cancellationToken,
+                    safePath.DirectoryHandle);
+                if (!composeVersion.IsSupported)
+                {
+                    return new AgentExecutionResult(
+                        false,
+                        composeVersion.ExitCode,
+                        composeVersion.OutputLog,
+                        composeVersion.LogTruncated,
+                        composeVersion.ErrorCode);
+                }
+
+                var gitResult = await gitCheckoutExecutor.MaterializeAsync(
+                    new GitDeploymentInput(
+                        command.GitRepo,
+                        command.GitUserName,
+                        command.AccessToken,
+                        command.TargetCommitHash,
+                        command.StackGitRelativePath,
+                        command.AgentStackLocalPath,
+                        safePath.DirectoryHandle),
+                    cancellationToken);
+                if (!gitResult.Success)
+                {
+                    return Failure(gitResult.ErrorCode ?? "git_failed");
+                }
+
+                var composeResult = await composeExecutor.ExecuteUpAsync(
+                    safePath.FullPath,
+                    cancellationToken,
+                    logHandler is null
+                        ? null
+                        : output => logHandler(new AgentLogEntry(output.Stream, output.Text)),
+                    safePath.DirectoryHandle);
+                return new AgentExecutionResult(
+                    composeResult.Success,
+                    composeResult.ExitCode,
+                    composeResult.OutputLog,
+                    composeResult.LogTruncated,
+                    composeResult.ErrorCode);
             }
-            catch (ArgumentException)
+            catch (Exception exception) when (exception is PathPolicyException or ArgumentException or PlatformNotSupportedException)
             {
                 return Failure("invalid_path");
             }
-
-            Directory.CreateDirectory(safePath.FullPath);
-            var composeVersion = await composeExecutor.CheckVersionAsync(safePath.FullPath, cancellationToken);
-            if (!composeVersion.IsSupported)
+            finally
             {
-                return new AgentExecutionResult(
-                    false,
-                    composeVersion.ExitCode,
-                    composeVersion.OutputLog,
-                    composeVersion.LogTruncated,
-                    composeVersion.ErrorCode);
+                if (safePath is not null)
+                {
+                    await safePath.DisposeAsync();
+                }
             }
-
-            var gitResult = await gitCheckoutExecutor.MaterializeAsync(
-                new GitDeploymentInput(
-                    command.GitRepo,
-                    command.GitUserName,
-                    command.AccessToken,
-                    command.TargetCommitHash,
-                    command.StackGitRelativePath,
-                    command.AgentStackLocalPath),
-                cancellationToken);
-            if (!gitResult.Success)
-            {
-                return Failure(gitResult.ErrorCode ?? "git_failed");
-            }
-
-            var composeResult = await composeExecutor.ExecuteUpAsync(
-                safePath.FullPath,
-                cancellationToken,
-                logHandler is null
-                    ? null
-                    : output => logHandler(new AgentLogEntry(output.Stream, output.Text)));
-            return new AgentExecutionResult(
-                composeResult.Success,
-                composeResult.ExitCode,
-                composeResult.OutputLog,
-                composeResult.LogTruncated,
-                composeResult.ErrorCode);
         }
         catch (System.Text.Json.JsonException)
         {

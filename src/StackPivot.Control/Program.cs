@@ -35,7 +35,6 @@ builder.Services.AddScoped<IUserIdentityService, UserIdentityService>();
 builder.Services.AddScoped<WorkspaceAuthorizationService>();
 builder.Services.AddSingleton(new CentralGitOptions
 {
-    MainRoot = builder.Configuration["CentralGit:MainRoot"] ?? "/opt/main",
     AllowedRemoteHosts = CentralGitOptions.ReadAllowedRemoteHosts(builder.Configuration),
     RejectSensitiveEnv = !bool.TryParse(builder.Configuration["CentralGit:AllowSensitiveEnv"], out var allowSensitiveEnv) || !allowSensitiveEnv
 });

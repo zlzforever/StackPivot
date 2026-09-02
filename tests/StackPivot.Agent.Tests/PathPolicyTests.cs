@@ -74,4 +74,74 @@ public sealed class PathPolicyTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    [SkippableFact]
+    public async Task OpenStackPathKeepsFileOperationsInsideTheOpenedDirectoryAfterReplacement()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-fd-" + Guid.NewGuid().ToString("N"));
+        var outside = Path.Combine(Path.GetTempPath(), "stackpivot-path-outside-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var movedStackPath = Path.Combine(root, "workspace_one", "stack_web-original");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            var policy = new PathPolicy(root);
+            await using var safePath = await policy.OpenStackPathAsync(
+                "workspace_one/stack_web",
+                CancellationToken.None);
+
+            Directory.Move(stackPath, movedStackPath);
+            Directory.CreateSymbolicLink(stackPath, outside);
+
+            using (var file = safePath.DirectoryHandle!.OpenFile("marker.txt", FileMode.CreateNew, FileAccess.Write))
+            using (var writer = new StreamWriter(file))
+            {
+                writer.Write("inside");
+            }
+
+            Assert.True(File.Exists(Path.Combine(movedStackPath, "marker.txt")));
+            Assert.False(File.Exists(Path.Combine(outside, "marker.txt")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+
+            if (Directory.Exists(outside))
+            {
+                Directory.Delete(outside, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task OpenStackPathFailsClosedOnUnsupportedOperatingSystem()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            throw new Xunit.SkipException("Linux-only Agent implementation test.");
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-platform-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var policy = new PathPolicy(root);
+
+            await Assert.ThrowsAsync<PlatformNotSupportedException>(() =>
+                policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
 }
