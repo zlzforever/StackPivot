@@ -12,7 +12,9 @@ Group=stackpivot-agent
 # The docker group must already exist and be approved by the host operator.
 SupplementaryGroups=docker
 WorkingDirectory=/opt/agent-main
-ExecStart=/usr/bin/dotnet /opt/stackpivot-agent/StackPivot.Agent.dll
+# EnvironmentFile values are not trusted for the credential selector. The
+# fixed env assignment below is the only selector value visible to dotnet.
+ExecStart=/usr/bin/env STACKPIVOT_AGENT_API_KEY_FILE=%d/agent-api-key /usr/bin/dotnet /opt/stackpivot-agent/StackPivot.Agent.dll
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -20,12 +22,12 @@ KillMode=control-group
 
 Environment=DOTNET_ENVIRONMENT=Production
 Environment=STACKPIVOT_AGENT_WORK_ROOT=/opt/agent-main
-# This file contains only non-sensitive identity and hub settings.
+# This file is limited to non-sensitive identity, hub and Git host settings.
 EnvironmentFile=/etc/stackpivot/agent.env
 LoadCredential=agent-api-key:/etc/stackpivot/agent-api-key
-# The value is a path to the runtime credential, never the credential itself.
-# Keep this after EnvironmentFile so the credential path cannot be overridden there.
-Environment=STACKPIVOT_AGENT_API_KEY_FILE=%d/agent-api-key
+# EnvironmentFile= has precedence over Environment=. Remove any attempt to
+# inject this selector before ExecStart adds the fixed runtime credential path.
+UnsetEnvironment=STACKPIVOT_AGENT_API_KEY_FILE
 
 UMask=0077
 NoNewPrivileges=yes
