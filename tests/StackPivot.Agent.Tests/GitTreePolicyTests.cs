@@ -50,6 +50,14 @@ public sealed class GitTreePolicyTests
     }
 
     [Fact]
+    public void RemoteHostPolicyRejectsWhitespaceInTheRemote()
+    {
+        Assert.False(CentralRemotePolicy.IsAllowed(
+            "https://git.example/repository with-space.git",
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "git.example" }));
+    }
+
+    [Fact]
     public async Task MaterializationUsesReadTreeAndClearsTheCredentialBuffer()
     {
         if (!OperatingSystem.IsLinux())
@@ -310,6 +318,15 @@ public sealed class GitTreePolicyTests
                 Directory.Delete(root, recursive: true);
             }
         }
+    }
+
+    [Fact]
+    public async Task ManagedMetadataPathCannotTargetGitDirectory()
+    {
+        var policy = new PathPolicy(Path.Combine(Path.GetTempPath(), "stackpivot-git-" + Guid.NewGuid().ToString("N")));
+
+        await Assert.ThrowsAsync<PathPolicyException>(() =>
+            policy.ValidateManagedFilePathAsync(".git/config", CancellationToken.None));
     }
 
     private sealed class MaterializationRunner(bool treeOutputTruncated = false) : IProcessRunner

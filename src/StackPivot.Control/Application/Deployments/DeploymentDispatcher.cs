@@ -34,7 +34,8 @@ public sealed class DeploymentDispatcher(
             var now = DateTimeOffset.UtcNow;
             if (history.AcceptedAt is not null || history.StartTime is not null)
             {
-                if (now - history.LastEventAt >= ExecutionTimeout)
+                var executionStartedAt = history.StartTime ?? history.AcceptedAt ?? history.LastEventAt;
+                if (now - executionStartedAt >= ExecutionTimeout)
                 {
                     await MarkFailedAsync(history, "agent_execution_timeout", cancellationToken);
                 }

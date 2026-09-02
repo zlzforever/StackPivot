@@ -236,6 +236,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 ["GIT_ASKPASS"] = askpass.AskpassPath,
                 ["GIT_TERMINAL_PROMPT"] = "0",
                 ["GIT_CONFIG_NOSYSTEM"] = "1",
+                ["GIT_CONFIG_NOGLOBAL"] = "1",
                 ["GIT_CONFIG_COUNT"] = "2",
                 ["GIT_CONFIG_KEY_0"] = "credential.helper",
                 ["GIT_CONFIG_VALUE_0"] = string.Empty,
@@ -435,7 +436,7 @@ public static class CentralRemotePolicy
     public static bool IsAllowed(string? remote, IReadOnlySet<string>? allowedHosts)
     {
         return !string.IsNullOrWhiteSpace(remote)
-            && !remote.Any(char.IsControl)
+            && !remote.Any(character => char.IsControl(character) || char.IsWhiteSpace(character))
             && Uri.TryCreate(remote, UriKind.Absolute, out var uri)
             && string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
             && string.IsNullOrEmpty(uri.UserInfo)

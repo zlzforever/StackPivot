@@ -277,4 +277,91 @@ public sealed class AuthAndPermissionTests
             return result;
         }
     }
+
+    [Fact]
+    public async Task AuthenticationLastSeenUpdateSurvivesConcurrentKeyRotation()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-auth-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        var barrier = new LastSeenUpdateBarrier();
+        var manager = new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests"));
+        var agentId = Guid.Parse("00000000-0000-0000-0000-000000000011");
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            var authenticationOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(barrier)
+                .Options;
+            var issued = manager.Issue(agentId);
+            await using (var seed = new StackPivotDbContext(baseOptions))
+            {
+                await seed.Database.EnsureCreatedAsync();
+                seed.AgentNodes.Add(new AgentNode
+                {
+                    AgentId = agentId,
+                    Name = "agent",
+                    ApiKeyHash = issued.ApiKeyHash,
+                    ApiKeyVersion = issued.Version,
+                    ApiKeyLast4 = issued.ApiKeyLast4
+                });
+                await seed.SaveChangesAsync();
+            }
+
+            await using var authenticationDb = new StackPivotDbContext(authenticationOptions);
+            await using var rotationDb = new StackPivotDbContext(baseOptions);
+            barrier.Target = authenticationDb;
+            barrier.Enabled = true;
+            var authentication = new AgentApiKeyAuthenticationService(
+                authenticationDb,
+                new AgentApiKeyService(authenticationDb, manager));
+            var rotation = new AgentApiKeyService(rotationDb, manager);
+            var authenticationTask = authentication.AuthenticateAsync(issued.ApiKey, CancellationToken.None);
+            await barrier.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await rotation.RotateKeyAsync(agentId, CancellationToken.None);
+            barrier.Enabled = false;
+            barrier.Release.TrySetResult(true);
+
+            var identity = await authenticationTask;
+            Assert.NotNull(identity);
+            Assert.Equal(agentId, identity!.AgentId);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    private sealed class LastSeenUpdateBarrier : DbCommandInterceptor
+    {
+        public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public StackPivotDbContext? Target { get; set; }
+        public bool Enabled { get; set; }
+        private int blocked;
+
+        public override async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Enabled
+                && ReferenceEquals(eventData.Context, Target)
+                && command.CommandText.Contains("last_seen_at", StringComparison.OrdinalIgnoreCase)
+                && Interlocked.Exchange(ref blocked, 1) == 0)
+            {
+                Started.TrySetResult(true);
+                await Release.Task.WaitAsync(cancellationToken);
+            }
+
+            return result;
+        }
+    }
 }

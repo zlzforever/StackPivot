@@ -364,13 +364,21 @@ public sealed class AgentApiKeyAuthenticationService(
 
         var agents = await dbContext.AgentNodes
             .Where(value => value.RevokedAt == null)
+            .AsNoTracking()
             .ToListAsync(cancellationToken);
         foreach (var agent in agents)
         {
             if (keyService.Verify(agent, candidate))
             {
-                agent.LastSeenAt = DateTimeOffset.UtcNow;
-                await dbContext.SaveChangesAsync(cancellationToken);
+                var lastSeenAt = DateTimeOffset.UtcNow;
+                await dbContext.AgentNodes
+                    .Where(value => value.AgentId == agent.AgentId
+                        && value.ApiKeyVersion == agent.ApiKeyVersion
+                        && value.ApiKeyHash == agent.ApiKeyHash
+                        && value.RevokedAt == null)
+                    .ExecuteUpdateAsync(
+                        setters => setters.SetProperty(value => value.LastSeenAt, lastSeenAt),
+                        cancellationToken);
                 return new AgentApiKeyIdentity(agent.AgentId);
             }
         }

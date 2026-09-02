@@ -40,7 +40,7 @@ public sealed class PathPolicy
         }
 
         var segments = relativePath.Split('/', StringSplitOptions.None);
-        if (segments.Any(segment => string.IsNullOrEmpty(segment) || segment is "." or ".."))
+        if (segments.Any(segment => string.IsNullOrEmpty(segment) || segment is "." or ".." or ".git"))
         {
             throw new PathPolicyException("Managed path contains an unsafe segment.");
         }

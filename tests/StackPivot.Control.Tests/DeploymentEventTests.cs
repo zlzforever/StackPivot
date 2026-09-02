@@ -359,6 +359,38 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AcceptedTaskExpiresFromStartTimeEvenWhenRecentLogsUpdatedLastEvent()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var startedAt = DateTimeOffset.UtcNow.AddHours(-2);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchAttemptAt = startedAt;
+        history.DispatchedAt = startedAt;
+        history.AcceptedAt = startedAt;
+        history.StartTime = startedAt;
+        history.LastEventAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", history.TaskStatus);
+        Assert.Equal("agent_execution_timeout", history.ErrorCode);
+        Assert.Equal(fixture.AgentId, history.AgentId);
+    }
+
+    [Fact]
     public async Task AgentDisconnectFailsAcceptedTaskAndReleasesActivity()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
