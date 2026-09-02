@@ -102,6 +102,19 @@ public sealed class GitTreePolicyTests
     }
 
     [Fact]
+    public void InMemoryAskpassIsExecutableByGit()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var credential = InMemoryGitCredential.Create("git-user", "secret"u8.ToArray());
+
+        Assert.True(File.GetUnixFileMode(credential.AskpassPath).HasFlag(UnixFileMode.UserExecute));
+    }
+
+    [Fact]
     public async Task TruncatedTreeOutputFailsClosedBeforeReadTree()
     {
         if (!OperatingSystem.IsLinux())
@@ -332,7 +345,6 @@ public sealed class GitTreePolicyTests
     private sealed class MaterializationRunner(bool treeOutputTruncated = false) : IProcessRunner
     {
         public List<ProcessRequest> Requests { get; } = new();
-
         public ProcessResult TreeResult { get; init; } = new(
             0,
             "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",

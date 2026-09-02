@@ -4,9 +4,9 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using StackPivot.Control.Auth;
 using StackPivot.Control.Application.Deployments;
+using StackPivot.Control.Infrastructure.Git;
 using StackPivot.Contracts.Deployments;
 using StackPivot.Contracts.SignalR;
-using StackPivot.Control.Infrastructure.Git;
 
 namespace StackPivot.Control.Api;
 

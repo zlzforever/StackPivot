@@ -79,6 +79,33 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AcceptedEventIsHandledBeforeDispatchMarkerIsPersisted()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAcceptedAsync(
+            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.NotNull(history.StartTime);
+        Assert.Null(history.DispatchedAt);
+    }
+
+    [Fact]
     public async Task DispatchSendExceptionFailsTheTaskInsteadOfLeavingItPending()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
