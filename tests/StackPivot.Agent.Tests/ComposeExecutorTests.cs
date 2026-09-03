@@ -228,12 +228,178 @@ public sealed class ComposeExecutorTests
         }
     }
 
+    [SkippableTheory]
+    [InlineData("extends:\n  file: ../../etc/passwd\n  service: base")]
+    [InlineData("extends:\n  file: /etc/passwd\n  service: base")]
+    [InlineData("extends: { file: ../../etc/passwd, service: base }")]
+    [InlineData("extends: { file: /etc/passwd, service: base }")]
+    [InlineData("extends:\n  file: base.yaml\n  service: base\n  unknown: ../outside")]
+    [InlineData("extends: { file: base.yaml, service: base, unknown: ../outside }")]
+    [InlineData("build: { context: build, unknown: ../outside }")]
+    public async Task ComposeUpRejectsUnsafeOrUnknownComposeReferences(string serviceConfiguration)
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(
+            Path.Combine(stackPath, "compose.yaml"),
+            "services:\n  app:\n    image: alpine\n    " + serviceConfiguration.Replace("\n", "\n    ", StringComparison.Ordinal) + "\n");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("extends: base.yaml")]
+    [InlineData("extends:\n  file: base.yaml")]
+    [InlineData("extends: { file: base.yaml }")]
+    [InlineData("extends: { service: base, file: base.yaml, extra: value }")]
+    public async Task ComposeUpRejectsMalformedOrIncompleteExtendsConfiguration(string serviceConfiguration)
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-shape-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(
+            Path.Combine(stackPath, "compose.yaml"),
+            "services:\n  app:\n    image: alpine\n    " + serviceConfiguration.Replace("\n", "\n    ", StringComparison.Ordinal) + "\n");
+        File.WriteAllText(Path.Combine(stackPath, "base.yaml"), "services:\n  base:\n    image: alpine\n");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpPreservesSafeRelativeExtendsFileInPrivateSnapshot()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-safe-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        const string compose = "services:\n  app:\n    image: alpine\n    extends:\n      file: base.yaml\n      service: base\n";
+        const string baseCompose = "services:\n  base:\n    image: alpine\n";
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), compose);
+        File.WriteAllText(Path.Combine(stackPath, "base.yaml"), baseCompose);
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.True(result.Success);
+            Assert.Equal(compose, runner.ComposeContentsDuringUp);
+            Assert.Equal(baseCompose, runner.ExtendsFileContentsDuringUp);
+            Assert.Equal(ExpectedUpArguments, runner.Requests.Single().Arguments);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsSymlinkedExtendsFileBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-link-" + Guid.NewGuid().ToString("N"));
+        var outside = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-link-outside-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        Directory.CreateDirectory(outside);
+        File.WriteAllText(
+            Path.Combine(stackPath, "compose.yaml"),
+            "services:\n  app:\n    extends:\n      file: base.yaml\n      service: base\n");
+        var outsideCompose = Path.Combine(outside, "base.yaml");
+        File.WriteAllText(outsideCompose, "services:\n  base:\n    image: alpine\n");
+        File.CreateSymbolicLink(Path.Combine(stackPath, "base.yaml"), outsideCompose);
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+
+            if (Directory.Exists(outside))
+            {
+                Directory.Delete(outside, recursive: true);
+            }
+        }
+    }
+
     internal sealed class RecordingProcessRunner(params ProcessResult[] responses) : IProcessRunner
     {
         private int responseIndex;
         public List<ProcessRequest> Requests { get; } = new();
         public bool SawComposeFileDuringUp { get; private set; }
         public bool SawReferencedFilesDuringUp { get; private set; }
+        public string? ComposeContentsDuringUp { get; private set; }
+        public string? ExtendsFileContentsDuringUp { get; private set; }
 
         public Task<ProcessResult> RunAsync(ProcessRequest request, CancellationToken cancellationToken)
         {
@@ -243,6 +409,17 @@ public sealed class ComposeExecutorTests
                 SawComposeFileDuringUp = File.Exists(Path.Combine(request.WorkingDirectory, "compose.yaml"));
                 SawReferencedFilesDuringUp = File.Exists(Path.Combine(request.WorkingDirectory, "app.env"))
                     && File.Exists(Path.Combine(request.WorkingDirectory, "build", "Dockerfile"));
+                var composeFile = Path.Combine(request.WorkingDirectory, "compose.yaml");
+                if (File.Exists(composeFile))
+                {
+                    ComposeContentsDuringUp = File.ReadAllText(composeFile);
+                }
+
+                var extendsFile = Path.Combine(request.WorkingDirectory, "base.yaml");
+                if (File.Exists(extendsFile))
+                {
+                    ExtendsFileContentsDuringUp = File.ReadAllText(extendsFile);
+                }
             }
             return Task.FromResult(responses[Math.Min(responseIndex++, responses.Length - 1)]);
         }

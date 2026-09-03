@@ -6,9 +6,6 @@ namespace StackPivot.Agent.Execution;
 
 internal sealed class ComposeWorkspaceSnapshot : IDisposable
 {
-    private static readonly Regex PathProperty = new(
-        @"^(?<key>[A-Za-z0-9_.-]+)\s*:\s*(?<value>.*)$",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly HashSet<string> PathKeys = new(StringComparer.Ordinal)
     {
         "build",
@@ -23,6 +20,7 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         "additional_contexts",
         "include",
         "path",
+        "src",
         "project_directory",
         "ssh",
         "source",
@@ -124,83 +122,1108 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
     private static void ValidateComposeReferences(SafeDirectoryHandle workspace)
     {
         string compose;
-        using (var file = OpenComposeFile(workspace))
-        using (var reader = new StreamReader(file, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+        try
         {
+            using var file = OpenComposeFile(workspace);
+            using var reader = new StreamReader(
+                file,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true));
             compose = reader.ReadToEnd();
         }
-
-        var activeListKey = string.Empty;
-        foreach (var rawLine in compose.Split('\n'))
+        catch (DecoderFallbackException exception)
         {
-            var line = RemoveComment(rawLine.TrimEnd('\r'));
-            var trimmed = line.Trim();
-            if (trimmed.Length == 0)
-            {
-                continue;
-            }
-
-            if (trimmed.Contains('&') || trimmed.Contains('*'))
-            {
-                throw new PathPolicyException("Compose file aliases and anchors are not supported safely.");
-            }
-
-            var property = PathProperty.Match(trimmed);
-            if (property.Success)
-            {
-                var key = property.Groups["key"].Value;
-                var value = property.Groups["value"].Value;
-                if (activeListKey == "additional_contexts" && !PathKeys.Contains(key))
-                {
-                    ValidateAdditionalContextValue(value);
-                }
-
-                activeListKey = PathKeys.Contains(key) ? key : string.Empty;
-                if (PathKeys.Contains(key))
-                {
-                    switch (key)
-                    {
-                        case "build":
-                            ValidateBuildValue(value);
-                            break;
-                        case "volumes":
-                        case "devices":
-                            ValidateMountValue(value);
-                            break;
-                        case "additional_contexts":
-                            ValidateAdditionalContextValue(value);
-                            break;
-                        default:
-                            ValidatePathValue(value);
-                            break;
-                    }
-                }
-
-                continue;
-            }
-
-            if (activeListKey.Length > 0 && trimmed.StartsWith('-'))
-            {
-                var value = trimmed[1..];
-                switch (activeListKey)
-                {
-                    case "volumes":
-                    case "devices":
-                        ValidateMountValue(value);
-                        break;
-                    case "additional_contexts":
-                        ValidateAdditionalContextValue(value);
-                        break;
-                    default:
-                        ValidatePathValue(value);
-                        break;
-                }
-
-                continue;
-            }
-
-            activeListKey = string.Empty;
+            throw new PathPolicyException("Compose file is not valid UTF-8.", exception);
         }
+
+        var document = new ComposeYamlParser(compose).Parse();
+        ValidateComposeNode(document, ComposeValidationContext.Root);
+    }
+
+    private static readonly HashSet<string> RootKeys = new(StringComparer.Ordinal)
+    {
+        "version",
+        "name",
+        "services",
+        "networks",
+        "volumes",
+        "configs",
+        "secrets",
+        "include",
+        "models",
+        "fragments",
+        "merge"
+    };
+
+    private static readonly HashSet<string> ServiceKeys = new(StringComparer.Ordinal)
+    {
+        "annotations",
+        "attach",
+        "build",
+        "cap_add",
+        "cap_drop",
+        "cgroup",
+        "cgroup_parent",
+        "command",
+        "configs",
+        "container_name",
+        "cpu_count",
+        "cpu_percent",
+        "cpu_period",
+        "cpu_quota",
+        "cpu_rt_period",
+        "cpu_rt_runtime",
+        "cpus",
+        "cpuset",
+        "cpu_shares",
+        "credential_spec",
+        "depends_on",
+        "deploy",
+        "description",
+        "devices",
+        "develop",
+        "dns",
+        "dns_opt",
+        "dns_search",
+        "domainname",
+        "entrypoint",
+        "env_file",
+        "environment",
+        "expose",
+        "extends",
+        "external_links",
+        "extra_hosts",
+        "gpus",
+        "group_add",
+        "healthcheck",
+        "hostname",
+        "image",
+        "init",
+        "ipc",
+        "isolation",
+        "labels",
+        "links",
+        "logging",
+        "mac_address",
+        "mem_limit",
+        "mem_reservation",
+        "mem_swappiness",
+        "memswap_limit",
+        "models",
+        "networks",
+        "network_mode",
+        "oom_kill_disable",
+        "oom_score_adj",
+        "pid",
+        "pids_limit",
+        "platform",
+        "ports",
+        "privileged",
+        "profiles",
+        "pull_policy",
+        "read_only",
+        "restart",
+        "runtime",
+        "scale",
+        "secrets",
+        "security_opt",
+        "shm_size",
+        "stdin_open",
+        "stop_grace_period",
+        "stop_signal",
+        "storage_opt",
+        "sysctls",
+        "tmpfs",
+        "tty",
+        "ulimits",
+        "user",
+        "userns_mode",
+        "uts",
+        "volumes",
+        "volumes_from",
+        "working_dir",
+        "post_start",
+        "pre_stop",
+        "provider",
+        "use_api_socket",
+        "interface_name"
+    };
+
+    private static readonly HashSet<string> BuildKeys = new(StringComparer.Ordinal)
+    {
+        "context",
+        "dockerfile",
+        "dockerfile_inline",
+        "args",
+        "ssh",
+        "cache_from",
+        "cache_to",
+        "additional_contexts",
+        "target",
+        "network",
+        "extra_hosts",
+        "isolation",
+        "labels",
+        "secrets",
+        "platforms",
+        "tags",
+        "privileged",
+        "entitlements",
+        "provenance",
+        "sbom",
+        "no_cache",
+        "pull",
+        "shm_size",
+        "ulimits",
+        "outputs"
+    };
+
+    private static readonly HashSet<string> ExtendsKeys = new(StringComparer.Ordinal)
+    {
+        "file",
+        "service"
+    };
+
+    private static readonly HashSet<string> EnvFileKeys = new(StringComparer.Ordinal)
+    {
+        "path",
+        "required",
+        "format"
+    };
+
+    private static readonly HashSet<string> IncludeKeys = new(StringComparer.Ordinal)
+    {
+        "path",
+        "env_file",
+        "project_directory"
+    };
+
+    private static readonly HashSet<string> MountKeys = new(StringComparer.Ordinal)
+    {
+        "type",
+        "source",
+        "target",
+        "read_only",
+        "consistency",
+        "bind",
+        "volume",
+        "tmpfs",
+        "image",
+        "subpath",
+        "nocopy",
+        "create_host_path",
+        "selinux",
+        "propagation",
+        "recursive",
+        "device"
+    };
+
+    private static readonly HashSet<string> BindMountKeys = new(StringComparer.Ordinal)
+    {
+        "propagation",
+        "create_host_path",
+        "selinux",
+        "recursive"
+    };
+
+    private static readonly HashSet<string> VolumeMountKeys = new(StringComparer.Ordinal)
+    {
+        "nocopy",
+        "subpath"
+    };
+
+    private static readonly HashSet<string> TmpfsMountKeys = new(StringComparer.Ordinal)
+    {
+        "size",
+        "mode"
+    };
+
+    private static readonly HashSet<string> ImageMountKeys = new(StringComparer.Ordinal)
+    {
+        "subpath"
+    };
+
+    private static readonly HashSet<string> ResourceDefinitionKeys = new(StringComparer.Ordinal)
+    {
+        "name",
+        "external",
+        "file",
+        "environment",
+        "content",
+        "template_driver",
+        "driver",
+        "driver_opts",
+        "labels",
+        "image",
+        "uid",
+        "gid",
+        "mode"
+    };
+
+    private static readonly HashSet<string> ServiceResourceKeys = new(StringComparer.Ordinal)
+    {
+        "source",
+        "target",
+        "uid",
+        "gid",
+        "mode"
+    };
+
+    private static readonly HashSet<string> CacheKeys = new(StringComparer.Ordinal)
+    {
+        "type",
+        "ref",
+        "src",
+        "dest",
+        "mode",
+        "compression",
+        "oci-mediatypes",
+        "ignore-error",
+        "sharing",
+        "scope",
+        "image-manifest",
+        "registry.insecure",
+        "inline",
+        "platform"
+    };
+
+    private static readonly HashSet<string> DevelopKeys = new(StringComparer.Ordinal)
+    {
+        "watch"
+    };
+
+    private static readonly HashSet<string> WatchKeys = new(StringComparer.Ordinal)
+    {
+        "path",
+        "target",
+        "action",
+        "ignore",
+        "initial_sync",
+        "exec"
+    };
+
+    private static readonly Regex ServiceName = new(
+        "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private enum ComposeValidationContext
+    {
+        Root,
+        Services,
+        Service,
+        Generic,
+        Extends,
+        Build,
+        EnvFile,
+        EnvFileItem,
+        Include,
+        IncludeItem,
+        MountCollection,
+        MountItem,
+        MountOptions,
+        TopLevelResources,
+        ResourceDefinition,
+        ServiceResources,
+        ServiceResourceItem,
+        AdditionalContexts,
+        Cache,
+        CacheItem,
+        Ssh,
+        Develop,
+        Watch
+    }
+
+    private static void ValidateComposeNode(ComposeNode node, ComposeValidationContext context)
+    {
+        switch (context)
+        {
+            case ComposeValidationContext.Root:
+                ValidateRoot(node);
+                break;
+            case ComposeValidationContext.Services:
+                ValidateServices(node);
+                break;
+            case ComposeValidationContext.Service:
+                ValidateService(node);
+                break;
+            case ComposeValidationContext.Generic:
+                ValidateGeneric(node);
+                break;
+            case ComposeValidationContext.Extends:
+                ValidateExtends(node);
+                break;
+            case ComposeValidationContext.Build:
+                ValidateBuild(node);
+                break;
+            case ComposeValidationContext.EnvFile:
+                ValidateEnvFile(node);
+                break;
+            case ComposeValidationContext.EnvFileItem:
+                ValidateEnvFileItem(node);
+                break;
+            case ComposeValidationContext.Include:
+                ValidateInclude(node);
+                break;
+            case ComposeValidationContext.IncludeItem:
+                ValidateIncludeItem(node);
+                break;
+            case ComposeValidationContext.MountCollection:
+                ValidateMountCollection(node);
+                break;
+            case ComposeValidationContext.MountItem:
+                ValidateMountItem(node);
+                break;
+            case ComposeValidationContext.MountOptions:
+                ValidateMountOptions(node);
+                break;
+            case ComposeValidationContext.TopLevelResources:
+                ValidateTopLevelResources(node);
+                break;
+            case ComposeValidationContext.ResourceDefinition:
+                ValidateResourceDefinition(node);
+                break;
+            case ComposeValidationContext.ServiceResources:
+                ValidateServiceResources(node);
+                break;
+            case ComposeValidationContext.ServiceResourceItem:
+                ValidateServiceResourceItem(node);
+                break;
+            case ComposeValidationContext.AdditionalContexts:
+                ValidateAdditionalContexts(node);
+                break;
+            case ComposeValidationContext.Cache:
+                ValidateCache(node);
+                break;
+            case ComposeValidationContext.CacheItem:
+                ValidateCacheItem(node);
+                break;
+            case ComposeValidationContext.Ssh:
+                ValidateSsh(node);
+                break;
+            case ComposeValidationContext.Develop:
+                ValidateDevelop(node);
+                break;
+            case ComposeValidationContext.Watch:
+                ValidateWatch(node);
+                break;
+            default:
+                throw new PathPolicyException("Compose file uses an unsupported validation context.");
+        }
+    }
+
+    private static void ValidateRoot(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose document");
+        foreach (var property in map.Properties)
+        {
+            if (!RootKeys.Contains(property.Key) && !property.Key.StartsWith("x-", StringComparison.Ordinal))
+            {
+                throw new PathPolicyException("Compose document contains an unknown key.");
+            }
+
+            switch (property.Key)
+            {
+                case "services":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Services);
+                    break;
+                case "include":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Include);
+                    break;
+                case "volumes":
+                case "configs":
+                case "secrets":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.TopLevelResources);
+                    break;
+                default:
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Generic);
+                    break;
+            }
+        }
+    }
+
+    private static void ValidateServices(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose services");
+        foreach (var property in map.Properties)
+        {
+            if (property.Key.Length == 0)
+            {
+                throw new PathPolicyException("Compose service name is empty.");
+            }
+
+            ValidateComposeNode(property.Value, ComposeValidationContext.Service);
+        }
+    }
+
+    private static void ValidateService(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose service");
+        foreach (var property in map.Properties)
+        {
+            if (!ServiceKeys.Contains(property.Key)
+                && !property.Key.StartsWith("x-", StringComparison.Ordinal))
+            {
+                throw new PathPolicyException("Compose service contains an unknown key.");
+            }
+
+            switch (property.Key)
+            {
+                case "build":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Build);
+                    break;
+                case "extends":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Extends);
+                    break;
+                case "env_file":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.EnvFile);
+                    break;
+                case "include":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Include);
+                    break;
+                case "volumes":
+                case "devices":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.MountCollection);
+                    break;
+                case "configs":
+                case "secrets":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.ServiceResources);
+                    break;
+                case "develop":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Develop);
+                    break;
+                default:
+                    ValidateGenericProperty(property);
+                    break;
+            }
+        }
+    }
+
+    private static void ValidateGeneric(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeMap map:
+                foreach (var property in map.Properties)
+                {
+                    ValidateGenericProperty(property);
+                }
+
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidateGeneric(item);
+                }
+
+                break;
+            case ComposeScalar:
+                break;
+            default:
+                throw new PathPolicyException("Compose file contains an unsupported value.");
+        }
+    }
+
+    private static void ValidateGenericProperty(ComposeProperty property)
+    {
+        if (property.Key == "<<")
+        {
+            throw new PathPolicyException("Compose merge keys are not supported safely.");
+        }
+
+        switch (property.Key)
+        {
+            case "build":
+                ValidateComposeNode(property.Value, ComposeValidationContext.Build);
+                break;
+            case "extends":
+                ValidateComposeNode(property.Value, ComposeValidationContext.Extends);
+                break;
+            case "env_file":
+                ValidateComposeNode(property.Value, ComposeValidationContext.EnvFile);
+                break;
+            case "include":
+                ValidateComposeNode(property.Value, ComposeValidationContext.Include);
+                break;
+            case "volumes":
+            case "devices":
+                ValidateComposeNode(property.Value, ComposeValidationContext.MountCollection);
+                break;
+            case "configs":
+            case "secrets":
+                ValidateComposeNode(property.Value, ComposeValidationContext.ServiceResources);
+                break;
+            case "additional_contexts":
+                ValidateComposeNode(property.Value, ComposeValidationContext.AdditionalContexts);
+                break;
+            case "cache_from":
+            case "cache_to":
+            case "outputs":
+                ValidateComposeNode(property.Value, ComposeValidationContext.Cache);
+                break;
+            case "ssh":
+                ValidateComposeNode(property.Value, ComposeValidationContext.Ssh);
+                break;
+            case "develop":
+                ValidateComposeNode(property.Value, ComposeValidationContext.Develop);
+                break;
+            default:
+                if (PathKeys.Contains(property.Key))
+                {
+                    ValidatePathNode(property.Value, property.Key);
+                }
+                else
+                {
+                    ValidateGeneric(property.Value);
+                }
+
+                break;
+        }
+    }
+
+    private static void ValidateExtends(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose extends");
+        var serviceFound = false;
+        foreach (var property in map.Properties)
+        {
+            if (!ExtendsKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose extends contains an unknown key.");
+            }
+
+            if (property.Key == "file")
+            {
+                ValidatePathNode(property.Value, "extends.file");
+            }
+            else
+            {
+                ValidateServiceReference(property.Value);
+                serviceFound = true;
+            }
+        }
+
+        if (!serviceFound)
+        {
+            throw new PathPolicyException("Compose extends.service is required.");
+        }
+    }
+
+    private static void ValidateBuild(ComposeNode node)
+    {
+        if (node is ComposeScalar)
+        {
+            ValidatePathNode(node, "build");
+            return;
+        }
+
+        var map = RequireMap(node, "Compose build");
+        foreach (var property in map.Properties)
+        {
+            if (!BuildKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose build contains an unknown key.");
+            }
+
+            switch (property.Key)
+            {
+                case "context":
+                case "dockerfile":
+                    ValidatePathNode(property.Value, "build." + property.Key);
+                    break;
+                case "additional_contexts":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.AdditionalContexts);
+                    break;
+                case "cache_from":
+                case "cache_to":
+                case "outputs":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Cache);
+                    break;
+                case "ssh":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.Ssh);
+                    break;
+                default:
+                    ValidateGenericProperty(property);
+                    break;
+            }
+        }
+    }
+
+    private static void ValidateEnvFile(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeScalar:
+                ValidatePathNode(node, "env_file");
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidateComposeNode(item, ComposeValidationContext.EnvFileItem);
+                }
+
+                break;
+            case ComposeMap:
+                ValidateComposeNode(node, ComposeValidationContext.EnvFileItem);
+                break;
+            default:
+                throw new PathPolicyException("Compose env_file has an unsupported value.");
+        }
+    }
+
+    private static void ValidateEnvFileItem(ComposeNode node)
+    {
+        if (node is ComposeScalar)
+        {
+            ValidatePathNode(node, "env_file");
+            return;
+        }
+
+        var map = RequireMap(node, "Compose env_file entry");
+        var pathFound = false;
+        foreach (var property in map.Properties)
+        {
+            if (!EnvFileKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose env_file contains an unknown key.");
+            }
+
+            if (property.Key == "path")
+            {
+                ValidatePathNode(property.Value, "env_file.path");
+                pathFound = true;
+            }
+            else
+            {
+                ValidateGeneric(property.Value);
+            }
+        }
+
+        if (!pathFound)
+        {
+            throw new PathPolicyException("Compose env_file.path is required.");
+        }
+    }
+
+    private static void ValidateInclude(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeScalar:
+                ValidatePathNode(node, "include");
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidateComposeNode(item, ComposeValidationContext.IncludeItem);
+                }
+
+                break;
+            case ComposeMap:
+                ValidateComposeNode(node, ComposeValidationContext.IncludeItem);
+                break;
+            default:
+                throw new PathPolicyException("Compose include has an unsupported value.");
+        }
+    }
+
+    private static void ValidateIncludeItem(ComposeNode node)
+    {
+        if (node is ComposeScalar)
+        {
+            ValidatePathNode(node, "include");
+            return;
+        }
+
+        var map = RequireMap(node, "Compose include entry");
+        var pathFound = false;
+        foreach (var property in map.Properties)
+        {
+            if (!IncludeKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose include contains an unknown key.");
+            }
+
+            switch (property.Key)
+            {
+                case "path":
+                    ValidatePathNode(property.Value, "include.path", allowSequence: true);
+                    pathFound = true;
+                    break;
+                case "env_file":
+                    ValidateComposeNode(property.Value, ComposeValidationContext.EnvFile);
+                    break;
+                case "project_directory":
+                    ValidatePathNode(property.Value, "include.project_directory");
+                    break;
+                default:
+                    throw new PathPolicyException("Compose include contains an unsupported key.");
+            }
+        }
+
+        if (!pathFound)
+        {
+            throw new PathPolicyException("Compose include.path is required.");
+        }
+    }
+
+    private static void ValidateMountCollection(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeScalar:
+                ValidateMountValue(RequireScalar(node, "Compose mount").Value);
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidateComposeNode(item, ComposeValidationContext.MountItem);
+                }
+
+                break;
+            case ComposeMap:
+                ValidateComposeNode(node, ComposeValidationContext.MountItem);
+                break;
+            default:
+                throw new PathPolicyException("Compose mount list has an unsupported value.");
+        }
+    }
+
+    private static void ValidateMountItem(ComposeNode node)
+    {
+        if (node is ComposeScalar)
+        {
+            ValidateMountValue(RequireScalar(node, "Compose mount").Value);
+            return;
+        }
+
+        var map = RequireMap(node, "Compose mount entry");
+        foreach (var property in map.Properties)
+        {
+            if (!MountKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose mount contains an unknown key.");
+            }
+
+            switch (property.Key)
+            {
+                case "source":
+                case "device":
+                    ValidatePathNode(property.Value, "mount." + property.Key);
+                    break;
+                case "bind":
+                case "volume":
+                case "tmpfs":
+                case "image":
+                    ValidateMountOptions(property.Value, property.Key);
+                    break;
+                default:
+                    ValidateGeneric(property.Value);
+                    break;
+            }
+        }
+    }
+
+    private static void ValidateMountOptions(ComposeNode node)
+    {
+        ValidateMountOptions(node, "mount");
+    }
+
+    private static void ValidateMountOptions(ComposeNode node, string optionName)
+    {
+        var map = RequireMap(node, "Compose " + optionName + " mount options");
+        var allowedKeys = optionName switch
+        {
+            "bind" => BindMountKeys,
+            "volume" => VolumeMountKeys,
+            "tmpfs" => TmpfsMountKeys,
+            "image" => ImageMountKeys,
+            _ => MountKeys
+        };
+
+        foreach (var property in map.Properties)
+        {
+            if (!allowedKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose mount options contain an unknown key.");
+            }
+
+            ValidateGeneric(property.Value);
+        }
+    }
+
+    private static void ValidateTopLevelResources(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose top-level resources");
+        foreach (var property in map.Properties)
+        {
+            ValidateComposeNode(property.Value, ComposeValidationContext.ResourceDefinition);
+        }
+    }
+
+    private static void ValidateResourceDefinition(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose resource definition");
+        foreach (var property in map.Properties)
+        {
+            if (!ResourceDefinitionKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose resource definition contains an unknown key.");
+            }
+
+            if (property.Key == "file")
+            {
+                ValidatePathNode(property.Value, "resource.file");
+            }
+            else
+            {
+                ValidateGeneric(property.Value);
+            }
+        }
+    }
+
+    private static void ValidateServiceResources(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidateComposeNode(item, ComposeValidationContext.ServiceResourceItem);
+                }
+
+                break;
+            case ComposeMap:
+                ValidateComposeNode(node, ComposeValidationContext.ServiceResourceItem);
+                break;
+            default:
+                throw new PathPolicyException("Compose service resources have an unsupported value.");
+        }
+    }
+
+    private static void ValidateServiceResourceItem(ComposeNode node)
+    {
+        if (node is ComposeScalar)
+        {
+            ValidateGeneric(node);
+            return;
+        }
+
+        var map = RequireMap(node, "Compose service resource");
+        var sourceFound = false;
+        foreach (var property in map.Properties)
+        {
+            if (!ServiceResourceKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose service resource contains an unknown key.");
+            }
+
+            if (property.Key == "source")
+            {
+                ValidateGeneric(property.Value);
+                sourceFound = true;
+            }
+            else
+            {
+                ValidateGeneric(property.Value);
+            }
+        }
+
+        if (!sourceFound)
+        {
+            throw new PathPolicyException("Compose service resource.source is required.");
+        }
+    }
+
+    private static void ValidateAdditionalContexts(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeMap map:
+                foreach (var property in map.Properties)
+                {
+                    ValidatePathNode(property.Value, "additional_contexts." + property.Key);
+                }
+
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    var scalar = RequireScalar(item, "Compose additional_contexts entry");
+                    ValidateAdditionalContextValue(scalar.Value);
+                }
+
+                break;
+            case ComposeScalar:
+                ValidateAdditionalContextValue(RequireScalar(node, "Compose additional_contexts").Value);
+                break;
+            default:
+                throw new PathPolicyException("Compose additional_contexts has an unsupported value.");
+        }
+    }
+
+    private static void ValidateCache(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeScalar:
+                ValidatePathValue(RequireScalar(node, "Compose cache reference").Value);
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidateComposeNode(item, ComposeValidationContext.CacheItem);
+                }
+
+                break;
+            case ComposeMap:
+                ValidateComposeNode(node, ComposeValidationContext.CacheItem);
+                break;
+            default:
+                throw new PathPolicyException("Compose cache reference has an unsupported value.");
+        }
+    }
+
+    private static void ValidateCacheItem(ComposeNode node)
+    {
+        if (node is ComposeScalar)
+        {
+            ValidatePathValue(RequireScalar(node, "Compose cache reference").Value);
+            return;
+        }
+
+        var map = RequireMap(node, "Compose cache reference");
+        foreach (var property in map.Properties)
+        {
+            if (!CacheKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose cache reference contains an unknown key.");
+            }
+
+            if (property.Key is "src" or "dest")
+            {
+                ValidatePathNode(property.Value, "cache." + property.Key);
+            }
+            else
+            {
+                ValidateGeneric(property.Value);
+            }
+        }
+    }
+
+    private static void ValidateSsh(ComposeNode node)
+    {
+        switch (node)
+        {
+            case ComposeScalar:
+                ValidatePathNode(node, "build.ssh");
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    ValidatePathNode(item, "build.ssh");
+                }
+
+                break;
+            case ComposeMap map:
+                foreach (var property in map.Properties)
+                {
+                    ValidatePathNode(property.Value, "build.ssh." + property.Key);
+                }
+
+                break;
+            default:
+                throw new PathPolicyException("Compose build.ssh has an unsupported value.");
+        }
+    }
+
+    private static void ValidateDevelop(ComposeNode node)
+    {
+        var map = RequireMap(node, "Compose develop");
+        foreach (var property in map.Properties)
+        {
+            if (!DevelopKeys.Contains(property.Key))
+            {
+                throw new PathPolicyException("Compose develop contains an unknown key.");
+            }
+
+            ValidateComposeNode(property.Value, ComposeValidationContext.Watch);
+        }
+    }
+
+    private static void ValidateWatch(ComposeNode node)
+    {
+        var sequence = node as ComposeSequence
+            ?? throw new PathPolicyException("Compose develop.watch must be a sequence.");
+        foreach (var item in sequence.Items)
+        {
+            var map = RequireMap(item, "Compose develop.watch entry");
+            var pathFound = false;
+            foreach (var property in map.Properties)
+            {
+                if (!WatchKeys.Contains(property.Key))
+                {
+                    throw new PathPolicyException("Compose develop.watch contains an unknown key.");
+                }
+
+                if (property.Key == "path")
+                {
+                    ValidatePathNode(property.Value, "develop.watch.path");
+                    pathFound = true;
+                }
+                else
+                {
+                    ValidateGeneric(property.Value);
+                }
+            }
+
+            if (!pathFound)
+            {
+                throw new PathPolicyException("Compose develop.watch.path is required.");
+            }
+        }
+    }
+
+    private static void ValidatePathNode(ComposeNode node, string propertyName, bool allowSequence = false)
+    {
+        if (allowSequence && node is ComposeSequence sequence)
+        {
+            foreach (var item in sequence.Items)
+            {
+                ValidatePathNode(item, propertyName);
+            }
+
+            return;
+        }
+
+        var scalar = RequireScalar(node, propertyName);
+        if (scalar.IsBlockScalar || scalar.IsNull || scalar.Value.Length == 0)
+        {
+            throw new PathPolicyException("Compose path expressions must be single scalar values.");
+        }
+
+        ValidatePathValue(scalar.Value);
+    }
+
+    private static void ValidateServiceReference(ComposeNode node)
+    {
+        var scalar = RequireScalar(node, "extends.service");
+        if (scalar.IsBlockScalar
+            || string.IsNullOrWhiteSpace(scalar.Value)
+            || !ServiceName.IsMatch(scalar.Value))
+        {
+            throw new PathPolicyException("Compose extends.service is invalid.");
+        }
+    }
+
+    private static ComposeScalar RequireScalar(ComposeNode node, string propertyName)
+    {
+        return node as ComposeScalar
+            ?? throw new PathPolicyException("Compose " + propertyName + " must be a scalar value.");
+    }
+
+    private static ComposeMap RequireMap(ComposeNode node, string propertyName)
+    {
+        return node as ComposeMap
+            ?? throw new PathPolicyException("Compose " + propertyName + " must be a mapping.");
     }
 
     private static FileStream OpenComposeFile(SafeDirectoryHandle workspace)
@@ -237,7 +1260,8 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
             throw new PathPolicyException("Compose file contains an unresolved path expression.");
         }
 
-        if (value.Contains('$')
+        if (value.Any(char.IsControl)
+            || value.Contains('$')
             || value.Contains('\\')
             || value.Contains('*'))
         {
@@ -360,35 +1384,6 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
             || path.StartsWith("~/", StringComparison.Ordinal)
             || path.StartsWith("~\\", StringComparison.Ordinal)
             || Regex.IsMatch(path, @"(^|[\s:=\[,])(?:[A-Za-z]:[\\/]|/|\.\.(?:[/\\]|$))", RegexOptions.CultureInvariant);
-    }
-
-    private static string RemoveComment(string value)
-    {
-        var quote = '\0';
-        for (var index = 0; index < value.Length; index++)
-        {
-            var character = value[index];
-            if (quote != '\0')
-            {
-                if (character == quote && (index == 0 || value[index - 1] != '\\'))
-                {
-                    quote = '\0';
-                }
-
-                continue;
-            }
-
-            if (character is '\'' or '"')
-            {
-                quote = character;
-            }
-            else if (character == '#')
-            {
-                return value[..index];
-            }
-        }
-
-        return value;
     }
 
     private static bool IsSensitiveEnvironmentFile(string fileName)
