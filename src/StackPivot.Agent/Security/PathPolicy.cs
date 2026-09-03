@@ -37,17 +37,32 @@ public sealed class SafeDirectoryHandle : IDisposable
         }
     }
 
-    internal IReadOnlyList<string> EnumerateEntryNames()
+    internal IReadOnlyList<string> EnumerateEntryNames(int maxEntries = int.MaxValue)
     {
         if (!OperatingSystem.IsLinux())
         {
             throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
         }
 
-        return Directory.EnumerateFileSystemEntries(ProcessWorkingDirectory)
-            .Select(Path.GetFileName)
-            .OfType<string>()
-            .ToArray();
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxEntries, 1);
+
+        var names = new List<string>();
+        foreach (var entry in Directory.EnumerateFileSystemEntries(ProcessWorkingDirectory))
+        {
+            var name = Path.GetFileName(entry);
+            if (name is null)
+            {
+                continue;
+            }
+
+            names.Add(name);
+            if (names.Count > maxEntries)
+            {
+                throw new PathPolicyException("Directory contains too many entries.");
+            }
+        }
+
+        return names;
     }
 
     internal static SafeDirectoryHandle OpenOrCreateAbsoluteDirectory(string absolutePath)
@@ -72,6 +87,17 @@ public sealed class SafeDirectoryHandle : IDisposable
 
         var fileHandle = LinuxPathOperations.OpenFileAt(GetFileDescriptor(), relativePath, mode, access);
         return new FileStream(fileHandle, access, bufferSize: 4096, isAsync: false);
+    }
+
+    internal FileStream OpenRegularFile(string name)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        var fileHandle = LinuxPathOperations.OpenRegularFileAt(GetFileDescriptor(), name);
+        return new FileStream(fileHandle, FileAccess.Read, bufferSize: 4096, isAsync: false);
     }
 
     internal SafeDirectoryHandle? TryOpenChildDirectory(string name)
@@ -504,6 +530,11 @@ internal static class LinuxPathOperations
     private const int OpenNoFollow = 0x20000;
     private const int OpenCloseOnExec = 0x80000;
     private const int OpenAppend = 0x400;
+    private const int OpenNonBlock = 0x800;
+    private const int AtEmptyPath = 0x1000;
+    private const uint StatxBasicStats = 0x000007ff;
+    private const ushort StatxTypeMask = 0xf000;
+    private const ushort StatxTypeRegular = 0x8000;
     private const int LockExclusive = 2;
     private const int LockNonBlocking = 4;
     private const int RemoveDirectory = 0x200;
@@ -647,6 +678,36 @@ internal static class LinuxPathOperations
         finally
         {
             current?.Dispose();
+        }
+    }
+
+    internal static SafeFileHandle OpenRegularFileAt(int parentFileDescriptor, string name)
+    {
+        ValidateSingleSegment(name, allowGitDirectory: false);
+        var fileDescriptor = openat(
+            parentFileDescriptor,
+            name,
+            OpenReadOnly | OpenNoFollow | OpenCloseOnExec | OpenNonBlock,
+            0);
+        if (fileDescriptor < 0)
+        {
+            throw CreateNativeException("Unable to open a managed regular file.", Marshal.GetLastWin32Error());
+        }
+
+        var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+        try
+        {
+            if (!IsRegularFile(fileDescriptor))
+            {
+                throw new PathPolicyException("Managed path must reference a regular file.");
+            }
+
+            return fileHandle;
+        }
+        catch
+        {
+            fileHandle.Dispose();
+            throw;
         }
     }
 
@@ -879,6 +940,34 @@ internal static class LinuxPathOperations
         return checked((int)handle.DangerousGetHandle().ToInt64());
     }
 
+    private static bool IsRegularFile(int fileDescriptor)
+    {
+        if (statx(
+                fileDescriptor,
+                string.Empty,
+                AtEmptyPath,
+                StatxBasicStats,
+                out var metadata) != 0)
+        {
+            throw CreateNativeException("Unable to inspect a managed file.", Marshal.GetLastWin32Error());
+        }
+
+        return (metadata.Mode & StatxTypeMask) == StatxTypeRegular;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1, Size = 256)]
+    private struct LinuxStatx
+    {
+        public uint Mask;
+        public uint BlockSize;
+        public ulong Attributes;
+        public uint LinkCount;
+        public uint UserId;
+        public uint GroupId;
+        public ushort Mode;
+        public ushort Spare0;
+    }
+
     private static PathPolicyException CreateNativeException(string message, int errorNumber)
     {
         return new PathPolicyException($"{message} (errno {errorNumber}).", errorNumber);
@@ -909,6 +998,14 @@ internal static class LinuxPathOperations
 
     [DllImport("libc", EntryPoint = "fchmod", SetLastError = true)]
     private static extern int fchmod(int fileDescriptor, uint mode);
+
+    [DllImport("libc", EntryPoint = "statx", SetLastError = true, CharSet = CharSet.Ansi)]
+    private static extern int statx(
+        int directoryFileDescriptor,
+        [MarshalAs(UnmanagedType.LPStr)] string path,
+        int flags,
+        uint mask,
+        out LinuxStatx metadata);
     #pragma warning restore CA2101
 }
 

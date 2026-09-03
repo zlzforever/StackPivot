@@ -6,6 +6,17 @@ namespace StackPivot.Agent.Execution;
 
 internal sealed class ComposeWorkspaceSnapshot : IDisposable
 {
+    private const int MaxSnapshotFileCount = 4096;
+    private const int MaxSnapshotDirectoryCount = 4096;
+    private const int MaxSnapshotEntryCount = 8192;
+    private const long MaxSnapshotTotalBytes = 64L * 1024 * 1024;
+    private const long MaxSnapshotFileBytes = 16L * 1024 * 1024;
+    private const int MaxSnapshotPathDepth = 32;
+    private const int MaxComposeReferenceDepth = 8;
+    private const int MaxComposeDocuments = 64;
+    private const long MaxComposeDocumentBytes = 1L * 1024 * 1024;
+    private const long MaxComposeInputBytes = 4L * 1024 * 1024;
+
     private static readonly HashSet<string> PathKeys = new(StringComparer.Ordinal)
     {
         "build",
@@ -55,9 +66,15 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         var temporaryDirectory = SafeDirectoryHandle.CreateTemporaryDirectory("compose-");
         try
         {
-            CopyDirectory(source, temporaryDirectory.Directory, isRoot: true, cancellationToken);
-            ValidateComposeReferences(temporaryDirectory.Directory);
-            return new ComposeWorkspaceSnapshot(temporaryDirectory, FindComposeFileName(temporaryDirectory.Directory));
+            CopyDirectory(
+                source,
+                temporaryDirectory.Directory,
+                isRoot: true,
+                depth: 0,
+                new SnapshotBudget(),
+                cancellationToken);
+            var composeFileName = ValidateComposeReferences(temporaryDirectory.Directory);
+            return new ComposeWorkspaceSnapshot(temporaryDirectory, composeFileName);
         }
         catch
         {
@@ -81,11 +98,21 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         SafeDirectoryHandle source,
         SafeDirectoryHandle destination,
         bool isRoot,
+        int depth,
+        SnapshotBudget budget,
         CancellationToken cancellationToken)
     {
-        foreach (var name in source.EnumerateEntryNames())
+        if (depth > MaxSnapshotPathDepth)
+        {
+            throw new PathPolicyException("Compose workspace path depth exceeds the safety limit.");
+        }
+
+        budget.StartDirectory();
+
+        foreach (var name in source.EnumerateEntryNames(MaxSnapshotFileCount + 1))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            budget.StartEntry();
             if (name is "." or "..")
             {
                 throw new PathPolicyException("Directory enumeration returned an unsafe entry.");
@@ -107,36 +134,416 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
                 using (sourceDirectory)
                 using (var destinationDirectory = destination.OpenChildDirectory(name, create: true))
                 {
-                    CopyDirectory(sourceDirectory, destinationDirectory, isRoot: false, cancellationToken);
+                    CopyDirectory(
+                        sourceDirectory,
+                        destinationDirectory,
+                        isRoot: false,
+                        depth + 1,
+                        budget,
+                        cancellationToken);
                 }
 
                 continue;
             }
 
-            using var sourceFile = source.OpenFile(name, FileMode.Open, FileAccess.Read);
+            using var sourceFile = source.OpenRegularFile(name);
+            budget.StartFile(sourceFile.Length);
             using var destinationFile = destination.OpenFile(name, FileMode.Create, FileAccess.Write);
-            sourceFile.CopyTo(destinationFile);
+            var buffer = budget.Buffer;
+            long copiedBytes = 0;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = sourceFile.Read(buffer, 0, buffer.Length);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                copiedBytes = checked(copiedBytes + read);
+                if (copiedBytes > MaxSnapshotFileBytes)
+                {
+                    throw new PathPolicyException("Compose workspace contains an oversized file.");
+                }
+
+                budget.ConsumeBytes(read);
+                destinationFile.Write(buffer, 0, read);
+            }
         }
     }
 
-    private static void ValidateComposeReferences(SafeDirectoryHandle workspace)
+    private static string ValidateComposeReferences(SafeDirectoryHandle workspace)
     {
-        string compose;
+        var state = new ComposeReferenceState();
+        var rootFileName = FindComposeFileName(workspace);
+        ValidateComposeDocument(workspace, rootFileName, depth: 0, state);
+        return rootFileName;
+    }
+
+    private static void ValidateComposeDocument(
+        SafeDirectoryHandle workspace,
+        string relativeFileName,
+        int depth,
+        ComposeReferenceState state)
+    {
+        using var file = OpenReferencedComposeFile(workspace, relativeFileName);
+        var length = file.Length;
+        state.Enter(relativeFileName, depth, length);
         try
         {
-            using var file = OpenComposeFile(workspace);
-            using var reader = new StreamReader(
-                file,
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true));
-            compose = reader.ReadToEnd();
+            string compose;
+            try
+            {
+                using var reader = new StreamReader(
+                    file,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true));
+                compose = reader.ReadToEnd();
+            }
+            catch (DecoderFallbackException exception)
+            {
+                throw new PathPolicyException("Compose file is not valid UTF-8.", exception);
+            }
+
+            if (Encoding.UTF8.GetByteCount(compose) > MaxComposeDocumentBytes)
+            {
+                throw new PathPolicyException("Compose document exceeds the input size limit.");
+            }
+
+            var document = new ComposeYamlParser(compose).Parse();
+            ValidateComposeNode(document, ComposeValidationContext.Root);
+            VisitComposeReferences(workspace, relativeFileName, document, depth, state);
         }
-        catch (DecoderFallbackException exception)
+        finally
         {
-            throw new PathPolicyException("Compose file is not valid UTF-8.", exception);
+            state.Exit(relativeFileName);
+        }
+    }
+
+    private static void VisitComposeReferences(
+        SafeDirectoryHandle workspace,
+        string currentFileName,
+        ComposeNode node,
+        int depth,
+        ComposeReferenceState state)
+    {
+        var root = RequireMap(node, "Compose document");
+        foreach (var property in root.Properties)
+        {
+            if (property.Key == "include")
+            {
+                VisitIncludeReferences(workspace, currentFileName, property.Value, depth, state);
+            }
+            else if (property.Key == "services")
+            {
+                VisitServiceReferences(workspace, currentFileName, property.Value, depth, state);
+            }
+        }
+    }
+
+    private static void VisitServiceReferences(
+        SafeDirectoryHandle workspace,
+        string currentFileName,
+        ComposeNode node,
+        int depth,
+        ComposeReferenceState state)
+    {
+        var services = RequireMap(node, "Compose services");
+        foreach (var service in services.Properties)
+        {
+            var serviceMap = RequireMap(service.Value, "Compose service");
+            foreach (var property in serviceMap.Properties)
+            {
+                if (property.Key == "extends")
+                {
+                    VisitExtendsReference(workspace, currentFileName, property.Value, depth, state);
+                }
+                else if (property.Key == "include")
+                {
+                    VisitIncludeReferences(workspace, currentFileName, property.Value, depth, state);
+                }
+            }
+        }
+    }
+
+    private static void VisitExtendsReference(
+        SafeDirectoryHandle workspace,
+        string currentFileName,
+        ComposeNode node,
+        int depth,
+        ComposeReferenceState state)
+    {
+        var map = RequireMap(node, "Compose extends");
+        foreach (var property in map.Properties)
+        {
+            if (property.Key == "file")
+            {
+                var path = RequireReferenceScalar(property.Value, "extends.file");
+                var referencedFileName = ResolveReferencePath(currentFileName, path.Value, "extends.file");
+                ValidateComposeDocument(workspace, referencedFileName, depth + 1, state);
+            }
+        }
+    }
+
+    private static void VisitIncludeReferences(
+        SafeDirectoryHandle workspace,
+        string currentFileName,
+        ComposeNode node,
+        int depth,
+        ComposeReferenceState state)
+    {
+        switch (node)
+        {
+            case ComposeScalar scalar:
+                VisitIncludedFile(workspace, currentFileName, scalar, depth, state);
+                break;
+            case ComposeSequence sequence:
+                foreach (var item in sequence.Items)
+                {
+                    VisitIncludeItem(workspace, currentFileName, item, depth, state);
+                }
+
+                break;
+            case ComposeMap map:
+                VisitIncludeItem(workspace, currentFileName, map, depth, state);
+                break;
+            default:
+                throw new PathPolicyException("Compose include has an unsupported value.");
+        }
+    }
+
+    private static void VisitIncludeItem(
+        SafeDirectoryHandle workspace,
+        string currentFileName,
+        ComposeNode node,
+        int depth,
+        ComposeReferenceState state)
+    {
+        if (node is ComposeScalar scalar)
+        {
+            VisitIncludedFile(workspace, currentFileName, scalar, depth, state);
+            return;
         }
 
-        var document = new ComposeYamlParser(compose).Parse();
-        ValidateComposeNode(document, ComposeValidationContext.Root);
+        var map = RequireMap(node, "Compose include entry");
+        foreach (var property in map.Properties)
+        {
+            if (property.Key != "path")
+            {
+                continue;
+            }
+
+            switch (property.Value)
+            {
+                case ComposeScalar scalarValue:
+                    VisitIncludedFile(workspace, currentFileName, scalarValue, depth, state);
+                    break;
+                case ComposeSequence sequence:
+                    foreach (var item in sequence.Items)
+                    {
+                        VisitIncludedFile(
+                            workspace,
+                            currentFileName,
+                            RequireReferenceScalar(item, "include.path"),
+                            depth,
+                            state);
+                    }
+
+                    break;
+                default:
+                    throw new PathPolicyException("Compose include.path must be a scalar or sequence.");
+            }
+        }
+    }
+
+    private static void VisitIncludedFile(
+        SafeDirectoryHandle workspace,
+        string currentFileName,
+        ComposeScalar scalar,
+        int depth,
+        ComposeReferenceState state)
+    {
+        var referencedFileName = ResolveReferencePath(currentFileName, scalar.Value, "include.path");
+        ValidateComposeDocument(workspace, referencedFileName, depth + 1, state);
+    }
+
+    private static ComposeScalar RequireReferenceScalar(ComposeNode node, string propertyName)
+    {
+        var scalar = RequireScalar(node, propertyName);
+        if (scalar.IsBlockScalar || scalar.IsNull || scalar.Value.Length == 0)
+        {
+            throw new PathPolicyException("Compose reference paths must be non-empty scalar values.");
+        }
+
+        return scalar;
+    }
+
+    private static string ResolveReferencePath(string currentFileName, string value, string propertyName)
+    {
+        ValidateReferencePathValue(value, propertyName);
+        var currentDirectory = Path.GetDirectoryName(currentFileName)?.Replace('\\', '/') ?? string.Empty;
+        var combined = string.IsNullOrEmpty(currentDirectory)
+            ? value
+            : currentDirectory + "/" + value;
+        var segments = combined.Split('/', StringSplitOptions.None);
+        if (segments.Length > MaxSnapshotPathDepth
+            || segments.Any(segment => segment.Length == 0 || segment is ".." or ".git"))
+        {
+            throw new PathPolicyException("Compose reference path exceeds the private workspace boundary.");
+        }
+
+        var normalizedSegments = segments.Where(segment => segment != ".").ToArray();
+        if (normalizedSegments.Length == 0)
+        {
+            throw new PathPolicyException("Compose reference path must name a file.");
+        }
+
+        return string.Join('/', normalizedSegments);
+    }
+
+    private static void ValidateReferencePathValue(string value, string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(value)
+            || value.Any(char.IsControl)
+            || value.Contains('$')
+            || value.Contains('\\')
+            || value.Contains(':')
+            || value.Contains('*')
+            || value.StartsWith('~')
+            || Path.IsPathFullyQualified(value))
+        {
+            throw new PathPolicyException("Compose " + propertyName + " is not a safe relative path.");
+        }
+
+        var segments = value.Split('/', StringSplitOptions.None);
+        if (segments.Length == 0
+            || segments.Any(segment => segment.Length == 0 || segment is ".." or ".git"))
+        {
+            throw new PathPolicyException("Compose " + propertyName + " is not a safe relative path.");
+        }
+    }
+
+    private static FileStream OpenReferencedComposeFile(
+        SafeDirectoryHandle workspace,
+        string relativeFileName)
+    {
+        var segments = relativeFileName.Split('/', StringSplitOptions.None);
+        SafeDirectoryHandle current = workspace;
+        SafeDirectoryHandle? ownedDirectory = null;
+        try
+        {
+            for (var index = 0; index < segments.Length - 1; index++)
+            {
+                var next = current.TryOpenChildDirectory(segments[index])
+                    ?? throw new PathPolicyException("Compose reference file is missing or is not a directory.");
+                ownedDirectory?.Dispose();
+                ownedDirectory = next;
+                current = next;
+            }
+
+            return current.OpenRegularFile(segments[^1]);
+        }
+        finally
+        {
+            ownedDirectory?.Dispose();
+        }
+    }
+
+    private sealed class SnapshotBudget
+    {
+        public byte[] Buffer { get; } = new byte[64 * 1024];
+
+        private int fileCount;
+        private int directoryCount;
+        private int entryCount;
+        private long totalBytes;
+
+        public void StartDirectory()
+        {
+            directoryCount++;
+            if (directoryCount > MaxSnapshotDirectoryCount)
+            {
+                throw new PathPolicyException("Compose workspace contains too many directories.");
+            }
+        }
+
+        public void StartEntry()
+        {
+            entryCount++;
+            if (entryCount > MaxSnapshotEntryCount)
+            {
+                throw new PathPolicyException("Compose workspace contains too many entries.");
+            }
+        }
+
+        public void StartFile(long expectedLength)
+        {
+            if (expectedLength < 0 || expectedLength > MaxSnapshotFileBytes)
+            {
+                throw new PathPolicyException("Compose workspace contains an oversized file.");
+            }
+
+            fileCount++;
+            if (fileCount > MaxSnapshotFileCount)
+            {
+                throw new PathPolicyException("Compose workspace contains too many files.");
+            }
+        }
+
+        public void ConsumeBytes(int count)
+        {
+            totalBytes = checked(totalBytes + count);
+            if (totalBytes > MaxSnapshotTotalBytes)
+            {
+                throw new PathPolicyException("Compose workspace exceeds the total input size limit.");
+            }
+        }
+    }
+
+    private sealed class ComposeReferenceState
+    {
+        private readonly HashSet<string> active = new(StringComparer.Ordinal);
+        private readonly HashSet<string> visited = new(StringComparer.Ordinal);
+        private long inputBytes;
+        private int documentCount;
+
+        public void Enter(string fileName, int depth, long length)
+        {
+            if (depth > MaxComposeReferenceDepth)
+            {
+                throw new PathPolicyException("Compose reference depth exceeds the safety limit.");
+            }
+
+            if (!active.Add(fileName))
+            {
+                throw new PathPolicyException("Compose references contain a cycle.");
+            }
+
+            if (!visited.Add(fileName))
+            {
+                active.Remove(fileName);
+                throw new PathPolicyException("Compose references contain a duplicate file.");
+            }
+
+            documentCount++;
+            if (documentCount > MaxComposeDocuments)
+            {
+                active.Remove(fileName);
+                throw new PathPolicyException("Compose references contain too many documents.");
+            }
+
+            if (length < 0 || length > MaxComposeDocumentBytes || inputBytes > MaxComposeInputBytes - length)
+            {
+                active.Remove(fileName);
+                throw new PathPolicyException("Compose references exceed the input size limit.");
+            }
+
+            inputBytes += length;
+        }
+
+        public void Exit(string fileName)
+        {
+            active.Remove(fileName);
+        }
     }
 
     private static readonly HashSet<string> RootKeys = new(StringComparer.Ordinal)
@@ -244,7 +651,6 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         "post_start",
         "pre_stop",
         "provider",
-        "use_api_socket",
         "interface_name"
     };
 
@@ -393,6 +799,7 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
 
     private static readonly HashSet<string> WatchKeys = new(StringComparer.Ordinal)
     {
+        "include",
         "path",
         "target",
         "action",
@@ -559,6 +966,11 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         var map = RequireMap(node, "Compose service");
         foreach (var property in map.Properties)
         {
+            if (property.Key == "use_api_socket")
+            {
+                throw new PathPolicyException("Compose service use_api_socket is not allowed.");
+            }
+
             if (!ServiceKeys.Contains(property.Key)
                 && !property.Key.StartsWith("x-", StringComparison.Ordinal))
             {
@@ -624,6 +1036,11 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
 
     private static void ValidateGenericProperty(ComposeProperty property)
     {
+        if (property.Key == "use_api_socket")
+        {
+            throw new PathPolicyException("Compose service use_api_socket is not allowed.");
+        }
+
         if (property.Key == "<<")
         {
             throw new PathPolicyException("Compose merge keys are not supported safely.");
@@ -1169,6 +1586,10 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
                     ValidatePathNode(property.Value, "develop.watch.path");
                     pathFound = true;
                 }
+                else if (property.Key is "ignore" or "include")
+                {
+                    ValidateWatchPatternNode(property.Value, "develop.watch." + property.Key);
+                }
                 else
                 {
                     ValidateGeneric(property.Value);
@@ -1179,6 +1600,42 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
             {
                 throw new PathPolicyException("Compose develop.watch.path is required.");
             }
+        }
+    }
+
+    private static void ValidateWatchPatternNode(ComposeNode node, string propertyName)
+    {
+        if (node is ComposeSequence sequence)
+        {
+            foreach (var item in sequence.Items)
+            {
+                ValidateWatchPatternNode(item, propertyName);
+            }
+
+            return;
+        }
+
+        var scalar = RequireScalar(node, propertyName);
+        if (scalar.IsBlockScalar || scalar.IsNull || scalar.Value.Length == 0)
+        {
+            throw new PathPolicyException("Compose watch patterns must be non-empty scalar values.");
+        }
+
+        var pattern = scalar.Value;
+        if (pattern.Any(char.IsControl)
+            || pattern.Contains('$')
+            || pattern.Contains('\\')
+            || pattern.Contains(':')
+            || pattern.StartsWith('~')
+            || Path.IsPathFullyQualified(pattern))
+        {
+            throw new PathPolicyException("Compose watch pattern is not a safe relative glob.");
+        }
+
+        var segments = pattern.Split('/', StringSplitOptions.None);
+        if (segments.Any(segment => segment.Length == 0 || segment is "." or ".."))
+        {
+            throw new PathPolicyException("Compose watch pattern is not a safe relative glob.");
         }
     }
 
@@ -1226,28 +1683,16 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
             ?? throw new PathPolicyException("Compose " + propertyName + " must be a mapping.");
     }
 
-    private static FileStream OpenComposeFile(SafeDirectoryHandle workspace)
-    {
-        try
-        {
-            return workspace.OpenFile("compose.yaml", FileMode.Open, FileAccess.Read);
-        }
-        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
-        {
-            return workspace.OpenFile("compose.yml", FileMode.Open, FileAccess.Read);
-        }
-    }
-
     private static string FindComposeFileName(SafeDirectoryHandle workspace)
     {
         try
         {
-            using var compose = workspace.OpenFile("compose.yaml", FileMode.Open, FileAccess.Read);
+            using var compose = workspace.OpenRegularFile("compose.yaml");
             return "compose.yaml";
         }
         catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
         {
-            using var compose = workspace.OpenFile("compose.yml", FileMode.Open, FileAccess.Read);
+            using var compose = workspace.OpenRegularFile("compose.yml");
             return "compose.yml";
         }
     }

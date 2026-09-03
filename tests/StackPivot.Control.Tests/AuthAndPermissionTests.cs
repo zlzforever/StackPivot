@@ -328,6 +328,7 @@ public sealed class AuthAndPermissionTests
             var identity = await authenticationTask;
             Assert.NotNull(identity);
             Assert.Equal(agentId, identity!.AgentId);
+            Assert.Equal(issued.Version, identity.ApiKeyVersion);
         }
         finally
         {

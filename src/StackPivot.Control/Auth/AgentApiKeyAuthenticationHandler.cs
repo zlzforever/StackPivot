@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text.Encodings.Web;
@@ -340,14 +341,15 @@ public sealed class AgentApiKeyAuthenticationHandler(
             new[]
             {
                 new Claim(ClaimTypes.NameIdentifier, identity.AgentId.ToString()),
-                new Claim("agent_id", identity.AgentId.ToString())
+                new Claim("agent_id", identity.AgentId.ToString()),
+                new Claim("agent_key_version", identity.ApiKeyVersion.ToString(CultureInfo.InvariantCulture))
             },
             AgentApiKeyDefaults.AuthenticationScheme));
         return AuthenticateResult.Success(new AuthenticationTicket(principal, Scheme.Name));
     }
 }
 
-public sealed record AgentApiKeyIdentity(Guid AgentId);
+public sealed record AgentApiKeyIdentity(Guid AgentId, int ApiKeyVersion = 0);
 
 public sealed class AgentApiKeyAuthenticationService(
     StackPivotDbContext dbContext,
@@ -379,7 +381,7 @@ public sealed class AgentApiKeyAuthenticationService(
                     .ExecuteUpdateAsync(
                         setters => setters.SetProperty(value => value.LastSeenAt, lastSeenAt),
                         cancellationToken);
-                return new AgentApiKeyIdentity(agent.AgentId);
+                return new AgentApiKeyIdentity(agent.AgentId, agent.ApiKeyVersion);
             }
         }
 

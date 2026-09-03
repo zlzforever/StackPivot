@@ -1,5 +1,6 @@
 using StackPivot.Agent.Execution;
 using StackPivot.Agent.Security;
+using System.Net.Sockets;
 using Xunit;
 
 namespace StackPivot.Agent.Tests;
@@ -194,6 +195,7 @@ public sealed class ComposeExecutorTests
     [InlineData("volumes:\n  - ../outside:/var/lib/app")]
     [InlineData("volumes: { type: bind, source: ../outside }")]
     [InlineData("include:\n  - project_directory: ../outside")]
+    [InlineData("use_api_socket: true")]
     public async Task ComposeUpRejectsReferencesOutsideThePrivateSnapshot(string serviceConfiguration)
     {
         TestPlatform.RequireLinux();
@@ -316,7 +318,7 @@ public sealed class ComposeExecutorTests
         TestPlatform.RequireLinux();
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-safe-" + Guid.NewGuid().ToString("N"));
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
-        const string compose = "services:\n  app:\n    image: alpine\n    extends:\n      file: base.yaml\n      service: base\n";
+        const string compose = "services:\n  app:\n    image: alpine\n    extends:\n      file: ./base.yaml\n      service: base\n";
         const string baseCompose = "services:\n  base:\n    image: alpine\n";
         Directory.CreateDirectory(stackPath);
         File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), compose);
@@ -388,6 +390,372 @@ public sealed class ComposeExecutorTests
             if (Directory.Exists(outside))
             {
                 Directory.Delete(outside, recursive: true);
+            }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("services:\n  base:\n    use_api_socket: true\n")]
+    [InlineData("services:\n  base:\n    build:\n      context: ../outside\n")]
+    [InlineData("services:\n  base:\n    volumes:\n      - ../outside:/var/lib/app\n")]
+    [InlineData("services:\n  base:\n    image: [\n")]
+    [InlineData("services:\n  base:\n    image: alpine\n    image: nginx\n")]
+    [InlineData("services:\n  base: &base\n    image: alpine\n")]
+    public async Task ComposeUpRejectsDangerousFieldsInReferencedExtendsDocument(string referencedCompose)
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-extends-danger-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(
+            Path.Combine(stackPath, "compose.yaml"),
+            "services:\n  app:\n    image: alpine\n    extends:\n      file: base.yaml\n      service: base\n");
+        File.WriteAllText(Path.Combine(stackPath, "base.yaml"), referencedCompose);
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("services:\n  included:\n    use_api_socket: true\n")]
+    [InlineData("services:\n  included:\n    volumes:\n      - ../outside:/var/lib/app\n")]
+    public async Task ComposeUpRejectsDangerousFieldsInIncludedDocument(string includedCompose)
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-include-danger-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "include: child.yaml\n");
+        File.WriteAllText(Path.Combine(stackPath, "child.yaml"), includedCompose);
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsMissingReferencedComposeFileBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-reference-missing-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "include: missing.yaml\n");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsCyclicComposeIncludesBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-reference-cycle-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "include: child.yaml\n");
+        File.WriteAllText(Path.Combine(stackPath, "child.yaml"), "include: compose.yaml\n");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsAnOversizedReferencedComposeDocumentBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-reference-size-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "include: child.yaml\n");
+        File.WriteAllText(Path.Combine(stackPath, "child.yaml"), "x-padding: " + new string('x', 2 * 1024 * 1024) + "\n");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsWorkspacePathDepthBeyondTheSnapshotLimit()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-depth-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var nestedPath = stackPath;
+        for (var index = 0; index < 40; index++)
+        {
+            nestedPath = Path.Combine(nestedPath, "nested_" + index);
+        }
+
+        Directory.CreateDirectory(nestedPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "services:\n  app:\n    image: alpine\n");
+        File.WriteAllText(Path.Combine(nestedPath, "data.txt"), "data");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsAWorkspaceWithTooManyFilesBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-file-count-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "services:\n  app:\n    image: alpine\n");
+        for (var index = 0; index < 4097; index++)
+        {
+            File.WriteAllText(Path.Combine(stackPath, $"data_{index:D4}.txt"), "data");
+        }
+
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsAWorkspaceWithTooManyDirectoriesBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-directory-count-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "services:\n  app:\n    image: alpine\n");
+        for (var index = 0; index < 4096; index++)
+        {
+            Directory.CreateDirectory(Path.Combine(stackPath, $"directory_{index:D4}"));
+        }
+
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpPreservesAWatchIncludePatternInThePrivateSnapshot()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-watch-include-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(Path.Combine(stackPath, "src"));
+        const string compose = "services:\n  app:\n    image: alpine\n    develop:\n      watch:\n        - path: src\n          include: \"*.cs\"\n          action: rebuild\n";
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), compose);
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.True(result.Success);
+            Assert.Equal(compose, runner.ComposeContentsDuringUp);
+            Assert.Equal(ExpectedUpArguments, runner.Requests.Single().Arguments);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ComposeUpRejectsAUnixSocketInTheWorkspaceBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-socket-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "services:\n  app:\n    image: alpine\n");
+        var socketPath = Path.Combine(stackPath, "agent.sock");
+        using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        socket.Bind(new UnixDomainSocketEndPoint(socketPath));
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            socket.Dispose();
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
             }
         }
     }

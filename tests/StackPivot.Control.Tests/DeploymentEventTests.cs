@@ -244,7 +244,7 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
-    public async Task DispatchSendExceptionFailsTheTaskInsteadOfLeavingItPending()
+    public async Task DispatchSendExceptionRecordsAnUnknownDispatchResult()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -271,8 +271,154 @@ public sealed class DeploymentEventTests
 
         var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
         Assert.Equal("failed", history.TaskStatus);
-        Assert.Equal("agent_offline", history.ErrorCode);
+        Assert.Equal("agent_dispatch_unknown", history.ErrorCode);
         Assert.Contains(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskFailed);
+    }
+
+    [Fact]
+    public async Task SuccessfulSendKeepsTheDispatchMarkerWhenAuditPersistenceFails()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var persistenceFailure = new PersistenceFailureInterceptor();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(persistenceFailure)
+            .Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        await db.GlobalGitSettings.AddAsync(new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = protector.Protect("git-token", "git-key-v1"),
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        persistenceFailure.Enabled = true;
+        persistenceFailure.Target = db;
+        var transport = new RecordingTransport();
+        var dispatcher = new DeploymentDispatcher(db, transport, protector, new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Single(transport.Commands);
+        Assert.Equal("pending", history.TaskStatus);
+        Assert.NotNull(history.DispatchedAt);
+        Assert.Null(history.ErrorCode);
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskFailed);
+    }
+
+    [Fact]
+    public async Task CommittedDispatchMarkerIsNotDowngradedWhenCommitResultIsUnknown()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var commitFailure = new CommitFailureInterceptor();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(commitFailure)
+            .Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        await db.GlobalGitSettings.AddAsync(new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = protector.Protect("git-token", "git-key-v1"),
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+        var transport = new RecordingTransport
+        {
+            OnSend = () => commitFailure.Enabled = true
+        };
+        var dispatcher = new DeploymentDispatcher(db, transport, protector, new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Single(transport.Commands);
+        Assert.Equal("pending", history.TaskStatus);
+        Assert.NotNull(history.DispatchedAt);
+        Assert.Null(history.ErrorCode);
+    }
+
+    [Fact]
+    public async Task AcceptedTaskIsNotDowngradedWhenDispatchMarkerPersistenceFails()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-dispatch-accepted-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        var markerFailure = new DispatchMarkerFailureInterceptor();
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            var dispatchOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(markerFailure)
+                .Options;
+            await using (var seedDb = new StackPivotDbContext(baseOptions))
+            {
+                await seedDb.Database.EnsureCreatedAsync();
+                var fixture = await SeedAsync(seedDb);
+                var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+                seedDb.GlobalGitSettings.Add(new GlobalGitSetting
+                {
+                    Id = 1,
+                    GitRepo = "https://git.example/repository.git",
+                    GitUserName = "git-user",
+                    AccessTokenEncrypted = protector.Protect("git-token", "git-key-v1"),
+                    TokenKeyId = "git-key-v1"
+                });
+                await seedDb.SaveChangesAsync();
+
+                await using var dispatchDb = new StackPivotDbContext(dispatchOptions);
+                markerFailure.Target = dispatchDb;
+                var transport = new RecordingTransport
+                {
+                    OnSend = () =>
+                    {
+                        using var acceptanceDb = new StackPivotDbContext(baseOptions);
+                        var history = acceptanceDb.ServiceOperationHistories.Single();
+                        var acceptedAt = DateTimeOffset.UtcNow;
+                        history.AcceptedAt = acceptedAt;
+                        history.StartTime = acceptedAt;
+                        acceptanceDb.SaveChanges();
+                        markerFailure.Enabled = true;
+                    }
+                };
+                var dispatcher = new DeploymentDispatcher(
+                    dispatchDb,
+                    transport,
+                    protector,
+                    new AuditWriter(dispatchDb));
+
+                await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+                await using var verifyDb = new StackPivotDbContext(baseOptions);
+                var persisted = await verifyDb.ServiceOperationHistories.AsNoTracking().SingleAsync();
+                Assert.Equal("pending", persisted.TaskStatus);
+                Assert.NotNull(persisted.AcceptedAt);
+                Assert.NotNull(persisted.StartTime);
+                Assert.Null(persisted.ErrorCode);
+            }
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
     }
 
     [Fact]
@@ -389,7 +535,7 @@ public sealed class DeploymentEventTests
 
         var failed = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
         Assert.Equal("failed", failed.TaskStatus);
-        Assert.Equal("agent_offline", failed.ErrorCode);
+        Assert.Equal("agent_dispatch_unknown", failed.ErrorCode);
 
         var service = new DeploymentService(
             db,
@@ -848,9 +994,11 @@ public sealed class DeploymentEventTests
     private sealed class RecordingTransport : IAgentTransport
     {
         public List<DeployStackCommand> Commands { get; } = new();
+        public Action? OnSend { get; init; }
         public Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken) => Task.FromResult(true);
         public Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken)
         {
+            OnSend?.Invoke();
             Commands.Add(command);
             return Task.CompletedTask;
         }
@@ -935,6 +1083,68 @@ public sealed class DeploymentEventTests
             }
 
             return result;
+        }
+    }
+
+    private sealed class PersistenceFailureInterceptor : SaveChangesInterceptor
+    {
+        public StackPivotDbContext? Target { get; set; }
+        public bool Enabled { get; set; }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Enabled && ReferenceEquals(eventData.Context, Target))
+            {
+                throw new InvalidOperationException("simulated audit persistence failure");
+            }
+
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    private sealed class CommitFailureInterceptor : DbTransactionInterceptor
+    {
+        public bool Enabled { get; set; }
+        private int failed;
+
+        public override Task TransactionCommittedAsync(
+            DbTransaction transaction,
+            TransactionEndEventData eventData,
+            CancellationToken cancellationToken = default)
+        {
+            if (Enabled && Interlocked.Exchange(ref failed, 1) == 0)
+            {
+                throw new InvalidOperationException("simulated unknown commit result");
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class DispatchMarkerFailureInterceptor : DbCommandInterceptor
+    {
+        public StackPivotDbContext? Target { get; set; }
+        public bool Enabled { get; set; }
+        private int failed;
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Enabled
+                && ReferenceEquals(eventData.Context, Target)
+                && command.CommandText.Contains("dispatched_at", StringComparison.OrdinalIgnoreCase)
+                && Interlocked.Exchange(ref failed, 1) == 0)
+            {
+                throw new InvalidOperationException("simulated dispatch marker persistence failure");
+            }
+
+            return ValueTask.FromResult(result);
         }
     }
 }

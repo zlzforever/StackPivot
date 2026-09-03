@@ -25,7 +25,7 @@ var pepperText = builder.Configuration["AgentApiKey:Pepper"]
     ?? Environment.GetEnvironmentVariable("STACKPIVOT_AGENT_API_PEPPER");
 var pepper = RequiredSecretConfiguration.ReadBase64(pepperText, "AgentApiKey:Pepper", 32);
 
-builder.Services.AddDbContext<StackPivotDbContext>(options => options.UseSqlite(connectionString));
+builder.Services.AddDbContextFactory<StackPivotDbContext>(options => options.UseSqlite(connectionString));
 builder.Services.AddSingleton(new AgentApiKeyManager(pepper));
 CryptographicOperations.ZeroMemory(pepper);
 builder.Services.AddScoped<AgentApiKeyService>();

@@ -17,7 +17,8 @@ public sealed class DeploymentDispatcher(
     StackPivotDbContext dbContext,
     IAgentTransport transport,
     IGitCredentialProtector credentialProtector,
-    AuditWriter auditWriter)
+    AuditWriter auditWriter,
+    IDbContextFactory<StackPivotDbContext>? verificationContextFactory = null)
 {
     public static readonly TimeSpan AcceptanceTimeout = TimeSpan.FromMinutes(2);
     public static readonly TimeSpan ExecutionTimeout = TimeSpan.FromHours(1);
@@ -292,6 +293,8 @@ public sealed class DeploymentDispatcher(
 
         byte[]? accessToken = null;
         var command = (DeployStackCommand?)null;
+        var sendCompleted = false;
+        var dispatchMarkerCommitted = false;
         try
         {
             history.TokenKeyId = tokenKeyId;
@@ -310,20 +313,34 @@ public sealed class DeploymentDispatcher(
                 agentStackLocalPath,
                 DateTimeOffset.UtcNow.AddMinutes(5));
             await transport.SendDeployAsync(command, cancellationToken);
+            sendCompleted = true;
             var dispatchedAt = DateTimeOffset.UtcNow;
-            await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
-            var updated = await dbContext.ServiceOperationHistories
-                .Where(value => value.HistoryId == history.HistoryId
-                    && value.TaskStatus == "pending"
-                    && value.DispatchAttemptAt == history.DispatchAttemptAt
-                    && value.DispatchedAt == null)
-                .ExecuteUpdateAsync(
-                    setters => setters
-                        .SetProperty(value => value.DispatchedAt, dispatchedAt)
-                        .SetProperty(value => value.TokenKeyId, tokenKeyId)
-                        .SetProperty(value => value.LastEventAt, dispatchedAt),
-                    cancellationToken);
-            if (updated == 1)
+            await using (var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken))
+            {
+                var updated = await dbContext.ServiceOperationHistories
+                    .Where(value => value.HistoryId == history.HistoryId
+                        && value.TaskStatus == "pending"
+                        && value.DispatchAttemptAt == history.DispatchAttemptAt
+                        && value.DispatchedAt == null)
+                    .ExecuteUpdateAsync(
+                        setters => setters
+                            .SetProperty(value => value.DispatchedAt, dispatchedAt)
+                            .SetProperty(value => value.TokenKeyId, tokenKeyId)
+                            .SetProperty(value => value.LastEventAt, dispatchedAt),
+                        cancellationToken);
+                if (updated == 1)
+                {
+                    await transaction.CommitAsync(cancellationToken);
+                    dispatchMarkerCommitted = true;
+                }
+            }
+
+            if (!dispatchMarkerCommitted)
+            {
+                return;
+            }
+
+            try
             {
                 auditWriter.Add(
                     AuditActions.TaskDispatched,
@@ -334,7 +351,10 @@ public sealed class DeploymentDispatcher(
                     history.TaskId.ToString(),
                     "sent");
                 await dbContext.SaveChangesAsync(cancellationToken);
-                await transaction.CommitAsync(cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                dbContext.ChangeTracker.Clear();
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -343,7 +363,30 @@ public sealed class DeploymentDispatcher(
         }
         catch (Exception)
         {
-            await MarkFailedAsync(history, "agent_offline", cancellationToken);
+            if (dispatchMarkerCommitted)
+            {
+                dbContext.ChangeTracker.Clear();
+                return;
+            }
+
+            if (sendCompleted)
+            {
+                var markerState = await ReadDispatchMarkerStateAsync(
+                    history.HistoryId,
+                    cancellationToken);
+                if (markerState is null
+                    || markerState.DispatchMarkerCommitted
+                    || markerState.ExecutionStarted
+                    || markerState.TaskStatus != "pending")
+                {
+                    return;
+                }
+            }
+
+            await MarkFailedAsync(
+                history,
+                sendCompleted ? "dispatch_persistence_failed" : "agent_dispatch_unknown",
+                cancellationToken);
         }
         finally
         {
@@ -354,6 +397,66 @@ public sealed class DeploymentDispatcher(
             }
         }
     }
+
+    private async Task<DispatchMarkerState?> ReadDispatchMarkerStateAsync(
+        Guid historyId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (verificationContextFactory is not null)
+            {
+                await using var verificationContext = await verificationContextFactory.CreateDbContextAsync(cancellationToken);
+                var state = await verificationContext.ServiceOperationHistories
+                    .AsNoTracking()
+                    .Where(value => value.HistoryId == historyId)
+                    .Select(value => new
+                    {
+                        value.TaskStatus,
+                        DispatchMarkerCommitted = value.DispatchedAt != null,
+                        ExecutionStarted = value.AcceptedAt != null || value.StartTime != null
+                    })
+                    .SingleOrDefaultAsync(cancellationToken);
+                return state is null
+                    ? null
+                    : new DispatchMarkerState(
+                        state.TaskStatus,
+                        state.DispatchMarkerCommitted,
+                        state.ExecutionStarted);
+            }
+
+            dbContext.ChangeTracker.Clear();
+            var localState = await dbContext.ServiceOperationHistories
+                .AsNoTracking()
+                .Where(value => value.HistoryId == historyId)
+                .Select(value => new
+                {
+                    value.TaskStatus,
+                    DispatchMarkerCommitted = value.DispatchedAt != null,
+                    ExecutionStarted = value.AcceptedAt != null || value.StartTime != null
+                })
+                .SingleOrDefaultAsync(cancellationToken);
+            return localState is null
+                ? null
+                : new DispatchMarkerState(
+                    localState.TaskStatus,
+                    localState.DispatchMarkerCommitted,
+                    localState.ExecutionStarted);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private sealed record DispatchMarkerState(
+        string TaskStatus,
+        bool DispatchMarkerCommitted,
+        bool ExecutionStarted);
 
     private async Task MarkFailedAsync(
         ServiceOperationHistory history,

@@ -53,6 +53,129 @@ public sealed class AgentConnectionRegistryTests
         Assert.True(oldAborted.Task.IsCompleted);
     }
 
+    [Fact]
+    public async Task RegistrationUsingAnOldVersionCannotReturnAfterDisconnect()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        var registrationVersion = registry.GetRegistrationVersion(agentId);
+
+        await registry.DisconnectAsync(agentId);
+
+        var registered = await registry.RegisterAsync(
+            new AgentConnection(agentId, "old-connection", new NoOpClientProxy()),
+            registrationVersion);
+
+        Assert.False(registered);
+        Assert.Null(await registry.FindAsync(agentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RegistrationUsingAnOldVersionCannotReturnAfterConnectionRemoval()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        await registry.RegisterAsync(new AgentConnection(agentId, "connection-1", new NoOpClientProxy()));
+        var registrationVersion = registry.GetRegistrationVersion(agentId);
+
+        Assert.True(await registry.RemoveAsync("connection-1"));
+
+        var registered = await registry.RegisterAsync(
+            new AgentConnection(agentId, "stale-connection", new NoOpClientProxy()),
+            registrationVersion);
+
+        Assert.False(registered);
+        Assert.Null(await registry.FindAsync(agentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ConcurrentReplacementInvalidationLeavesNoStaleConnection()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        var oldAbort = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.RegisterAsync(new AgentConnection(
+            agentId,
+            "connection-1",
+            new NoOpClientProxy(),
+            () => oldAbort.Task));
+
+        var registration = registry.RegisterAsync(
+            new AgentConnection(agentId, "connection-2", new NoOpClientProxy()),
+            registry.GetRegistrationVersion(agentId));
+        await registry.DisconnectAsync(agentId);
+        oldAbort.TrySetResult(true);
+        Assert.True(await registration);
+
+        Assert.Null(await registry.FindAsync(agentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task StaleRegistrationCannotOverwriteAReplacement()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        var replacementAbortStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseReplacementAbort = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.RegisterAsync(new AgentConnection(
+            agentId,
+            "connection-1",
+            new NoOpClientProxy(),
+            async () =>
+            {
+                replacementAbortStarted.TrySetResult(true);
+                await releaseReplacementAbort.Task;
+            }));
+
+        var replacement = registry.RegisterAsync(
+            new AgentConnection(agentId, "connection-2", new NoOpClientProxy()),
+            registry.GetRegistrationVersion(agentId));
+        await replacementAbortStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var staleRegistered = await registry.RegisterAsync(
+            new AgentConnection(agentId, "stale-connection", new NoOpClientProxy()),
+            registrationVersion: 0);
+
+        Assert.False(staleRegistered);
+        Assert.Equal("connection-2", (await registry.FindAsync(agentId, CancellationToken.None))!.ConnectionId);
+        releaseReplacementAbort.TrySetResult(true);
+        Assert.True(await replacement);
+    }
+
+    [Fact]
+    public async Task RegistrationCapturedBeforeFirstConnectionCannotOverwriteIt()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        var staleVersion = registry.GetRegistrationVersion(agentId);
+
+        Assert.True(await registry.RegisterAsync(
+            new AgentConnection(agentId, "connection-2", new NoOpClientProxy()),
+            staleVersion));
+
+        var staleRegistered = await registry.RegisterAsync(
+            new AgentConnection(agentId, "stale-connection", new NoOpClientProxy()),
+            staleVersion);
+
+        Assert.False(staleRegistered);
+        Assert.Equal("connection-2", (await registry.FindAsync(agentId, CancellationToken.None))!.ConnectionId);
+    }
+
+    [Fact]
+    public async Task RegistrationIsBoundToItsApiKeyVersion()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        await registry.RegisterAsync(new AgentConnection(
+            agentId,
+            "connection-1",
+            new NoOpClientProxy(),
+            ApiKeyVersion: 3));
+
+        Assert.True(registry.IsRegistered(agentId, "connection-1", 3));
+        Assert.False(registry.IsRegistered(agentId, "connection-1", 4));
+    }
+
     private sealed class NoOpClientProxy : IClientProxy
     {
         public Task SendCoreAsync(string method, object?[] args, CancellationToken cancellationToken = default) => Task.CompletedTask;

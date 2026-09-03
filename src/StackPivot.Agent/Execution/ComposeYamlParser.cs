@@ -59,8 +59,10 @@ internal sealed class ComposeProperty
 
 internal sealed class ComposeYamlParser
 {
+    private const int MaxNestingDepth = 128;
     private readonly List<YamlLine> lines;
     private int lineIndex;
+    private int blockDepth;
 
     public ComposeYamlParser(string input)
     {
@@ -93,22 +95,36 @@ internal sealed class ComposeYamlParser
 
     private ComposeNode ParseBlock(int indent)
     {
-        var next = NextSignificantIndex(lineIndex);
-        if (next < 0)
+        blockDepth++;
+        if (blockDepth > MaxNestingDepth)
         {
-            throw InvalidYaml("Compose document contains an incomplete value.");
+            blockDepth--;
+            throw InvalidYaml("Compose document nesting exceeds the safety limit.");
         }
 
-        lineIndex = next;
-        var line = lines[lineIndex];
-        if (line.Indent != indent)
+        try
         {
-            throw InvalidYaml("Compose document has inconsistent indentation.");
-        }
+            var next = NextSignificantIndex(lineIndex);
+            if (next < 0)
+            {
+                throw InvalidYaml("Compose document contains an incomplete value.");
+            }
 
-        return IsSequenceItem(line.Content)
-            ? ParseSequence(indent)
-            : ParseMap(indent);
+            lineIndex = next;
+            var line = lines[lineIndex];
+            if (line.Indent != indent)
+            {
+                throw InvalidYaml("Compose document has inconsistent indentation.");
+            }
+
+            return IsSequenceItem(line.Content)
+                ? ParseSequence(indent)
+                : ParseMap(indent);
+        }
+        finally
+        {
+            blockDepth--;
+        }
     }
 
     private ComposeMap ParseMap(int indent)
@@ -756,6 +772,7 @@ internal sealed class ComposeYamlParser
     {
         private readonly string text;
         private int position;
+        private int nodeDepth;
 
         public FlowParser(string text)
         {
@@ -777,19 +794,33 @@ internal sealed class ComposeYamlParser
 
         private ComposeNode ParseNode()
         {
-            SkipWhitespace();
-            if (position >= text.Length)
+            nodeDepth++;
+            if (nodeDepth > MaxNestingDepth)
             {
-                throw InvalidYaml("Compose flow value is incomplete.");
+                nodeDepth--;
+                throw InvalidYaml("Compose flow nesting exceeds the safety limit.");
             }
 
-            return text[position] switch
+            try
             {
-                '{' => ParseMap(),
-                '[' => ParseSequence(),
-                '\'' or '"' => new ComposeScalar(ParseQuoted(text, ref position)),
-                _ => ParsePlain(),
-            };
+                SkipWhitespace();
+                if (position >= text.Length)
+                {
+                    throw InvalidYaml("Compose flow value is incomplete.");
+                }
+
+                return text[position] switch
+                {
+                    '{' => ParseMap(),
+                    '[' => ParseSequence(),
+                    '\'' or '"' => new ComposeScalar(ParseQuoted(text, ref position)),
+                    _ => ParsePlain(),
+                };
+            }
+            finally
+            {
+                nodeDepth--;
+            }
         }
 
         private ComposeMap ParseMap()

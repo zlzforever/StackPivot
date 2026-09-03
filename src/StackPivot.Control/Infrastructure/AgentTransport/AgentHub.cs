@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
@@ -22,12 +23,34 @@ public sealed class AgentHub(
     {
         ProtocolValidation.EnsureSchemaVersion(hello.SchemaVersion);
         var identity = GetAgentId();
+        var apiKeyVersion = GetApiKeyVersion();
+        var registrationVersion = registry.GetRegistrationVersion(identity);
         var agent = await dbContext.AgentNodes
-            .SingleOrDefaultAsync(value => value.AgentId == identity && value.RevokedAt == null, Context.ConnectionAborted);
+            .SingleOrDefaultAsync(
+                value => value.AgentId == identity
+                    && value.ApiKeyVersion == apiKeyVersion
+                    && value.RevokedAt == null,
+                Context.ConnectionAborted);
         var accepted = agent is not null
             && hello.AgentId == identity
             && string.Equals(hello.Os, "linux", StringComparison.OrdinalIgnoreCase)
             && hello.ComposeMajorVersion == 2;
+        if (accepted)
+        {
+            accepted = await registry.RegisterAsync(
+                new AgentConnection(
+                    identity,
+                    Context.ConnectionId,
+                    Clients.Caller,
+                    () =>
+                    {
+                        Context.Abort();
+                        return Task.CompletedTask;
+                    },
+                    ApiKeyVersion: apiKeyVersion),
+                registrationVersion);
+        }
+
         var ack = new AgentHelloAck(
             ProtocolVersion.Current,
             accepted,
@@ -43,15 +66,6 @@ public sealed class AgentHub(
 
         agent!.LastSeenAt = DateTimeOffset.UtcNow;
         agent.CapabilitiesJson = System.Text.Json.JsonSerializer.Serialize(hello.Capabilities);
-        await registry.RegisterAsync(new AgentConnection(
-            identity,
-            Context.ConnectionId,
-            Clients.Caller,
-            () =>
-            {
-                Context.Abort();
-                return Task.CompletedTask;
-            }));
         auditWriter.Add(
             AuditActions.AgentConnected,
             null,
@@ -65,25 +79,25 @@ public sealed class AgentHub(
 
     public async Task ReportTaskAccepted(TaskAccepted accepted)
     {
-        EnsureAgent(accepted.AgentId);
+        await EnsureAgentAsync(accepted.AgentId);
         await dispatcher.HandleAcceptedAsync(accepted, Context.ConnectionAborted);
     }
 
     public async Task ReportTaskLog(TaskLog log)
     {
-        EnsureAgent(log.AgentId);
+        await EnsureAgentAsync(log.AgentId);
         await dispatcher.HandleLogAsync(log, Context.ConnectionAborted);
     }
 
     public async Task ReportTaskCompleted(TaskCompleted completed)
     {
-        EnsureAgent(completed.AgentId);
+        await EnsureAgentAsync(completed.AgentId);
         await dispatcher.HandleCompletedAsync(completed, Context.ConnectionAborted);
     }
 
     public async Task Heartbeat(HeartbeatMessage heartbeat)
     {
-        EnsureAgent(heartbeat.AgentId);
+        await EnsureAgentAsync(heartbeat.AgentId);
         await dispatcher.HandleHeartbeatAsync(heartbeat, Context.ConnectionAborted);
     }
 
@@ -116,7 +130,7 @@ public sealed class AgentHub(
             : throw new HubException("Agent identity is invalid.");
     }
 
-    private void EnsureAgent(Guid payloadAgentId)
+    private async Task EnsureAgentAsync(Guid payloadAgentId)
     {
         var identity = GetAgentId();
         if (identity != payloadAgentId)
@@ -124,9 +138,30 @@ public sealed class AgentHub(
             throw new HubException("Agent identity does not match payload.");
         }
 
-        if (!registry.IsRegistered(identity, Context.ConnectionId))
+        if (!registry.IsRegistered(identity, Context.ConnectionId, GetApiKeyVersion()))
         {
             throw new HubException("Agent connection is not registered.");
         }
+
+        var apiKeyVersion = GetApiKeyVersion();
+        var current = await dbContext.AgentNodes
+            .AsNoTracking()
+            .AnyAsync(
+                value => value.AgentId == identity
+                    && value.ApiKeyVersion == apiKeyVersion
+                    && value.RevokedAt == null,
+                Context.ConnectionAborted);
+        if (!current || !registry.IsRegistered(identity, Context.ConnectionId, apiKeyVersion))
+        {
+            throw new HubException("Agent credentials are no longer valid.");
+        }
+    }
+
+    private int GetApiKeyVersion()
+    {
+        var value = Context.User?.FindFirstValue("agent_key_version");
+        return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var version) && version > 0
+            ? version
+            : throw new HubException("Agent key version is invalid.");
     }
 }
