@@ -214,7 +214,10 @@ public sealed class DeploymentDispatcher(
 
         var histories = await dbContext.ServiceOperationHistories
             .AsNoTracking()
-            .Where(value => value.AgentId == agentId && value.TaskStatus == "pending")
+            .Where(value => value.AgentId == agentId
+                && value.TaskStatus == "pending"
+                && value.DispatchAttemptAt == null
+                && value.DispatchedAt == null)
             .ToListAsync(cancellationToken);
         if (histories.Count == 0)
         {
@@ -293,7 +296,7 @@ public sealed class DeploymentDispatcher(
 
         byte[]? accessToken = null;
         var command = (DeployStackCommand?)null;
-        var sendCompleted = false;
+        var sendStarted = false;
         var dispatchMarkerCommitted = false;
         try
         {
@@ -312,8 +315,8 @@ public sealed class DeploymentDispatcher(
                 stackGitRelativePath,
                 agentStackLocalPath,
                 DateTimeOffset.UtcNow.AddMinutes(5));
+            sendStarted = true;
             await transport.SendDeployAsync(command, cancellationToken);
-            sendCompleted = true;
             var dispatchedAt = DateTimeOffset.UtcNow;
             await using (var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken))
             {
@@ -361,6 +364,10 @@ public sealed class DeploymentDispatcher(
         {
             throw;
         }
+        catch (AgentOfflineException)
+        {
+            await MarkFailedAsync(history, "agent_offline", cancellationToken);
+        }
         catch (Exception)
         {
             if (dispatchMarkerCommitted)
@@ -369,7 +376,7 @@ public sealed class DeploymentDispatcher(
                 return;
             }
 
-            if (sendCompleted)
+            if (sendStarted)
             {
                 var markerState = await ReadDispatchMarkerStateAsync(
                     history.HistoryId,
@@ -381,12 +388,12 @@ public sealed class DeploymentDispatcher(
                 {
                     return;
                 }
+
+                dbContext.ChangeTracker.Clear();
+                return;
             }
 
-            await MarkFailedAsync(
-                history,
-                sendCompleted ? "dispatch_persistence_failed" : "agent_dispatch_unknown",
-                cancellationToken);
+            await MarkFailedAsync(history, "agent_dispatch_unknown", cancellationToken);
         }
         finally
         {

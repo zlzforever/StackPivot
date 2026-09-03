@@ -32,6 +32,8 @@ public interface IAgentTransport
     Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken);
 }
 
+public sealed class AgentOfflineException(string message = "Agent is offline.") : InvalidOperationException(message);
+
 public sealed class DeploymentRequestException(string code, int statusCode, string message) : Exception(message)
 {
     public string Code { get; } = code;

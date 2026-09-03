@@ -1,3 +1,6 @@
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using StackPivot.Agent.Connection;
 using StackPivot.Agent.Execution;
 using StackPivot.Contracts.Agents;
@@ -99,6 +102,40 @@ public sealed class AgentTaskCoordinatorLockTests
         {
             firstExecutor.Release.TrySetResult(true);
             await first;
+            DeleteDirectory(root);
+        }
+    }
+
+    [SkippableFact]
+    public async Task PreexistingFifoLockIsRejectedBeforeTaskExecution()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-lock-fifo-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var lockDirectory = Path.Combine(root, "locks");
+        Directory.CreateDirectory(lockDirectory);
+        var lockName = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(stackPath)))) + ".lock";
+        var lockPath = Path.Combine(lockDirectory, lockName);
+        var executor = new ImmediateExecutor();
+        var coordinator = new AgentTaskCoordinator(AgentId, executor, lockDirectory);
+        var reporter = new RecordingReporter();
+
+        try
+        {
+            Assert.Equal(0, mkfifo(lockPath, 0x180u));
+
+            await coordinator.HandleAsync(CreateCommand(stackPath), reporter, CancellationToken.None);
+
+            var accepted = Assert.Single(reporter.Accepted);
+            var completed = Assert.Single(reporter.Completed);
+            Assert.Equal(accepted.TaskId, completed.TaskId);
+            Assert.False(completed.Success);
+            Assert.Equal("stack_lock_unavailable", completed.ErrorCode);
+            Assert.Equal(0, executor.ExecutionCount);
+        }
+        finally
+        {
             DeleteDirectory(root);
         }
     }
@@ -290,4 +327,9 @@ public sealed class AgentTaskCoordinatorLockTests
         public Task ReportCompletedAsync(TaskCompleted completed, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("completion report must not be attempted");
     }
+
+#pragma warning disable CA2101
+    [DllImport("libc", EntryPoint = "mkfifo", SetLastError = true, CharSet = CharSet.Ansi)]
+    private static extern int mkfifo([MarshalAs(UnmanagedType.LPStr)] string path, uint mode);
+#pragma warning restore CA2101
 }

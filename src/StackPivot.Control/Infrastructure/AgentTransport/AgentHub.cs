@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using StackPivot.Control.Application.Audit;
 using StackPivot.Control.Application.Deployments;
 using StackPivot.Control.Auth;
+using StackPivot.Control.Domain.Entities;
 using StackPivot.Control.Infrastructure.Persistence;
 using StackPivot.Contracts.Agents;
 using StackPivot.Contracts.SignalR;
@@ -24,31 +25,54 @@ public sealed class AgentHub(
         ProtocolValidation.EnsureSchemaVersion(hello.SchemaVersion);
         var identity = GetAgentId();
         var apiKeyVersion = GetApiKeyVersion();
-        var registrationVersion = registry.GetRegistrationVersion(identity);
-        var agent = await dbContext.AgentNodes
-            .SingleOrDefaultAsync(
-                value => value.AgentId == identity
-                    && value.ApiKeyVersion == apiKeyVersion
-                    && value.RevokedAt == null,
-                Context.ConnectionAborted);
-        var accepted = agent is not null
-            && hello.AgentId == identity
-            && string.Equals(hello.Os, "linux", StringComparison.OrdinalIgnoreCase)
-            && hello.ComposeMajorVersion == 2;
-        if (accepted)
+        AgentConnection? previous = null;
+        AgentNode? agent = null;
+        var accepted = false;
+        await using (var lease = await registry.AcquireAgentLockAsync(identity, Context.ConnectionAborted))
         {
-            accepted = await registry.RegisterAsync(
-                new AgentConnection(
+            var registrationVersion = registry.GetRegistrationVersion(identity);
+            agent = await dbContext.AgentNodes
+                .SingleOrDefaultAsync(
+                    value => value.AgentId == identity
+                        && value.ApiKeyVersion == apiKeyVersion
+                        && value.RevokedAt == null,
+                    Context.ConnectionAborted);
+            accepted = agent is not null
+                && hello.AgentId == identity
+                && string.Equals(hello.Os, "linux", StringComparison.OrdinalIgnoreCase)
+                && hello.ComposeMajorVersion == 2;
+            if (accepted)
+            {
+                agent!.LastSeenAt = DateTimeOffset.UtcNow;
+                agent.CapabilitiesJson = System.Text.Json.JsonSerializer.Serialize(hello.Capabilities);
+                auditWriter.Add(
+                    AuditActions.AgentConnected,
+                    null,
+                    null,
                     identity,
-                    Context.ConnectionId,
-                    Clients.Caller,
-                    () =>
-                    {
-                        Context.Abort();
-                        return Task.CompletedTask;
-                    },
-                    ApiKeyVersion: apiKeyVersion),
-                registrationVersion);
+                    "agent",
+                    identity.ToString(),
+                    "connected");
+                await dbContext.SaveChangesAsync(Context.ConnectionAborted);
+                accepted = registry.TryRegisterUnderLock(
+                    new AgentConnection(
+                        identity,
+                        Context.ConnectionId,
+                        Clients.Caller,
+                        () =>
+                        {
+                            Context.Abort();
+                            return Task.CompletedTask;
+                        },
+                        ApiKeyVersion: apiKeyVersion),
+                    registrationVersion,
+                    out previous);
+            }
+        }
+
+        if (previous?.Abort is not null)
+        {
+            await previous.Abort();
         }
 
         var ack = new AgentHelloAck(
@@ -63,60 +87,63 @@ public sealed class AgentHub(
             Context.Abort();
             return;
         }
-
-        agent!.LastSeenAt = DateTimeOffset.UtcNow;
-        agent.CapabilitiesJson = System.Text.Json.JsonSerializer.Serialize(hello.Capabilities);
-        auditWriter.Add(
-            AuditActions.AgentConnected,
-            null,
-            null,
-            identity,
-            "agent",
-            identity.ToString(),
-            "connected");
-        await dbContext.SaveChangesAsync(Context.ConnectionAborted);
     }
 
     public async Task ReportTaskAccepted(TaskAccepted accepted)
     {
-        await EnsureAgentAsync(accepted.AgentId);
+        var identity = GetAgentId();
+        var apiKeyVersion = GetApiKeyVersion();
+        await using var lease = await registry.AcquireAgentLockAsync(identity, Context.ConnectionAborted);
+        await EnsureAgentAsync(accepted.AgentId, identity, apiKeyVersion);
         await dispatcher.HandleAcceptedAsync(accepted, Context.ConnectionAborted);
     }
 
     public async Task ReportTaskLog(TaskLog log)
     {
-        await EnsureAgentAsync(log.AgentId);
+        var identity = GetAgentId();
+        var apiKeyVersion = GetApiKeyVersion();
+        await using var lease = await registry.AcquireAgentLockAsync(identity, Context.ConnectionAborted);
+        await EnsureAgentAsync(log.AgentId, identity, apiKeyVersion);
         await dispatcher.HandleLogAsync(log, Context.ConnectionAborted);
     }
 
     public async Task ReportTaskCompleted(TaskCompleted completed)
     {
-        await EnsureAgentAsync(completed.AgentId);
+        var identity = GetAgentId();
+        var apiKeyVersion = GetApiKeyVersion();
+        await using var lease = await registry.AcquireAgentLockAsync(identity, Context.ConnectionAborted);
+        await EnsureAgentAsync(completed.AgentId, identity, apiKeyVersion);
         await dispatcher.HandleCompletedAsync(completed, Context.ConnectionAborted);
     }
 
     public async Task Heartbeat(HeartbeatMessage heartbeat)
     {
-        await EnsureAgentAsync(heartbeat.AgentId);
+        var identity = GetAgentId();
+        var apiKeyVersion = GetApiKeyVersion();
+        await using var lease = await registry.AcquireAgentLockAsync(identity, Context.ConnectionAborted);
+        await EnsureAgentAsync(heartbeat.AgentId, identity, apiKeyVersion);
         await dispatcher.HandleHeartbeatAsync(heartbeat, Context.ConnectionAborted);
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        var removed = await registry.RemoveAsync(Context.ConnectionId);
         var identity = Context.User?.FindFirstValue("agent_id");
-        if (removed && Guid.TryParse(identity, out var agentId))
+        if (Guid.TryParse(identity, out var agentId) && agentId != Guid.Empty)
         {
-            await dispatcher.HandleAgentDisconnectedAsync(agentId, CancellationToken.None);
-            auditWriter.Add(
-                AuditActions.AgentDisconnected,
-                null,
-                null,
-                agentId,
-                "agent",
-                agentId.ToString(),
-                "disconnected");
-            await dbContext.SaveChangesAsync(CancellationToken.None);
+            await using var lease = await registry.AcquireAgentLockAsync(agentId, CancellationToken.None);
+            if (registry.TryRemoveUnderLock(agentId, Context.ConnectionId, out _))
+            {
+                await dispatcher.HandleAgentDisconnectedAsync(agentId, CancellationToken.None);
+                auditWriter.Add(
+                    AuditActions.AgentDisconnected,
+                    null,
+                    null,
+                    agentId,
+                    "agent",
+                    agentId.ToString(),
+                    "disconnected");
+                await dbContext.SaveChangesAsync(CancellationToken.None);
+            }
         }
 
         await base.OnDisconnectedAsync(exception);
@@ -130,20 +157,19 @@ public sealed class AgentHub(
             : throw new HubException("Agent identity is invalid.");
     }
 
-    private async Task EnsureAgentAsync(Guid payloadAgentId)
+    private async Task EnsureAgentAsync(Guid payloadAgentId, Guid identity, int apiKeyVersion)
     {
-        var identity = GetAgentId();
         if (identity != payloadAgentId)
         {
             throw new HubException("Agent identity does not match payload.");
         }
 
-        if (!registry.IsRegistered(identity, Context.ConnectionId, GetApiKeyVersion()))
+        var registrationVersion = registry.GetRegistrationVersion(identity);
+        if (!registry.IsRegistered(identity, Context.ConnectionId, apiKeyVersion, registrationVersion))
         {
             throw new HubException("Agent connection is not registered.");
         }
 
-        var apiKeyVersion = GetApiKeyVersion();
         var current = await dbContext.AgentNodes
             .AsNoTracking()
             .AnyAsync(
@@ -151,7 +177,7 @@ public sealed class AgentHub(
                     && value.ApiKeyVersion == apiKeyVersion
                     && value.RevokedAt == null,
                 Context.ConnectionAborted);
-        if (!current || !registry.IsRegistered(identity, Context.ConnectionId, apiKeyVersion))
+        if (!current || !registry.IsRegistered(identity, Context.ConnectionId, apiKeyVersion, registrationVersion))
         {
             throw new HubException("Agent credentials are no longer valid.");
         }

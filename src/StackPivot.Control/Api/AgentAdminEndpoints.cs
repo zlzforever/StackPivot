@@ -130,8 +130,11 @@ public static class AgentAdminEndpoints
                     var user = await users.UpsertFromSsoAsync(identity, context.RequestAborted);
                     try
                     {
-                        var issue = await keyService.RotateKeyAsync(agentId, user.UserId, requestId, context.RequestAborted);
-                        await registry.DisconnectAsync(agentId);
+                        var issue = await registry.ExecuteExclusiveAndDisconnectAsync(
+                            agentId,
+                            () => keyService.RotateKeyAsync(agentId, user.UserId, requestId, context.RequestAborted),
+                            context.RequestAborted);
+
                         return Results.Ok(new AgentKeyIssueView(agentId, issue.ApiKey, issue.Version, issue.ApiKeyLast4));
                     }
                     catch (KeyNotFoundException)
@@ -161,8 +164,11 @@ public static class AgentAdminEndpoints
                     var user = await users.UpsertFromSsoAsync(identity, context.RequestAborted);
                     try
                     {
-                        await keyService.RevokeKeyAsync(agentId, user.UserId, requestId, context.RequestAborted);
-                        await registry.DisconnectAsync(agentId);
+                        await registry.ExecuteExclusiveAndDisconnectAsync(
+                            agentId,
+                            () => keyService.RevokeKeyAsync(agentId, user.UserId, requestId, context.RequestAborted),
+                            context.RequestAborted);
+
                         return Results.NoContent();
                     }
                     catch (KeyNotFoundException)

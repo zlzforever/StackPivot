@@ -76,6 +76,49 @@ public sealed class PathPolicyTests
     }
 
     [SkippableFact]
+    public async Task ExistingDirectoryInManagedFilePathIsRejectedAsNonRegular()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-directory-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(Path.Combine(stackPath, "directory"));
+        var policy = new PathPolicy(root);
+
+        try
+        {
+            await Assert.ThrowsAsync<PathPolicyException>(() =>
+                policy.ValidateManagedFilePathAsync("workspace_one/stack_web/directory", CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [SkippableFact]
+    public async Task OpenFileRejectsAnExistingDirectoryAsNonRegular()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-open-directory-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(Path.Combine(stackPath, "directory"));
+        var policy = new PathPolicy(root);
+
+        try
+        {
+            await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+            Assert.Throws<PathPolicyException>(() =>
+                safePath.DirectoryHandle!.OpenFile("directory", FileMode.Open, FileAccess.Read));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [SkippableFact]
     public async Task OpenStackPathKeepsFileOperationsInsideTheOpenedDirectoryAfterReplacement()
     {
         TestPlatform.RequireLinux();

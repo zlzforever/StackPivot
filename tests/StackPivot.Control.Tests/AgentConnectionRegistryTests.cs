@@ -176,6 +176,74 @@ public sealed class AgentConnectionRegistryTests
         Assert.False(registry.IsRegistered(agentId, "connection-1", 4));
     }
 
+    [Fact]
+    public async Task ReplacingAConnectionAdvancesItsRegistrationVersion()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+
+        await registry.RegisterAsync(new AgentConnection(
+            agentId,
+            "connection-1",
+            new NoOpClientProxy(),
+            ApiKeyVersion: 3));
+        var firstVersion = registry.GetRegistrationVersion(agentId);
+
+        Assert.True(await registry.RegisterAsync(
+            new AgentConnection(agentId, "connection-2", new NoOpClientProxy(), ApiKeyVersion: 4),
+            firstVersion));
+        var secondVersion = registry.GetRegistrationVersion(agentId);
+
+        Assert.True(secondVersion > firstVersion);
+        Assert.False(registry.IsRegistered(agentId, "connection-1", 3, firstVersion));
+        Assert.True(registry.IsRegistered(agentId, "connection-2", 4, secondVersion));
+    }
+
+    [Fact]
+    public async Task RegistrationWaitsForAnExclusiveAgentMutation()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+
+        await using var lease = await registry.AcquireAgentLockAsync(agentId, CancellationToken.None);
+        var registration = registry.RegisterAsync(
+            new AgentConnection(agentId, "connection-1", new NoOpClientProxy(), ApiKeyVersion: 3));
+
+        await Task.Delay(25);
+        Assert.False(registration.IsCompleted);
+
+        lease.Dispose();
+        Assert.True(await registration);
+        Assert.True(registry.IsRegistered(agentId, "connection-1", 3));
+    }
+
+    [Fact]
+    public async Task FailedExclusiveKeyMutationStillRemovesAndAbortsTheConnection()
+    {
+        var registry = new AgentConnectionRegistry();
+        var agentId = Guid.NewGuid();
+        var aborted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.RegisterAsync(new AgentConnection(
+            agentId,
+            "connection-1",
+            new NoOpClientProxy(),
+            () =>
+            {
+                aborted.TrySetResult(true);
+                return Task.CompletedTask;
+            }));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            registry.ExecuteExclusiveAndDisconnectAsync(
+                agentId,
+                () => Task.FromException(new InvalidOperationException("database commit result is unknown")),
+                CancellationToken.None));
+
+        Assert.Equal("database commit result is unknown", exception.Message);
+        Assert.True(aborted.Task.IsCompletedSuccessfully);
+        Assert.Null(await registry.FindAsync(agentId, CancellationToken.None));
+    }
+
     private sealed class NoOpClientProxy : IClientProxy
     {
         public Task SendCoreAsync(string method, object?[] args, CancellationToken cancellationToken = default) => Task.CompletedTask;

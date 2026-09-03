@@ -532,6 +532,7 @@ internal static class LinuxPathOperations
     private const int OpenAppend = 0x400;
     private const int OpenNonBlock = 0x800;
     private const int AtEmptyPath = 0x1000;
+    private const uint StatxMode = 0x00000002;
     private const uint StatxBasicStats = 0x000007ff;
     private const ushort StatxTypeMask = 0xf000;
     private const ushort StatxTypeRegular = 0x8000;
@@ -673,7 +674,17 @@ internal static class LinuxPathOperations
                 throw CreateNativeException("Unable to open a managed file.", Marshal.GetLastWin32Error());
             }
 
-            return new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+            var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+            try
+            {
+                EnsureRegularFile(fileDescriptor);
+                return fileHandle;
+            }
+            catch
+            {
+                fileHandle.Dispose();
+                throw;
+            }
         }
         finally
         {
@@ -697,10 +708,7 @@ internal static class LinuxPathOperations
         var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
         try
         {
-            if (!IsRegularFile(fileDescriptor))
-            {
-                throw new PathPolicyException("Managed path must reference a regular file.");
-            }
+            EnsureRegularFile(fileDescriptor);
 
             return fileHandle;
         }
@@ -735,7 +743,7 @@ internal static class LinuxPathOperations
                     currentFileDescriptor,
                     segments[index],
                     isFinal
-                        ? OpenReadOnly | OpenNoFollow | OpenCloseOnExec
+                        ? OpenReadOnly | OpenNoFollow | OpenCloseOnExec | OpenNonBlock
                         : OpenReadOnly | OpenDirectory | OpenNoFollow | OpenCloseOnExec,
                     0);
                 if (fileDescriptor < 0)
@@ -747,6 +755,10 @@ internal static class LinuxPathOperations
                 current?.Dispose();
                 current = next;
                 currentFileDescriptor = GetFileDescriptor(current);
+                if (isFinal)
+                {
+                    EnsureRegularFile(fileDescriptor);
+                }
             }
         }
         finally
@@ -817,7 +829,7 @@ internal static class LinuxPathOperations
         var fileDescriptor = openat(
             parentFileDescriptor,
             segments[0],
-            OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec,
+            OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec | OpenNonBlock,
             FileMode);
         if (fileDescriptor < 0)
         {
@@ -825,14 +837,21 @@ internal static class LinuxPathOperations
         }
 
         var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
-        if (flock(fileDescriptor, LockExclusive | LockNonBlocking) < 0)
+        try
         {
-            var errorNumber = Marshal.GetLastWin32Error();
-            fileHandle.Dispose();
-            throw CreateNativeException("Unable to acquire a deployment lock file.", errorNumber);
-        }
+            EnsureRegularFile(fileDescriptor);
+            if (flock(fileDescriptor, LockExclusive | LockNonBlocking) < 0)
+            {
+                throw CreateNativeException("Unable to acquire a deployment lock file.", Marshal.GetLastWin32Error());
+            }
 
-        return fileHandle;
+            return fileHandle;
+        }
+        catch
+        {
+            fileHandle.Dispose();
+            throw;
+        }
     }
 
     private static SafeFileHandle OpenAbsoluteDirectory(string absoluteRoot)
@@ -919,7 +938,7 @@ internal static class LinuxPathOperations
             System.IO.FileAccess.ReadWrite => OpenReadWrite,
             _ => throw new ArgumentOutOfRangeException(nameof(access))
         };
-        flags |= OpenNoFollow | OpenCloseOnExec;
+        flags |= OpenNoFollow | OpenCloseOnExec | OpenNonBlock;
         flags |= mode switch
         {
             System.IO.FileMode.CreateNew => OpenCreate | OpenExclusive,
@@ -940,32 +959,49 @@ internal static class LinuxPathOperations
         return checked((int)handle.DangerousGetHandle().ToInt64());
     }
 
-    private static bool IsRegularFile(int fileDescriptor)
+    private static void EnsureRegularFile(int fileDescriptor)
     {
-        if (statx(
-                fileDescriptor,
-                string.Empty,
-                AtEmptyPath,
-                StatxBasicStats,
-                out var metadata) != 0)
+        LinuxStatx metadata;
+        try
         {
-            throw CreateNativeException("Unable to inspect a managed file.", Marshal.GetLastWin32Error());
+            if (statx(
+                    fileDescriptor,
+                    string.Empty,
+                    AtEmptyPath,
+                    StatxBasicStats,
+                    out metadata) != 0)
+            {
+                throw CreateNativeException("Unable to inspect a managed file.", Marshal.GetLastWin32Error());
+            }
+        }
+        catch (DllNotFoundException exception)
+        {
+            throw new PathPolicyException("Linux file type inspection is unavailable.", exception);
+        }
+        catch (EntryPointNotFoundException exception)
+        {
+            throw new PathPolicyException("Linux file type inspection is unavailable.", exception);
+        }
+        catch (BadImageFormatException exception)
+        {
+            throw new PathPolicyException("Linux file type inspection is unavailable.", exception);
         }
 
-        return (metadata.Mode & StatxTypeMask) == StatxTypeRegular;
+        if ((metadata.Mask & StatxMode) != StatxMode
+            || (metadata.Mode & StatxTypeMask) != StatxTypeRegular)
+        {
+            throw new PathPolicyException("Managed path must reference a regular file.");
+        }
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1, Size = 256)]
+    [StructLayout(LayoutKind.Explicit, Size = 256)]
     private struct LinuxStatx
     {
+        [FieldOffset(0)]
         public uint Mask;
-        public uint BlockSize;
-        public ulong Attributes;
-        public uint LinkCount;
-        public uint UserId;
-        public uint GroupId;
+
+        [FieldOffset(28)]
         public ushort Mode;
-        public ushort Spare0;
     }
 
     private static PathPolicyException CreateNativeException(string message, int errorNumber)
@@ -974,32 +1010,32 @@ internal static class LinuxPathOperations
     }
 
     #pragma warning disable CA2101
-    [DllImport("libc", EntryPoint = "openat", SetLastError = true, CharSet = CharSet.Ansi)]
+    [DllImport("libc", EntryPoint = "openat", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.Cdecl)]
     private static extern int openat(
         int directoryFileDescriptor,
         [MarshalAs(UnmanagedType.LPStr)] string path,
         int flags,
         uint mode);
 
-    [DllImport("libc", EntryPoint = "mkdirat", SetLastError = true, CharSet = CharSet.Ansi)]
+    [DllImport("libc", EntryPoint = "mkdirat", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.Cdecl)]
     private static extern int mkdirat(
         int directoryFileDescriptor,
         [MarshalAs(UnmanagedType.LPStr)] string path,
         uint mode);
 
-    [DllImport("libc", EntryPoint = "unlinkat", SetLastError = true, CharSet = CharSet.Ansi)]
+    [DllImport("libc", EntryPoint = "unlinkat", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.Cdecl)]
     private static extern int unlinkat(
         int directoryFileDescriptor,
         [MarshalAs(UnmanagedType.LPStr)] string path,
         int flags);
 
-    [DllImport("libc", EntryPoint = "flock", SetLastError = true)]
+    [DllImport("libc", EntryPoint = "flock", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
     private static extern int flock(int fileDescriptor, int operation);
 
-    [DllImport("libc", EntryPoint = "fchmod", SetLastError = true)]
+    [DllImport("libc", EntryPoint = "fchmod", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
     private static extern int fchmod(int fileDescriptor, uint mode);
 
-    [DllImport("libc", EntryPoint = "statx", SetLastError = true, CharSet = CharSet.Ansi)]
+    [DllImport("libc", EntryPoint = "statx", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.Cdecl)]
     private static extern int statx(
         int directoryFileDescriptor,
         [MarshalAs(UnmanagedType.LPStr)] string path,

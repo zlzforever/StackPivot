@@ -244,7 +244,7 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
-    public async Task DispatchSendExceptionRecordsAnUnknownDispatchResult()
+    public async Task DispatchSendExceptionKeepsTheTaskPendingForAConvergentAgentReply()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -270,9 +270,21 @@ public sealed class DeploymentEventTests
         await dispatcher.DispatchPendingAsync(CancellationToken.None);
 
         var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
-        Assert.Equal("failed", history.TaskStatus);
-        Assert.Equal("agent_dispatch_unknown", history.ErrorCode);
-        Assert.Contains(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskFailed);
+        Assert.Equal("pending", history.TaskStatus);
+        Assert.Null(history.ErrorCode);
+        Assert.NotNull(history.DispatchAttemptAt);
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskFailed);
+
+        await dispatcher.HandleAcceptedAsync(
+            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(
+            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 0, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("success", history.TaskStatus);
+        Assert.Equal(0, history.ExitCode);
     }
 
     [Fact]
@@ -527,7 +539,7 @@ public sealed class DeploymentEventTests
         await db.SaveChangesAsync();
         var dispatcher = new DeploymentDispatcher(
             db,
-            new ThrowingTransport(),
+            new OfflineTransport(),
             protector,
             new AuditWriter(db));
 
@@ -535,7 +547,7 @@ public sealed class DeploymentEventTests
 
         var failed = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
         Assert.Equal("failed", failed.TaskStatus);
-        Assert.Equal("agent_dispatch_unknown", failed.ErrorCode);
+        Assert.Equal("agent_offline", failed.ErrorCode);
 
         var service = new DeploymentService(
             db,
@@ -745,6 +757,37 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AgentGoingOfflineDuringSendIsFailedWithStableOfflineErrorCode()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var transport = new OfflineDuringSendTransport();
+        var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        await db.GlobalGitSettings.AddAsync(new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = protector.Protect("git-token", "git-key-v1"),
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+
+        var dispatcher = new DeploymentDispatcher(db, transport, protector, new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", history.TaskStatus);
+        Assert.Equal("agent_offline", history.ErrorCode);
+        Assert.Equal(1, transport.SendAttempts);
+    }
+
+    [Fact]
     public async Task DispatchedTaskWithoutAcceptanceExpiresAndIsNotSentAgain()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -810,7 +853,7 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
-    public async Task AgentDisconnectFailsAcceptedTaskAndReleasesActivity()
+    public async Task AgentDisconnectKeepsAnAcceptedTaskPendingForACompletionReply()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -831,8 +874,8 @@ public sealed class DeploymentEventTests
         await dispatcher.HandleAgentDisconnectedAsync(fixture.AgentId, CancellationToken.None);
 
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
-        Assert.Equal("failed", history.TaskStatus);
-        Assert.Equal("agent_disconnected", history.ErrorCode);
+        Assert.Equal("pending", history.TaskStatus);
+        Assert.Null(history.ErrorCode);
     }
 
     [Fact]
@@ -878,8 +921,8 @@ public sealed class DeploymentEventTests
 
                 await using var verifyDb = new StackPivotDbContext(options);
                 var history = await verifyDb.ServiceOperationHistories.SingleAsync();
-                Assert.Equal("failed", history.TaskStatus);
-                Assert.Equal("agent_disconnected", history.ErrorCode);
+                Assert.Equal("pending", history.TaskStatus);
+                Assert.NotNull(history.DispatchedAt);
             }
         }
         finally
@@ -939,8 +982,9 @@ public sealed class DeploymentEventTests
 
                 await using var verifyDb = new StackPivotDbContext(options);
                 var finalHistory = await verifyDb.ServiceOperationHistories.SingleAsync();
-                Assert.Equal("failed", finalHistory.TaskStatus);
-                Assert.Equal("agent_disconnected", finalHistory.ErrorCode);
+                Assert.Equal("success", finalHistory.TaskStatus);
+                Assert.Equal(0, finalHistory.ExitCode);
+                Assert.Null(finalHistory.ErrorCode);
             }
         }
         finally
@@ -989,6 +1033,19 @@ public sealed class DeploymentEventTests
     {
         public Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken) => Task.FromResult(true);
         public Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken) => throw new TimeoutException("send failed");
+    }
+
+    private sealed class OfflineDuringSendTransport : IAgentTransport
+    {
+        public int SendAttempts { get; private set; }
+
+        public Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken) => Task.FromResult(true);
+
+        public Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken)
+        {
+            SendAttempts++;
+            throw new AgentOfflineException();
+        }
     }
 
     private sealed class RecordingTransport : IAgentTransport

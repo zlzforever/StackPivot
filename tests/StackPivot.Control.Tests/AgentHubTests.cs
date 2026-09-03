@@ -72,6 +72,64 @@ public sealed class AgentHubTests
         Assert.Equal(lastSeenAt, persisted.LastSeenAt);
     }
 
+    [Fact]
+    public async Task HeartbeatWaitsForAgentMutationBeforeCheckingKeyVersion()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var agentId = Guid.NewGuid();
+        var lastSeenAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        db.AgentNodes.Add(new AgentNode
+        {
+            AgentId = agentId,
+            Name = "agent",
+            ApiKeyHash = "hash",
+            ApiKeyVersion = 3,
+            LastSeenAt = lastSeenAt
+        });
+        await db.SaveChangesAsync();
+
+        var registry = new AgentConnectionRegistry();
+        await registry.RegisterAsync(new AgentConnection(
+            agentId,
+            "connection-1",
+            new NoOpClientProxy(),
+            ApiKeyVersion: 3));
+        var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        var hub = new AgentHub(
+            db,
+            registry,
+            new DeploymentDispatcher(db, new NoOpTransport(), protector, new AuditWriter(db)),
+            new AuditWriter(db))
+        {
+            Context = new TestHubCallerContext(
+                "connection-1",
+                new ClaimsPrincipal(new ClaimsIdentity(
+                    new[]
+                    {
+                        new Claim("agent_id", agentId.ToString()),
+                        new Claim("agent_key_version", "3")
+                    },
+                    AgentApiKeyDefaults.AuthenticationScheme)))
+        };
+
+        await using var lease = await registry.AcquireAgentLockAsync(agentId, CancellationToken.None);
+        var heartbeat = hub.Heartbeat(new HeartbeatMessage(1, agentId, DateTimeOffset.UtcNow));
+        await Task.Delay(25);
+        Assert.False(heartbeat.IsCompleted);
+
+        db.AgentNodes.Single().ApiKeyVersion = 4;
+        await db.SaveChangesAsync();
+        lease.Dispose();
+
+        await Assert.ThrowsAsync<HubException>(() => heartbeat);
+        var persisted = await db.AgentNodes.AsNoTracking().SingleAsync();
+        Assert.Equal(lastSeenAt, persisted.LastSeenAt);
+    }
+
     private sealed class TestHubCallerContext : HubCallerContext
     {
         private readonly string connectionId;

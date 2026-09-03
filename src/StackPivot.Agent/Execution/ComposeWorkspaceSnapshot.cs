@@ -100,14 +100,18 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         bool isRoot,
         int depth,
         SnapshotBudget budget,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool directoryAlreadyCounted = false)
     {
         if (depth > MaxSnapshotPathDepth)
         {
             throw new PathPolicyException("Compose workspace path depth exceeds the safety limit.");
         }
 
-        budget.StartDirectory();
+        if (!directoryAlreadyCounted)
+        {
+            budget.StartDirectory();
+        }
 
         foreach (var name in source.EnumerateEntryNames(MaxSnapshotFileCount + 1))
         {
@@ -131,6 +135,12 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
             var sourceDirectory = source.TryOpenChildDirectory(name);
             if (sourceDirectory is not null)
             {
+                if (depth == MaxSnapshotPathDepth)
+                {
+                    throw new PathPolicyException("Compose workspace path depth exceeds the safety limit.");
+                }
+
+                budget.StartDirectory();
                 using (sourceDirectory)
                 using (var destinationDirectory = destination.OpenChildDirectory(name, create: true))
                 {
@@ -140,7 +150,8 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
                         isRoot: false,
                         depth + 1,
                         budget,
-                        cancellationToken);
+                        cancellationToken,
+                        directoryAlreadyCounted: true);
                 }
 
                 continue;
