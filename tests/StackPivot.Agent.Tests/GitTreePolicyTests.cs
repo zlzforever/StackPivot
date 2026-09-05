@@ -45,6 +45,40 @@ public sealed class GitTreePolicyTests
     }
 
     [Fact]
+    public void CheckoutTreeRejectsMoreThanTheMetadataEntryBudget()
+    {
+        var files = Enumerable.Range(0, 4097)
+            .Select(index => $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/file-{index}.txt");
+        var tree = string.Join(
+            '\n',
+            new[]
+            {
+                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml"
+            }.Concat(files));
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("invalid_path", exception.Code);
+    }
+
+    [Fact]
+    public void CheckoutTreeRejectsMetadataThatExceedsTheSerializedByteBudget()
+    {
+        var files = Enumerable.Range(0, 4095)
+            .Select(index => $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/{new string('x', 350)}-{index}.txt");
+        var tree = string.Join(
+            '\n',
+            new[]
+            {
+                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml"
+            }.Concat(files));
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("invalid_path", exception.Code);
+    }
+
+    [Fact]
     public void RemoteHostPolicyRejectsAHostOutsideTheConfiguredAllowList()
     {
         Assert.False(CentralRemotePolicy.IsAllowed(

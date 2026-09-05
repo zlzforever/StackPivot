@@ -514,6 +514,118 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AcceptedReportCommitResultUnknownConvergesFromPersistedState()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-accepted-commit-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            var commitFailure = new CommitFailureInterceptor { Enabled = true };
+            var dispatchOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(commitFailure)
+                .Options;
+            await using (var seedDb = new StackPivotDbContext(baseOptions))
+            {
+                await seedDb.Database.EnsureCreatedAsync();
+                await SeedAsync(seedDb);
+                var history = await seedDb.ServiceOperationHistories.SingleAsync();
+                history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+                history.DispatchedAt = history.DispatchAttemptAt;
+                await seedDb.SaveChangesAsync();
+            }
+
+            await using var db = new StackPivotDbContext(dispatchOptions);
+            var historyForReport = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            var dispatcher = new DeploymentDispatcher(
+                db,
+                new OfflineTransport(),
+                protector,
+                new AuditWriter(db),
+                new TestDbContextFactory(baseOptions));
+
+            await dispatcher.HandleAcceptedAsync(
+                CreateAccepted(historyForReport, DateTimeOffset.UtcNow),
+                CancellationToken.None);
+
+            await using var verifyDb = new StackPivotDbContext(baseOptions);
+            var persisted = await verifyDb.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            Assert.Equal("pending", persisted.TaskStatus);
+            Assert.NotNull(persisted.AcceptedAt);
+            Assert.NotNull(persisted.StartTime);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CompletedReportCommitResultUnknownConvergesFromPersistedState()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-completed-commit-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            var commitFailure = new CommitFailureInterceptor { Enabled = true };
+            var dispatchOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(commitFailure)
+                .Options;
+            await using (var seedDb = new StackPivotDbContext(baseOptions))
+            {
+                await seedDb.Database.EnsureCreatedAsync();
+                await SeedAsync(seedDb);
+                var history = await seedDb.ServiceOperationHistories.SingleAsync();
+                var acceptedAt = DateTimeOffset.UtcNow;
+                history.DispatchAttemptAt = acceptedAt;
+                history.DispatchedAt = acceptedAt;
+                history.AcceptedAt = acceptedAt;
+                history.StartTime = acceptedAt;
+                await seedDb.SaveChangesAsync();
+            }
+
+            await using var db = new StackPivotDbContext(dispatchOptions);
+            var historyForReport = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            var dispatcher = new DeploymentDispatcher(
+                db,
+                new OfflineTransport(),
+                protector,
+                new AuditWriter(db),
+                new TestDbContextFactory(baseOptions));
+
+            await dispatcher.HandleCompletedAsync(
+                CreateCompleted(historyForReport, DateTimeOffset.UtcNow, success: true, exitCode: 0),
+                CancellationToken.None);
+
+            await using var verifyDb = new StackPivotDbContext(baseOptions);
+            var persisted = await verifyDb.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            Assert.Equal("success", persisted.TaskStatus);
+            Assert.Equal(0, persisted.ExitCode);
+            Assert.Null(persisted.ErrorCode);
+            Assert.NotNull(persisted.FinishTime);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    [Fact]
     public async Task SuccessfullyDispatchedTaskIsNotSentAgainBeforeAcceptance()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -1433,6 +1545,15 @@ public sealed class DeploymentEventTests
 
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class TestDbContextFactory(DbContextOptions<StackPivotDbContext> options)
+        : IDbContextFactory<StackPivotDbContext>
+    {
+        public StackPivotDbContext CreateDbContext() => new(options);
+
+        public Task<StackPivotDbContext> CreateDbContextAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new StackPivotDbContext(options));
     }
 
     private sealed class DispatchMarkerFailureInterceptor : DbCommandInterceptor

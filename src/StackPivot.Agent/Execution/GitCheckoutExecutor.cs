@@ -34,6 +34,99 @@ public sealed class GitTreePolicyException(string code, string message) : Except
     public string Code { get; } = code;
 }
 
+internal sealed class CheckoutMetadataPolicyException(string message) : Exception(message)
+{
+}
+
+internal sealed record CheckoutMetadataDocument(
+    string Commit,
+    string Path,
+    IReadOnlyList<string>? Files);
+
+internal static class CheckoutMetadataPolicy
+{
+    internal const int MaxBytes = 1024 * 1024;
+    internal const int MaxEntries = 4096;
+    internal const int MaxPathBytes = 4096;
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+    };
+
+    internal static string Serialize(
+        string commit,
+        string path,
+        IReadOnlyList<string> files)
+    {
+        ValidateDocument(commit, path, files);
+        var json = JsonSerializer.Serialize(
+            new CheckoutMetadataDocument(commit, path, files),
+            JsonOptions);
+        ValidateSerializedJson(json);
+        return json;
+    }
+
+    internal static CheckoutMetadataDocument? Deserialize(string json) =>
+        JsonSerializer.Deserialize<CheckoutMetadataDocument>(json, JsonOptions);
+
+    internal static void ValidateTree(string path, IReadOnlyList<string> files)
+    {
+        ValidateDocument(
+            new string('0', 64),
+            path,
+            files);
+        var json = JsonSerializer.Serialize(
+            new CheckoutMetadataDocument(new string('0', 64), path, files),
+            JsonOptions);
+        ValidateSerializedJson(json);
+    }
+
+    internal static void ValidateDocument(
+        string? commit,
+        string? path,
+        IReadOnlyList<string>? files)
+    {
+        if (string.IsNullOrWhiteSpace(commit)
+            || commit.Length > 64
+            || string.IsNullOrWhiteSpace(path)
+            || path.Length > 200)
+        {
+            throw new CheckoutMetadataPolicyException("Checkout metadata contains an invalid document header.");
+        }
+
+        ValidateFiles(path, files);
+    }
+
+    internal static void ValidateFiles(
+        string path,
+        IReadOnlyList<string>? files)
+    {
+        if (files is null || files.Count > MaxEntries)
+        {
+            throw new CheckoutMetadataPolicyException("Checkout metadata exceeds its entry limit.");
+        }
+
+        var uniqueFiles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var file in files)
+        {
+            if (string.IsNullOrWhiteSpace(file)
+                || Encoding.UTF8.GetByteCount(file) > MaxPathBytes
+                || !uniqueFiles.Add(file))
+            {
+                throw new CheckoutMetadataPolicyException("Checkout metadata contains an invalid file entry.");
+            }
+        }
+    }
+
+    internal static void ValidateSerializedJson(string json)
+    {
+        if (Encoding.UTF8.GetByteCount(json) > MaxBytes)
+        {
+            throw new CheckoutMetadataPolicyException("Checkout metadata exceeds its size limit.");
+        }
+    }
+}
+
 public static class GitTreePolicy
 {
     public static IReadOnlyList<string> Validate(string treeOutput, string stackPath)
@@ -95,6 +188,15 @@ public static class GitTreePolicy
             throw new GitTreePolicyException("invalid_path", "The stack does not contain a compose file.");
         }
 
+        try
+        {
+            CheckoutMetadataPolicy.ValidateTree(stackPath, files);
+        }
+        catch (CheckoutMetadataPolicyException exception)
+        {
+            throw new GitTreePolicyException("invalid_path", exception.Message);
+        }
+
         return files;
     }
 
@@ -126,13 +228,6 @@ public static class GitTreePolicy
 public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 {
     private static readonly string[] InitArguments = ["init", "--bare"];
-    private const int MaxCheckoutMetadataBytes = 1024 * 1024;
-    private const int MaxCheckoutMetadataEntries = 4096;
-    private const int MaxCheckoutMetadataPathBytes = 4096;
-    private static readonly JsonSerializerOptions MetadataJsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
-    };
     private readonly IProcessRunner processRunner;
     private readonly PathPolicy pathPolicy;
     private readonly TimeSpan timeout;
@@ -399,13 +494,22 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 }
 
                 IReadOnlyList<string> files;
+                string metadataJson;
                 try
                 {
                     files = GitTreePolicy.Validate(tree.StandardOutput, input.StackGitRelativePath);
+                    metadataJson = CheckoutMetadataPolicy.Serialize(
+                        input.TargetCommitHash,
+                        input.StackGitRelativePath,
+                        files);
                 }
                 catch (GitTreePolicyException exception)
                 {
                     return Failure(exception.Code);
+                }
+                catch (CheckoutMetadataPolicyException)
+                {
+                    return Failure("invalid_path");
                 }
 
                 IReadOnlyList<string> oldFiles;
@@ -442,11 +546,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 {
                     await RemoveManagedFilesAsync(directoryHandle, oldFiles, cancellationToken);
                     await CopyStagedFilesAsync(materializationDirectory.Directory, directoryHandle, files, cancellationToken);
-                    WriteMetadata(
-                        repositoryHandle,
-                        input.TargetCommitHash,
-                        input.StackGitRelativePath,
-                        files);
+                    WriteMetadata(repositoryHandle, metadataJson);
                 }
                 catch (PathPolicyException)
                 {
@@ -501,38 +601,25 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             var json = ReadMetadataJson(file);
             try
             {
-                var metadata = JsonSerializer.Deserialize<CheckoutMetadata>(json, MetadataJsonOptions);
-                if (metadata is null
-                    || string.IsNullOrWhiteSpace(metadata.Commit)
-                    || metadata.Commit.Length > 64
-                    || string.IsNullOrWhiteSpace(metadata.Path)
-                    || metadata.Path.Length > 200
-                    || !string.Equals(metadata.Path, expectedStackPath, StringComparison.Ordinal)
-                    || metadata.Files is null
-                    || metadata.Files.Count > MaxCheckoutMetadataEntries)
+                var metadata = CheckoutMetadataPolicy.Deserialize(json);
+                CheckoutMetadataPolicy.ValidateDocument(
+                    metadata?.Commit,
+                    metadata?.Path,
+                    metadata?.Files);
+                if (!string.Equals(metadata!.Path, expectedStackPath, StringComparison.Ordinal))
                 {
-                    throw new PathPolicyException("Checkout metadata is incomplete or exceeds its limits.");
+                    throw new CheckoutMetadataPolicyException("Checkout metadata path does not match the stack path.");
                 }
 
-                var files = new List<string>(metadata.Files.Count);
-                var uniqueFiles = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var path in metadata.Files)
-                {
-                    if (string.IsNullOrWhiteSpace(path)
-                        || Encoding.UTF8.GetByteCount(path) > MaxCheckoutMetadataPathBytes
-                        || !uniqueFiles.Add(path))
-                    {
-                        throw new PathPolicyException("Checkout metadata contains an invalid file entry.");
-                    }
-
-                    files.Add(path);
-                }
-
-                return files;
+                return metadata.Files!;
             }
             catch (JsonException exception)
             {
                 throw new PathPolicyException("Checkout metadata is incomplete or invalid.", exception);
+            }
+            catch (CheckoutMetadataPolicyException exception)
+            {
+                throw new PathPolicyException("Checkout metadata is incomplete or exceeds its limits.", exception);
             }
         }
         catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
@@ -543,12 +630,12 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
     private static string ReadMetadataJson(FileStream file)
     {
-        if (file.Length < 0 || file.Length > MaxCheckoutMetadataBytes)
+        if (file.Length < 0 || file.Length > CheckoutMetadataPolicy.MaxBytes)
         {
             throw new PathPolicyException("Checkout metadata exceeds its size limit.");
         }
 
-        var buffer = new byte[MaxCheckoutMetadataBytes + 1];
+        var buffer = new byte[CheckoutMetadataPolicy.MaxBytes + 1];
         var total = 0;
         while (true)
         {
@@ -559,7 +646,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             }
 
             total += read;
-            if (total > MaxCheckoutMetadataBytes)
+            if (total > CheckoutMetadataPolicy.MaxBytes)
             {
                 throw new PathPolicyException("Checkout metadata exceeds its size limit.");
             }
@@ -607,18 +694,22 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
     private static void WriteMetadata(
         SafeDirectoryHandle gitDirectory,
-        string commit,
-        string path,
-        IReadOnlyList<string> files)
+        string json)
     {
-        var metadata = new CheckoutMetadata(commit, path, files);
-        var json = JsonSerializer.Serialize(metadata, MetadataJsonOptions);
-        using var file = gitDirectory.OpenFile("stackpivot-checkout.json", FileMode.Create, FileAccess.Write);
-        using var writer = new StreamWriter(
-            file,
-            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-            bufferSize: 4096);
-        writer.Write(json);
+        try
+        {
+            CheckoutMetadataPolicy.ValidateSerializedJson(json);
+            using var file = gitDirectory.OpenFile("stackpivot-checkout.json", FileMode.Create, FileAccess.Write);
+            using var writer = new StreamWriter(
+                file,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                bufferSize: 4096);
+            writer.Write(json);
+        }
+        catch (CheckoutMetadataPolicyException exception)
+        {
+            throw new PathPolicyException("Checkout metadata exceeds its size limit.", exception);
+        }
     }
 
     private static GitCheckoutResult Failure(string errorCode)
@@ -626,7 +717,6 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         return new GitCheckoutResult(false, errorCode, Array.Empty<string>());
     }
 
-    private sealed record CheckoutMetadata(string Commit, string Path, IReadOnlyList<string> Files);
 }
 
 public static class CentralRemotePolicy

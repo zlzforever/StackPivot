@@ -130,7 +130,21 @@ public sealed class DeploymentDispatcher(
             history.TaskId.ToString(),
             "accepted");
         await dbContext.SaveChangesAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        try
+        {
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            var persisted = await IsAcceptedPersistedAsync(history.HistoryId, cancellationToken);
+            dbContext.ChangeTracker.Clear();
+            if (persisted)
+            {
+                return;
+            }
+
+            throw;
+        }
     }
 
     public async Task HandleLogAsync(TaskLog log, CancellationToken cancellationToken)
@@ -226,7 +240,26 @@ public sealed class DeploymentDispatcher(
             taskStatus,
             errorCode);
         await dbContext.SaveChangesAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        try
+        {
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            var persisted = await IsCompletedPersistedAsync(
+                history.HistoryId,
+                taskStatus,
+                completed.ExitCode,
+                errorCode,
+                cancellationToken);
+            dbContext.ChangeTracker.Clear();
+            if (persisted)
+            {
+                return;
+            }
+
+            throw;
+        }
     }
 
     private static bool IsAcceptedReportAllowed(
@@ -380,6 +413,85 @@ public sealed class DeploymentDispatcher(
     private static bool IsUnknownDispatch(ServiceOperationHistory history) =>
         history.TaskStatus == "failed"
         && string.Equals(history.ErrorCode, "agent_dispatch_unknown", StringComparison.Ordinal);
+
+    private async Task<bool> IsAcceptedPersistedAsync(
+        Guid historyId,
+        CancellationToken cancellationToken)
+    {
+        var state = await ReadReportPersistenceStateAsync(historyId, cancellationToken);
+        return state is not null
+            && state.AcceptedAt is not null
+            && state.StartTime is not null;
+    }
+
+    private async Task<bool> IsCompletedPersistedAsync(
+        Guid historyId,
+        string taskStatus,
+        int? exitCode,
+        string? errorCode,
+        CancellationToken cancellationToken)
+    {
+        var state = await ReadReportPersistenceStateAsync(historyId, cancellationToken);
+        return state is not null
+            && state.TaskStatus == taskStatus
+            && state.ExitCode == exitCode
+            && string.Equals(state.ErrorCode, errorCode, StringComparison.Ordinal)
+            && state.FinishTime is not null;
+    }
+
+    private async Task<ReportPersistenceState?> ReadReportPersistenceStateAsync(
+        Guid historyId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (verificationContextFactory is not null)
+            {
+                await using var verificationContext = await verificationContextFactory
+                    .CreateDbContextAsync(cancellationToken);
+                return await verificationContext.ServiceOperationHistories
+                    .AsNoTracking()
+                    .Where(value => value.HistoryId == historyId)
+                    .Select(value => new ReportPersistenceState(
+                        value.TaskStatus,
+                        value.AcceptedAt,
+                        value.StartTime,
+                        value.ExitCode,
+                        value.ErrorCode,
+                        value.FinishTime))
+                    .SingleOrDefaultAsync(cancellationToken);
+            }
+
+            dbContext.ChangeTracker.Clear();
+            return await dbContext.ServiceOperationHistories
+                .AsNoTracking()
+                .Where(value => value.HistoryId == historyId)
+                .Select(value => new ReportPersistenceState(
+                    value.TaskStatus,
+                    value.AcceptedAt,
+                    value.StartTime,
+                    value.ExitCode,
+                    value.ErrorCode,
+                    value.FinishTime))
+                .SingleOrDefaultAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private sealed record ReportPersistenceState(
+        string TaskStatus,
+        DateTimeOffset? AcceptedAt,
+        DateTimeOffset? StartTime,
+        int? ExitCode,
+        string? ErrorCode,
+        DateTimeOffset? FinishTime);
 
     public async Task HandleAgentDisconnectedAsync(Guid agentId, CancellationToken cancellationToken)
     {
