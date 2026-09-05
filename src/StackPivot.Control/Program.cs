@@ -62,7 +62,7 @@ builder.Services.AddAuthentication(options =>
     })
     .AddCookie(SsoAuthenticationDefaults.CookieScheme, options =>
     {
-        options.Cookie.Name = "StackPivot.SsoSession";
+        options.Cookie.Name = SsoAuthenticationDefaults.CookieName;
         options.SlidingExpiration = true;
         options.Events.OnRedirectToLogin = context =>
         {

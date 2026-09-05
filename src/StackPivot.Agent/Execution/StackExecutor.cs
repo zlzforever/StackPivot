@@ -79,6 +79,11 @@ public sealed class StackExecutor(
                 return Failure("command_expired");
             }
 
+            if (!DispatchFingerprint.Matches(command))
+            {
+                return Failure("invalid_dispatch_fingerprint");
+            }
+
             if (!ProtocolValidation.IsFullCommitHash(command.TargetCommitHash))
             {
                 return Failure("invalid_commit");

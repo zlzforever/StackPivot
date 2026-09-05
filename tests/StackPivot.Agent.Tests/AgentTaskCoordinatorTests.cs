@@ -85,6 +85,23 @@ public sealed class AgentTaskCoordinatorTests
         Assert.True(reporter.Completed[0].LogTruncated);
     }
 
+    [Fact]
+    public async Task InvalidDispatchFingerprintIsRejectedBeforeExecutionAndReporting()
+    {
+        var executor = new ThrowingExecutor();
+        var coordinator = new AgentTaskCoordinator(AgentId, executor);
+        var reporter = new RecordingReporter();
+        var command = CreateCommand() with { DispatchFingerprint = new string('0', 64) };
+
+        await coordinator.HandleAsync(command, reporter, CancellationToken.None);
+
+        Assert.Equal(0, executor.ExecutionCount);
+        Assert.Empty(reporter.Accepted);
+        Assert.Empty(reporter.Logs);
+        Assert.Empty(reporter.Completed);
+        Assert.All(command.AccessToken, value => Assert.Equal(0, value));
+    }
+
     [SkippableFact]
     public async Task CompletedTaskCacheIsBoundedAndCachedTasksRemainIdempotent()
     {
@@ -150,7 +167,7 @@ public sealed class AgentTaskCoordinatorTests
 
     private static DeployStackCommand CreateCommand(byte[]? accessToken = null)
     {
-        return new DeployStackCommand(
+        var command = new DeployStackCommand(
             ProtocolVersion.Current,
             Guid.NewGuid(),
             Guid.NewGuid(),
@@ -163,6 +180,7 @@ public sealed class AgentTaskCoordinatorTests
             "workspace_one/stack_web",
             "/opt/agent-main/workspace_one/stack_web",
             DateTimeOffset.UtcNow.AddMinutes(5));
+        return command with { DispatchFingerprint = DispatchFingerprint.Compute(command) };
     }
 
     private sealed class BlockingExecutor : IStackExecutor

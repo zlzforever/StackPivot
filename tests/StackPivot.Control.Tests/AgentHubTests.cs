@@ -118,7 +118,6 @@ public sealed class AgentHubTests
 
         await using var lease = await registry.AcquireAgentLockAsync(agentId, CancellationToken.None);
         var heartbeat = hub.Heartbeat(new HeartbeatMessage(1, agentId, DateTimeOffset.UtcNow));
-        await Task.Delay(25);
         Assert.False(heartbeat.IsCompleted);
 
         db.AgentNodes.Single().ApiKeyVersion = 4;

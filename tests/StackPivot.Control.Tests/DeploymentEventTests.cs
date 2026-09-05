@@ -14,6 +14,7 @@ using StackPivot.Control.Infrastructure.Persistence;
 using StackPivot.Control.Infrastructure.Security;
 using StackPivot.Contracts.Agents;
 using StackPivot.Contracts.Deployments;
+using StackPivot.Contracts.SignalR;
 using Xunit;
 
 namespace StackPivot.Control.Tests;
@@ -38,11 +39,11 @@ public sealed class DeploymentEventTests
         var fixtureTask = await db.ServiceOperationHistories.SingleAsync();
         fixtureTask.DispatchedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
-        await dispatcher.HandleAcceptedAsync(new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow), CancellationToken.None);
-        await dispatcher.HandleLogAsync(new TaskLog(1, fixture.TaskId, fixture.AgentId, 0, "stdout", "Authorization: Bearer hidden-token", DateTimeOffset.UtcNow), CancellationToken.None);
-        await dispatcher.HandleLogAsync(new TaskLog(1, fixture.TaskId, fixture.AgentId, 0, "stdout", "duplicate", DateTimeOffset.UtcNow), CancellationToken.None);
-        await dispatcher.HandleLogAsync(new TaskLog(1, fixture.TaskId, fixture.AgentId, 2, "stdout", "out-of-order", DateTimeOffset.UtcNow), CancellationToken.None);
-        await dispatcher.HandleLogAsync(new TaskLog(1, fixture.TaskId, fixture.AgentId, 1, "stdout", "password=hunter2", DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleAcceptedAsync(CreateAccepted(fixtureTask, DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleLogAsync(CreateLog(fixtureTask, 0, "stdout", "Authorization: Bearer hidden-token", DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleLogAsync(CreateLog(fixtureTask, 0, "stdout", "duplicate", DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleLogAsync(CreateLog(fixtureTask, 2, "stdout", "out-of-order", DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleLogAsync(CreateLog(fixtureTask, 1, "stdout", "password=hunter2", DateTimeOffset.UtcNow), CancellationToken.None);
 
         var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
         Assert.Equal(1, history.LastSequence);
@@ -73,16 +74,16 @@ public sealed class DeploymentEventTests
             new AuditWriter(db));
 
         await dispatcher.HandleAcceptedAsync(
-            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CreateAccepted(history, DateTimeOffset.UtcNow),
             CancellationToken.None);
         await dispatcher.HandleLogAsync(
-            new TaskLog(1, fixture.TaskId, fixture.AgentId, 0, "stdout", "pull complete", DateTimeOffset.UtcNow),
+            CreateLog(history, 0, "stdout", "pull complete", DateTimeOffset.UtcNow),
             CancellationToken.None);
         await dispatcher.HandleLogAsync(
-            new TaskLog(1, fixture.TaskId, fixture.AgentId, 1, "stderr", "password=\"hunter 2\"", DateTimeOffset.UtcNow),
+            CreateLog(history, 1, "stderr", "password=\"hunter 2\"", DateTimeOffset.UtcNow),
             CancellationToken.None);
         await dispatcher.HandleCompletedAsync(
-            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 0, null, DateTimeOffset.UtcNow),
+            CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0),
             CancellationToken.None);
 
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
@@ -136,10 +137,10 @@ public sealed class DeploymentEventTests
             new AuditWriter(db));
 
         await dispatcher.HandleAcceptedAsync(
-            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CreateAccepted(history, DateTimeOffset.UtcNow),
             CancellationToken.None);
         await dispatcher.HandleCompletedAsync(
-            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 17, null, DateTimeOffset.UtcNow),
+            CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 17),
             CancellationToken.None);
 
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
@@ -178,10 +179,10 @@ public sealed class DeploymentEventTests
             new AuditWriter(db));
 
         await dispatcher.HandleAcceptedAsync(
-            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CreateAccepted(history, DateTimeOffset.UtcNow),
             CancellationToken.None);
         await dispatcher.HandleCompletedAsync(
-            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, success, exitCode, null, DateTimeOffset.UtcNow),
+            CreateCompleted(history, DateTimeOffset.UtcNow, success, exitCode),
             CancellationToken.None);
 
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
@@ -207,8 +208,8 @@ public sealed class DeploymentEventTests
             new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
             new AuditWriter(db));
 
-        await dispatcher.HandleLogAsync(new TaskLog(1, fixture.TaskId, fixture.AgentId, 0, "stdout", "premature", DateTimeOffset.UtcNow), CancellationToken.None);
-        await dispatcher.HandleCompletedAsync(new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 0, null, DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleLogAsync(CreateLog(history, 0, "stdout", "premature", DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0), CancellationToken.None);
 
         history = await db.ServiceOperationHistories.SingleAsync();
         Assert.Equal("pending", history.TaskStatus);
@@ -235,7 +236,7 @@ public sealed class DeploymentEventTests
             new AuditWriter(db));
 
         await dispatcher.HandleAcceptedAsync(
-            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CreateAccepted(history, DateTimeOffset.UtcNow),
             CancellationToken.None);
 
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
@@ -276,15 +277,94 @@ public sealed class DeploymentEventTests
         Assert.DoesNotContain(await db.AuditLogs.ToListAsync(), audit => audit.Action == AuditActions.TaskFailed);
 
         await dispatcher.HandleAcceptedAsync(
-            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CreateAccepted(history, DateTimeOffset.UtcNow),
             CancellationToken.None);
         await dispatcher.HandleCompletedAsync(
-            new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 0, null, DateTimeOffset.UtcNow),
+            CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0),
             CancellationToken.None);
 
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
         Assert.Equal("success", history.TaskStatus);
         Assert.Equal(0, history.ExitCode);
+    }
+
+    [Fact]
+    public async Task UnknownDispatchExpiresToARecoverableErrorAndMatchingLateReportsComplete()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+        await db.GlobalGitSettings.AddAsync(new GlobalGitSetting
+        {
+            Id = 1,
+            GitRepo = "https://git.example/repository.git",
+            GitUserName = "git-user",
+            AccessTokenEncrypted = protector.Protect("git-token", "git-key-v1"),
+            TokenKeyId = "git-key-v1"
+        });
+        await db.SaveChangesAsync();
+
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new ThrowingTransport(),
+            protector,
+            new AuditWriter(db));
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+        var attempted = await db.ServiceOperationHistories.SingleAsync();
+        attempted.DispatchAttemptAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        await db.SaveChangesAsync();
+
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
+
+        var uncertain = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", uncertain.TaskStatus);
+        Assert.Equal("agent_dispatch_unknown", uncertain.ErrorCode);
+
+        var acceptedAt = DateTimeOffset.UtcNow;
+        await dispatcher.HandleAcceptedAsync(CreateAccepted(uncertain, acceptedAt), CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(
+            CreateCompleted(uncertain, acceptedAt.AddSeconds(1), success: true, exitCode: 0),
+            CancellationToken.None);
+
+        var completed = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("success", completed.TaskStatus);
+        Assert.Equal(0, completed.ExitCode);
+    }
+
+    [Fact]
+    public async Task TaskReportsWithAMismatchedDispatchFingerprintAreIgnored()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchedAt = DateTimeOffset.UtcNow;
+        history.DispatchAttemptAt = history.DispatchedAt;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        var accepted = CreateAccepted(history, DateTimeOffset.UtcNow) with
+        {
+            DispatchFingerprint = new string('0', 64)
+        };
+
+        await dispatcher.HandleAcceptedAsync(accepted, CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Null(history.AcceptedAt);
+        Assert.Null(history.StartTime);
     }
 
     [Fact]
@@ -670,17 +750,15 @@ public sealed class DeploymentEventTests
             new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
             new AuditWriter(db));
         await dispatcher.HandleAcceptedAsync(
-            new TaskAccepted(1, fixture.TaskId, fixture.AgentId, DateTimeOffset.UtcNow),
+            CreateAccepted(history, DateTimeOffset.UtcNow),
             CancellationToken.None);
 
         var line = new string('x', DeploymentLogSanitizer.MaxLineBytes);
         for (var index = 0; index < 100; index++)
         {
             await dispatcher.HandleLogAsync(
-                new TaskLog(
-                    1,
-                    fixture.TaskId,
-                    fixture.AgentId,
+                CreateLog(
+                    history,
                     index,
                     index % 2 == 0 ? "stdout" : "stderr",
                     line,
@@ -788,6 +866,65 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AcceptedTaskCannotBeOverwrittenByConcurrentOfflineFailure()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-dispatch-accepted-offline-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        try
+        {
+            var options = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            await using (var seedDb = new StackPivotDbContext(options))
+            {
+                await seedDb.Database.EnsureCreatedAsync();
+                await SeedAsync(seedDb);
+            }
+
+            var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            await using (var dispatchDb = new StackPivotDbContext(options))
+            {
+                var transport = new CallbackTransport(async (agentId, cancellationToken) =>
+                {
+                    await using var acceptedDb = new StackPivotDbContext(options);
+                    var history = await acceptedDb.ServiceOperationHistories.SingleAsync(
+                        value => value.AgentId == agentId,
+                        cancellationToken);
+                    var acceptedDispatcher = new DeploymentDispatcher(
+                        acceptedDb,
+                        new OfflineTransport(),
+                        protector,
+                        new AuditWriter(acceptedDb));
+                    await acceptedDispatcher.HandleAcceptedAsync(
+                        CreateAccepted(history, DateTimeOffset.UtcNow),
+                        cancellationToken);
+                });
+                var dispatcher = new DeploymentDispatcher(
+                    dispatchDb,
+                    transport,
+                    protector,
+                    new AuditWriter(dispatchDb));
+
+                await dispatcher.DispatchPendingAsync(CancellationToken.None);
+            }
+
+            await using var verifyDb = new StackPivotDbContext(options);
+            var persisted = await verifyDb.ServiceOperationHistories.SingleAsync();
+            Assert.Equal("pending", persisted.TaskStatus);
+            Assert.Null(persisted.ErrorCode);
+            Assert.NotNull(persisted.AcceptedAt);
+            Assert.NotNull(persisted.StartTime);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    [Fact]
     public async Task DispatchedTaskWithoutAcceptanceExpiresAndIsNotSentAgain()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -850,6 +987,37 @@ public sealed class DeploymentEventTests
         Assert.Equal("failed", history.TaskStatus);
         Assert.Equal("agent_execution_timeout", history.ErrorCode);
         Assert.Equal(fixture.AgentId, history.AgentId);
+    }
+
+    [Fact]
+    public async Task AcceptedTaskCanCompleteAfterDispatchLifetimeBeforeExecutionTimeout()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var dispatchStartedAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchAttemptAt = dispatchStartedAt;
+        history.DispatchedAt = dispatchStartedAt;
+        history.AcceptedAt = dispatchStartedAt.AddMinutes(1);
+        history.StartTime = history.AcceptedAt;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleCompletedAsync(
+            CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("success", history.TaskStatus);
+        Assert.Equal(0, history.ExitCode);
     }
 
     [Fact]
@@ -973,7 +1141,7 @@ public sealed class DeploymentEventTests
                     new AuditWriter(disconnectDb));
 
                 var completion = completionDispatcher.HandleCompletedAsync(
-                    new TaskCompleted(1, fixture.TaskId, fixture.AgentId, true, 0, null, DateTimeOffset.UtcNow),
+                    CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0),
                     CancellationToken.None);
                 await barrier.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 await disconnectDispatcher.HandleAgentDisconnectedAsync(fixture.AgentId, CancellationToken.None);
@@ -1023,6 +1191,79 @@ public sealed class DeploymentEventTests
 
     private sealed record Fixture(Guid TaskId, Guid AgentId);
 
+    private static TaskAccepted CreateAccepted(ServiceOperationHistory history, DateTimeOffset acceptedAt)
+    {
+        var dispatchStartedAt = history.DispatchAttemptAt ?? history.DispatchedAt
+            ?? throw new InvalidOperationException("Expected a dispatch timestamp.");
+        var dispatchExpiresAt = dispatchStartedAt.AddMinutes(5);
+        return new TaskAccepted(
+            ProtocolVersion.Current,
+            history.TaskId,
+            history.AgentId,
+            acceptedAt,
+            DispatchFingerprint.Compute(
+                history.TaskId,
+                history.RequestId,
+                history.StackId,
+                history.AgentId,
+                history.GitRepoSnapshot!,
+                history.GitUserNameSnapshot!,
+                history.TargetCommitHash,
+                history.StackGitRelativePathSnapshot!,
+                history.AgentStackLocalPathSnapshot!,
+                dispatchExpiresAt),
+            history.TargetCommitHash,
+            history.StackGitRelativePathSnapshot!,
+            history.AgentStackLocalPathSnapshot!,
+            dispatchExpiresAt);
+    }
+
+    private static TaskCompleted CreateCompleted(
+        ServiceOperationHistory history,
+        DateTimeOffset finishedAt,
+        bool success,
+        int exitCode)
+    {
+        var accepted = CreateAccepted(history, history.StartTime ?? finishedAt);
+        return new TaskCompleted(
+            ProtocolVersion.Current,
+            history.TaskId,
+            history.AgentId,
+            success,
+            exitCode,
+            null,
+            finishedAt,
+            false,
+            accepted.DispatchFingerprint,
+            accepted.TargetCommitHash,
+            accepted.StackGitRelativePath,
+            accepted.AgentStackLocalPath,
+            accepted.DispatchExpiresAt);
+    }
+
+    private static TaskLog CreateLog(
+        ServiceOperationHistory history,
+        long sequence,
+        string stream,
+        string line,
+        DateTimeOffset emittedAt)
+    {
+        var accepted = CreateAccepted(history, emittedAt);
+        return new TaskLog(
+            ProtocolVersion.Current,
+            history.TaskId,
+            history.AgentId,
+            sequence,
+            stream,
+            line,
+            emittedAt,
+            accepted.DispatchFingerprint,
+            accepted.TargetCommitHash,
+            accepted.StackGitRelativePath,
+            accepted.AgentStackLocalPath,
+            accepted.DispatchExpiresAt);
+    }
+
     private sealed class OfflineTransport : IAgentTransport
     {
         public Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken) => Task.FromResult(false);
@@ -1046,6 +1287,19 @@ public sealed class DeploymentEventTests
             SendAttempts++;
             throw new AgentOfflineException();
         }
+    }
+
+    private sealed class CallbackTransport(
+        Func<Guid, CancellationToken, Task> onConnected) : IAgentTransport
+    {
+        public async Task<bool> IsConnectedAsync(Guid agentId, CancellationToken cancellationToken)
+        {
+            await onConnected(agentId, cancellationToken);
+            return false;
+        }
+
+        public Task SendDeployAsync(DeployStackCommand command, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException();
     }
 
     private sealed class RecordingTransport : IAgentTransport

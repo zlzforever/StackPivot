@@ -1,3 +1,7 @@
+using System.Buffers.Binary;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using StackPivot.Contracts.Deployments;
@@ -74,7 +78,8 @@ public static class ProtocolJson
             targetCommitHash = command.TargetCommitHash,
             stackGitRelativePath = command.StackGitRelativePath,
             agentStackLocalPath = command.AgentStackLocalPath,
-            expiresAt = command.ExpiresAt
+            expiresAt = command.ExpiresAt,
+            dispatchFingerprint = command.DispatchFingerprint
         };
 
         return JsonSerializer.Serialize(safe, Options);
@@ -90,6 +95,86 @@ public static class ProtocolJson
         };
         options.Converters.Add(new DeploymentModeJsonConverter());
         return options;
+    }
+}
+
+public static class DispatchFingerprint
+{
+    public static string Compute(DeployStackCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        return Compute(
+            command.TaskId,
+            command.RequestId,
+            command.StackId,
+            command.AgentId,
+            command.GitRepo,
+            command.GitUserName,
+            command.TargetCommitHash,
+            command.StackGitRelativePath,
+            command.AgentStackLocalPath,
+            command.ExpiresAt);
+    }
+
+    public static string Compute(
+        Guid taskId,
+        Guid requestId,
+        Guid stackId,
+        Guid agentId,
+        string gitRepo,
+        string gitUserName,
+        string targetCommitHash,
+        string stackGitRelativePath,
+        string agentStackLocalPath,
+        DateTimeOffset expiresAt)
+    {
+        var values = new[]
+        {
+            ProtocolVersion.Current.ToString(CultureInfo.InvariantCulture),
+            taskId.ToString("D"),
+            requestId.ToString("D"),
+            stackId.ToString("D"),
+            agentId.ToString("D"),
+            gitRepo,
+            gitUserName,
+            targetCommitHash,
+            stackGitRelativePath,
+            agentStackLocalPath,
+            expiresAt.UtcDateTime.Ticks.ToString(CultureInfo.InvariantCulture)
+        };
+
+        using var payload = new MemoryStream();
+        Span<byte> length = stackalloc byte[sizeof(int)];
+        foreach (var value in values)
+        {
+            var bytes = Encoding.UTF8.GetBytes(value ?? string.Empty);
+            BinaryPrimitives.WriteInt32LittleEndian(length, bytes.Length);
+            payload.Write(length);
+            payload.Write(bytes);
+        }
+
+        return Convert.ToHexString(SHA256.HashData(payload.ToArray())).ToLowerInvariant();
+    }
+
+    public static bool Matches(DeployStackCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        return Matches(
+            command.DispatchFingerprint,
+            Compute(command));
+    }
+
+    public static bool Matches(string? actual, string expected)
+    {
+        if (string.IsNullOrWhiteSpace(actual)
+            || actual.Length != expected.Length)
+        {
+            return false;
+        }
+
+        return CryptographicOperations.FixedTimeEquals(
+            Encoding.ASCII.GetBytes(actual),
+            Encoding.ASCII.GetBytes(expected));
     }
 }
 

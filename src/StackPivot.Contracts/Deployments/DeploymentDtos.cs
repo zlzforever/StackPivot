@@ -30,7 +30,8 @@ public sealed record DeployStackCommand(
     [property: JsonPropertyName("targetCommitHash")] string TargetCommitHash,
     [property: JsonPropertyName("stackGitRelativePath")] string StackGitRelativePath,
     [property: JsonPropertyName("agentStackLocalPath")] string AgentStackLocalPath,
-    [property: JsonPropertyName("expiresAt")] DateTimeOffset ExpiresAt) : IProtocolMessage
+    [property: JsonPropertyName("expiresAt")] DateTimeOffset ExpiresAt,
+    [property: JsonPropertyName("dispatchFingerprint")] string DispatchFingerprint = "") : IProtocolMessage
 {
     public void ClearAccessToken()
     {

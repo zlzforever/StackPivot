@@ -63,10 +63,17 @@ public sealed class AgentTaskCoordinator
 
         try
         {
+            ProtocolValidation.EnsureSchemaVersion(command.SchemaVersion);
+            if (command.ExpiresAt <= DateTimeOffset.UtcNow
+                || !DispatchFingerprint.Matches(command))
+            {
+                return;
+            }
+
             if (TryGetCompleted(command.TaskId, out var completed))
             {
                 await reporter.ReportAcceptedAsync(
-                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    CreateAccepted(command, DateTimeOffset.UtcNow),
                     cancellationToken);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, completed), cancellationToken);
                 return;
@@ -95,7 +102,7 @@ public sealed class AgentTaskCoordinator
             {
                 var failure = new AgentExecutionResult(false, -1, string.Empty, false, "platform_unsupported");
                 await reporter.ReportAcceptedAsync(
-                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    CreateAccepted(command, DateTimeOffset.UtcNow),
                     cancellationToken);
                 CacheCompleted(command.TaskId, failure);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
@@ -107,7 +114,7 @@ public sealed class AgentTaskCoordinator
             {
                 var failure = new AgentExecutionResult(false, -1, string.Empty, false, lockResult.ErrorCode);
                 await reporter.ReportAcceptedAsync(
-                    new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                    CreateAccepted(command, DateTimeOffset.UtcNow),
                     cancellationToken);
                 CacheCompleted(command.TaskId, failure);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
@@ -116,7 +123,7 @@ public sealed class AgentTaskCoordinator
 
             await using var stackLease = lockResult.Lease!;
             await reporter.ReportAcceptedAsync(
-                new TaskAccepted(ProtocolVersion.Current, command.TaskId, agentId, DateTimeOffset.UtcNow),
+                CreateAccepted(command, DateTimeOffset.UtcNow),
                 cancellationToken);
 
             AgentExecutionResult result;
@@ -166,14 +173,7 @@ public sealed class AgentTaskCoordinator
                     try
                     {
                         await reporter.ReportLogAsync(
-                            new TaskLog(
-                                ProtocolVersion.Current,
-                                command.TaskId,
-                                agentId,
-                                sequence++,
-                                entry.Stream,
-                                entry.Line,
-                                DateTimeOffset.UtcNow),
+                            CreateLog(command, sequence++, entry.Stream, entry.Line, DateTimeOffset.UtcNow),
                             cancellationToken);
                     }
                     finally
@@ -188,14 +188,7 @@ public sealed class AgentTaskCoordinator
         foreach (var line in result.OutputLog.Split('\n', StringSplitOptions.None))
         {
             await reporter.ReportLogAsync(
-                new TaskLog(
-                    ProtocolVersion.Current,
-                    command.TaskId,
-                    agentId,
-                    sequence++,
-                    "stdout",
-                    line,
-                    DateTimeOffset.UtcNow),
+                CreateLog(command, sequence++, "stdout", line, DateTimeOffset.UtcNow),
                 cancellationToken);
         }
 
@@ -232,8 +225,45 @@ public sealed class AgentTaskCoordinator
             result.ExitCode,
             result.ErrorCode,
             DateTimeOffset.UtcNow,
-            result.LogTruncated);
+            result.LogTruncated,
+            command.DispatchFingerprint,
+            command.TargetCommitHash,
+            command.StackGitRelativePath,
+            command.AgentStackLocalPath,
+            command.ExpiresAt);
     }
+
+    private static TaskAccepted CreateAccepted(DeployStackCommand command, DateTimeOffset acceptedAt) =>
+        new(
+            ProtocolVersion.Current,
+            command.TaskId,
+            command.AgentId,
+            acceptedAt,
+            command.DispatchFingerprint,
+            command.TargetCommitHash,
+            command.StackGitRelativePath,
+            command.AgentStackLocalPath,
+            command.ExpiresAt);
+
+    private static TaskLog CreateLog(
+        DeployStackCommand command,
+        long sequence,
+        string stream,
+        string line,
+        DateTimeOffset emittedAt) =>
+        new(
+            ProtocolVersion.Current,
+            command.TaskId,
+            command.AgentId,
+            sequence,
+            stream,
+            line,
+            emittedAt,
+            command.DispatchFingerprint,
+            command.TargetCommitHash,
+            command.StackGitRelativePath,
+            command.AgentStackLocalPath,
+            command.ExpiresAt);
 
     private bool TryGetCompleted(Guid taskId, out AgentExecutionResult result)
     {

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text;
 using System.Security.Cryptography;
 using StackPivot.Agent.Security;
@@ -125,7 +126,13 @@ public static class GitTreePolicy
 public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 {
     private static readonly string[] InitArguments = ["init", "--bare"];
-    private static readonly JsonSerializerOptions MetadataJsonOptions = new();
+    private const int MaxCheckoutMetadataBytes = 1024 * 1024;
+    private const int MaxCheckoutMetadataEntries = 4096;
+    private const int MaxCheckoutMetadataPathBytes = 4096;
+    private static readonly JsonSerializerOptions MetadataJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+    };
     private readonly IProcessRunner processRunner;
     private readonly PathPolicy pathPolicy;
     private readonly TimeSpan timeout;
@@ -404,7 +411,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 IReadOnlyList<string> oldFiles;
                 try
                 {
-                    oldFiles = ReadPreviousFiles(repositoryHandle);
+                    oldFiles = ReadPreviousFiles(repositoryHandle, input.StackGitRelativePath);
                     foreach (var file in files)
                     {
                         directoryHandle.ValidateManagedFilePath(file);
@@ -484,25 +491,88 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             cancellationToken);
     }
 
-    private static IReadOnlyList<string> ReadPreviousFiles(SafeDirectoryHandle gitDirectory)
+    private static IReadOnlyList<string> ReadPreviousFiles(
+        SafeDirectoryHandle gitDirectory,
+        string expectedStackPath)
     {
         try
         {
             using var file = gitDirectory.OpenFile("stackpivot-checkout.json", FileMode.Open, FileAccess.Read);
-            using var reader = new StreamReader(file, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            var json = ReadMetadataJson(file);
             try
             {
-                var metadata = JsonSerializer.Deserialize<CheckoutMetadata>(reader.ReadToEnd());
-                return metadata?.Files ?? Array.Empty<string>();
+                var metadata = JsonSerializer.Deserialize<CheckoutMetadata>(json, MetadataJsonOptions);
+                if (metadata is null
+                    || string.IsNullOrWhiteSpace(metadata.Commit)
+                    || metadata.Commit.Length > 64
+                    || string.IsNullOrWhiteSpace(metadata.Path)
+                    || metadata.Path.Length > 200
+                    || !string.Equals(metadata.Path, expectedStackPath, StringComparison.Ordinal)
+                    || metadata.Files is null
+                    || metadata.Files.Count > MaxCheckoutMetadataEntries)
+                {
+                    throw new PathPolicyException("Checkout metadata is incomplete or exceeds its limits.");
+                }
+
+                var files = new List<string>(metadata.Files.Count);
+                var uniqueFiles = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var path in metadata.Files)
+                {
+                    if (string.IsNullOrWhiteSpace(path)
+                        || Encoding.UTF8.GetByteCount(path) > MaxCheckoutMetadataPathBytes
+                        || !uniqueFiles.Add(path))
+                    {
+                        throw new PathPolicyException("Checkout metadata contains an invalid file entry.");
+                    }
+
+                    files.Add(path);
+                }
+
+                return files;
             }
-            catch (JsonException)
+            catch (JsonException exception)
             {
-                return Array.Empty<string>();
+                throw new PathPolicyException("Checkout metadata is incomplete or invalid.", exception);
             }
         }
         catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
         {
             return Array.Empty<string>();
+        }
+    }
+
+    private static string ReadMetadataJson(FileStream file)
+    {
+        if (file.Length < 0 || file.Length > MaxCheckoutMetadataBytes)
+        {
+            throw new PathPolicyException("Checkout metadata exceeds its size limit.");
+        }
+
+        var buffer = new byte[MaxCheckoutMetadataBytes + 1];
+        var total = 0;
+        while (true)
+        {
+            var read = file.Read(buffer, total, buffer.Length - total);
+            if (read == 0)
+            {
+                break;
+            }
+
+            total += read;
+            if (total > MaxCheckoutMetadataBytes)
+            {
+                throw new PathPolicyException("Checkout metadata exceeds its size limit.");
+            }
+        }
+
+        try
+        {
+            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                .GetString(buffer, 0, total);
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new PathPolicyException("Checkout metadata is not valid UTF-8.", exception);
         }
     }
 

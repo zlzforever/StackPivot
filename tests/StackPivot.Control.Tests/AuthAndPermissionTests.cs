@@ -34,6 +34,16 @@ public sealed class AuthAndPermissionTests
     }
 
     [Fact]
+    public void AgentCredentialsRejectAnApiKeyMixedWithTheSsoCookie()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Headers[AgentApiKeyDefaults.HeaderName] = "agent-api-key";
+        context.Request.Headers.Cookie = SsoAuthenticationDefaults.CookieName + "=sso-session";
+
+        Assert.True(AgentApiKeyDefaults.HasMixedCredentials(context.Request));
+    }
+
+    [Fact]
     public void SsoAdapterRequiresSubAndMapsNameAndRoles()
     {
         var context = new DefaultHttpContext

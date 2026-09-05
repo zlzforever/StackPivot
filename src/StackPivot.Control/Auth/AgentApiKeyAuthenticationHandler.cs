@@ -17,6 +17,14 @@ public static class AgentApiKeyDefaults
 {
     public const string AuthenticationScheme = "AgentApiKey";
     public const string HeaderName = "X-Agent-Api-Key";
+
+    public static bool HasMixedCredentials(HttpRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return request.Headers.TryGetValue(HeaderName, out var header)
+            && !string.IsNullOrWhiteSpace(header.ToString())
+            && request.Cookies.ContainsKey(SsoAuthenticationDefaults.CookieName);
+    }
 }
 
 public sealed record AgentApiKeyIssue(
@@ -325,8 +333,14 @@ public sealed class AgentApiKeyAuthenticationHandler(
 {
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
     {
-        if (!Request.Headers.TryGetValue(AgentApiKeyDefaults.HeaderName, out var header)
-            || string.IsNullOrWhiteSpace(header.ToString()))
+        var hasApiKey = Request.Headers.TryGetValue(AgentApiKeyDefaults.HeaderName, out var header)
+            && !string.IsNullOrWhiteSpace(header.ToString());
+        if (AgentApiKeyDefaults.HasMixedCredentials(Request))
+        {
+            return AuthenticateResult.Fail("Mixed agent API key and SSO credentials are not allowed.");
+        }
+
+        if (!hasApiKey)
         {
             return AuthenticateResult.NoResult();
         }

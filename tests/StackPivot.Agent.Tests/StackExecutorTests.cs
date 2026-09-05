@@ -47,6 +47,7 @@ public sealed class StackExecutorTests
                 "workspace_one/stack_web",
                 Path.Combine(root, "workspace_one", "stack_web"),
                 DateTimeOffset.UtcNow.AddMinutes(5));
+            command = command with { DispatchFingerprint = DispatchFingerprint.Compute(command) };
 
             var result = await executor.ExecuteAsync(command, CancellationToken.None);
 
@@ -92,6 +93,7 @@ public sealed class StackExecutorTests
                 "workspace_one/stack_web",
                 null!,
                 DateTimeOffset.UtcNow.AddMinutes(5));
+            command = command with { DispatchFingerprint = DispatchFingerprint.Compute(command) };
 
             var result = await executor.ExecuteAsync(command, CancellationToken.None);
 
@@ -132,6 +134,7 @@ public sealed class StackExecutorTests
                 "workspace_one/stack_web",
                 Path.Combine(root, "workspace_one", "stack_web"),
                 DateTimeOffset.UtcNow.AddMinutes(5));
+            command = command with { DispatchFingerprint = DispatchFingerprint.Compute(command) };
 
             var result = await executor.ExecuteAsync(command, CancellationToken.None);
 

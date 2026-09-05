@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using StackPivot.Agent.Security;
 using Xunit;
 
@@ -119,6 +120,34 @@ public sealed class PathPolicyTests
     }
 
     [SkippableFact]
+    public async Task OpenFileRejectsAFifoWithoutOpeningItForIo()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-path-fifo-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        var fifoPath = Path.Combine(stackPath, "fifo");
+
+        try
+        {
+            Assert.Equal(0, mkfifo(fifoPath, 0x180u));
+            var policy = new PathPolicy(root);
+            await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+
+            Assert.Throws<PathPolicyException>(() =>
+                safePath.DirectoryHandle!.OpenFile("fifo", FileMode.Open, FileAccess.Read));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task OpenStackPathKeepsFileOperationsInsideTheOpenedDirectoryAfterReplacement()
     {
         TestPlatform.RequireLinux();
@@ -187,4 +216,9 @@ public sealed class PathPolicyTests
             }
         }
     }
+
+#pragma warning disable CA2101
+    [DllImport("libc", EntryPoint = "mkfifo", SetLastError = true, CharSet = CharSet.Ansi)]
+    private static extern int mkfifo([MarshalAs(UnmanagedType.LPStr)] string path, uint mode);
+#pragma warning restore CA2101
 }

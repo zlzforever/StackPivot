@@ -15,6 +15,7 @@ public static class SsoAuthenticationDefaults
 {
     public const string Scheme = "sso";
     public const string CookieScheme = "sso-session";
+    public const string CookieName = "StackPivot.SsoSession";
 }
 
 public interface ISsoIdentityAdapter

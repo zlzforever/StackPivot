@@ -232,7 +232,7 @@ public sealed class AgentTaskCoordinatorLockTests
 
     private static DeployStackCommand CreateCommand(string stackPath)
     {
-        return new DeployStackCommand(
+        var command = new DeployStackCommand(
             ProtocolVersion.Current,
             Guid.NewGuid(),
             Guid.NewGuid(),
@@ -245,6 +245,7 @@ public sealed class AgentTaskCoordinatorLockTests
             "workspace_one/stack_web",
             stackPath,
             DateTimeOffset.UtcNow.AddMinutes(5));
+        return command with { DispatchFingerprint = DispatchFingerprint.Compute(command) };
     }
 
     private static void DeleteDirectory(string path)

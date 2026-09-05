@@ -377,6 +377,48 @@ public sealed class GitTreePolicyTests
     }
 
     [SkippableFact]
+    public async Task OversizedCheckoutMetadataFailsClosedBeforeReadTree()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-metadata-size-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var gitPath = Path.Combine(stackPath, ".git");
+        Directory.CreateDirectory(gitPath);
+        File.WriteAllText(
+            Path.Combine(gitPath, "stackpivot-checkout.json"),
+            "{\"commit\":\"old\",\"path\":\"workspace_one/stack_web\",\"files\":[\""
+                + new string('x', 2 * 1024 * 1024)
+                + "\"]}");
+        var runner = new MaterializationRunner();
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("invalid_path", result.ErrorCode);
+            Assert.DoesNotContain(runner.Requests, request => request.Arguments.Contains("read-tree"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task MaterializationWritesThroughTheOpenedDirectoryAfterThePathIsReplaced()
     {
         TestPlatform.RequireLinux();

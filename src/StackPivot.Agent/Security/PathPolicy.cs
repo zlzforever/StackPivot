@@ -531,6 +531,7 @@ internal static class LinuxPathOperations
     private const int OpenCloseOnExec = 0x80000;
     private const int OpenAppend = 0x400;
     private const int OpenNonBlock = 0x800;
+    private const int OpenPath = 0x200000;
     private const int AtEmptyPath = 0x1000;
     private const uint StatxMode = 0x00000002;
     private const uint StatxBasicStats = 0x000007ff;
@@ -667,24 +668,11 @@ internal static class LinuxPathOperations
                 currentFileDescriptor = GetFileDescriptor(current);
             }
 
-            var flags = GetFileFlags(mode, access);
-            var fileDescriptor = openat(currentFileDescriptor, segments[^1], flags, FileMode);
-            if (fileDescriptor < 0)
-            {
-                throw CreateNativeException("Unable to open a managed file.", Marshal.GetLastWin32Error());
-            }
-
-            var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
-            try
-            {
-                EnsureRegularFile(fileDescriptor);
-                return fileHandle;
-            }
-            catch
-            {
-                fileHandle.Dispose();
-                throw;
-            }
+            return OpenRegularFileAt(
+                currentFileDescriptor,
+                segments[^1],
+                mode,
+                access);
         }
         finally
         {
@@ -694,29 +682,11 @@ internal static class LinuxPathOperations
 
     internal static SafeFileHandle OpenRegularFileAt(int parentFileDescriptor, string name)
     {
-        ValidateSingleSegment(name, allowGitDirectory: false);
-        var fileDescriptor = openat(
+        return OpenRegularFileAt(
             parentFileDescriptor,
             name,
-            OpenReadOnly | OpenNoFollow | OpenCloseOnExec | OpenNonBlock,
-            0);
-        if (fileDescriptor < 0)
-        {
-            throw CreateNativeException("Unable to open a managed regular file.", Marshal.GetLastWin32Error());
-        }
-
-        var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
-        try
-        {
-            EnsureRegularFile(fileDescriptor);
-
-            return fileHandle;
-        }
-        catch
-        {
-            fileHandle.Dispose();
-            throw;
-        }
+            System.IO.FileMode.Open,
+            System.IO.FileAccess.Read);
     }
 
     internal static void ValidateManagedPath(string absoluteRoot, IReadOnlyList<string> segments)
@@ -743,7 +713,7 @@ internal static class LinuxPathOperations
                     currentFileDescriptor,
                     segments[index],
                     isFinal
-                        ? OpenReadOnly | OpenNoFollow | OpenCloseOnExec | OpenNonBlock
+                        ? OpenPath | OpenNoFollow | OpenCloseOnExec
                         : OpenReadOnly | OpenDirectory | OpenNoFollow | OpenCloseOnExec,
                     0);
                 if (fileDescriptor < 0)
@@ -826,21 +796,14 @@ internal static class LinuxPathOperations
             throw new PathPolicyException("Lock file path must contain one segment.");
         }
 
-        var fileDescriptor = openat(
+        var fileHandle = OpenRegularFileAt(
             parentFileDescriptor,
             segments[0],
-            OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec | OpenNonBlock,
-            FileMode);
-        if (fileDescriptor < 0)
-        {
-            throw CreateNativeException("Unable to open a deployment lock file.", Marshal.GetLastWin32Error());
-        }
-
-        var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+            System.IO.FileMode.OpenOrCreate,
+            System.IO.FileAccess.ReadWrite);
         try
         {
-            EnsureRegularFile(fileDescriptor);
-            if (flock(fileDescriptor, LockExclusive | LockNonBlocking) < 0)
+            if (flock(GetFileDescriptor(fileHandle), LockExclusive | LockNonBlocking) < 0)
             {
                 throw CreateNativeException("Unable to acquire a deployment lock file.", Marshal.GetLastWin32Error());
             }
@@ -950,6 +913,114 @@ internal static class LinuxPathOperations
             _ => throw new ArgumentOutOfRangeException(nameof(mode))
         };
         return flags;
+    }
+
+    private static SafeFileHandle OpenRegularFileAt(
+        int parentFileDescriptor,
+        string name,
+        System.IO.FileMode mode,
+        System.IO.FileAccess access)
+    {
+        ValidateSingleSegment(name, allowGitDirectory: false);
+        var flags = GetFileFlags(mode, access);
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            using var pathHandle = TryOpenPathAt(parentFileDescriptor, name);
+            if (pathHandle is not null)
+            {
+                EnsureRegularFile(GetFileDescriptor(pathHandle));
+                if (mode == System.IO.FileMode.CreateNew)
+                {
+                    throw CreateNativeException("Unable to create a managed file.", EntryExists);
+                }
+
+                return OpenThroughPathHandle(pathHandle, flags);
+            }
+
+            if (mode is not (System.IO.FileMode.CreateNew
+                or System.IO.FileMode.Create
+                or System.IO.FileMode.OpenOrCreate
+                or System.IO.FileMode.Append))
+            {
+                throw CreateNativeException("Unable to open a managed file.", EntryNotFound);
+            }
+
+            var fileDescriptor = openat(
+                parentFileDescriptor,
+                name,
+                flags | OpenExclusive,
+                FileMode);
+            if (fileDescriptor >= 0)
+            {
+                var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+                try
+                {
+                    EnsureRegularFile(fileDescriptor);
+                    return fileHandle;
+                }
+                catch
+                {
+                    fileHandle.Dispose();
+                    throw;
+                }
+            }
+
+            var error = Marshal.GetLastWin32Error();
+            if (error != EntryExists || attempt == 1)
+            {
+                throw CreateNativeException("Unable to open a managed file.", error);
+            }
+        }
+
+        throw new PathPolicyException("Unable to open a managed file safely.");
+    }
+
+    private static SafeFileHandle? TryOpenPathAt(int parentFileDescriptor, string name)
+    {
+        var fileDescriptor = openat(
+            parentFileDescriptor,
+            name,
+            OpenPath | OpenNoFollow | OpenCloseOnExec,
+            0);
+        if (fileDescriptor >= 0)
+        {
+            return new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+        }
+
+        var error = Marshal.GetLastWin32Error();
+        if (error == EntryNotFound)
+        {
+            return null;
+        }
+
+        throw CreateNativeException("Unable to inspect a managed file.", error);
+    }
+
+    private static SafeFileHandle OpenThroughPathHandle(
+        SafeFileHandle pathHandle,
+        int flags)
+    {
+        var fileDescriptor = openat(
+            AtCurrentWorkingDirectory,
+            $"/proc/self/fd/{GetFileDescriptor(pathHandle)}",
+            flags & ~OpenNoFollow,
+            FileMode);
+        if (fileDescriptor < 0)
+        {
+            throw CreateNativeException("Unable to open a managed regular file.", Marshal.GetLastWin32Error());
+        }
+
+        var fileHandle = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
+        try
+        {
+            EnsureRegularFile(fileDescriptor);
+            return fileHandle;
+        }
+        catch
+        {
+            fileHandle.Dispose();
+            throw;
+        }
     }
 
     private static int GetFileDescriptor(SafeFileHandle handle)

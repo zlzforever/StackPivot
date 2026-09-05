@@ -113,7 +113,7 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
             budget.StartDirectory();
         }
 
-        foreach (var name in source.EnumerateEntryNames(MaxSnapshotFileCount + 1))
+        foreach (var name in source.EnumerateEntryNames(MaxSnapshotEntryCount + 1))
         {
             cancellationToken.ThrowIfCancellationRequested();
             budget.StartEntry();

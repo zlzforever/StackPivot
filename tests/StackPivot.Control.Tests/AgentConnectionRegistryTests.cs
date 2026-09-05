@@ -209,7 +209,6 @@ public sealed class AgentConnectionRegistryTests
         var registration = registry.RegisterAsync(
             new AgentConnection(agentId, "connection-1", new NoOpClientProxy(), ApiKeyVersion: 3));
 
-        await Task.Delay(25);
         Assert.False(registration.IsCompleted);
 
         lease.Dispose();

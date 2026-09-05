@@ -35,7 +35,12 @@ public sealed record TaskAccepted(
     [property: JsonPropertyName("schemaVersion")] int SchemaVersion,
     [property: JsonPropertyName("taskId")] Guid TaskId,
     [property: JsonPropertyName("agentId")] Guid AgentId,
-    [property: JsonPropertyName("acceptedAt")] DateTimeOffset AcceptedAt) : IProtocolMessage;
+    [property: JsonPropertyName("acceptedAt")] DateTimeOffset AcceptedAt,
+    [property: JsonPropertyName("dispatchFingerprint")] string DispatchFingerprint = "",
+    [property: JsonPropertyName("targetCommitHash")] string TargetCommitHash = "",
+    [property: JsonPropertyName("stackGitRelativePath")] string StackGitRelativePath = "",
+    [property: JsonPropertyName("agentStackLocalPath")] string AgentStackLocalPath = "",
+    [property: JsonPropertyName("dispatchExpiresAt")] DateTimeOffset? DispatchExpiresAt = null) : IProtocolMessage;
 
 public sealed record TaskLog(
     [property: JsonPropertyName("schemaVersion")] int SchemaVersion,
@@ -44,7 +49,12 @@ public sealed record TaskLog(
     [property: JsonPropertyName("sequence")] long Sequence,
     [property: JsonPropertyName("stream")] string Stream,
     [property: JsonPropertyName("line")] string Line,
-    [property: JsonPropertyName("emittedAt")] DateTimeOffset EmittedAt) : IProtocolMessage;
+    [property: JsonPropertyName("emittedAt")] DateTimeOffset EmittedAt,
+    [property: JsonPropertyName("dispatchFingerprint")] string DispatchFingerprint = "",
+    [property: JsonPropertyName("targetCommitHash")] string TargetCommitHash = "",
+    [property: JsonPropertyName("stackGitRelativePath")] string StackGitRelativePath = "",
+    [property: JsonPropertyName("agentStackLocalPath")] string AgentStackLocalPath = "",
+    [property: JsonPropertyName("dispatchExpiresAt")] DateTimeOffset? DispatchExpiresAt = null) : IProtocolMessage;
 
 public sealed record TaskCompleted(
     [property: JsonPropertyName("schemaVersion")] int SchemaVersion,
@@ -54,7 +64,12 @@ public sealed record TaskCompleted(
     [property: JsonPropertyName("exitCode")] int? ExitCode,
     [property: JsonPropertyName("errorCode")] string? ErrorCode,
     [property: JsonPropertyName("finishedAt")] DateTimeOffset FinishedAt,
-    [property: JsonPropertyName("logTruncated")] bool LogTruncated = false) : IProtocolMessage;
+    [property: JsonPropertyName("logTruncated")] bool LogTruncated = false,
+    [property: JsonPropertyName("dispatchFingerprint")] string DispatchFingerprint = "",
+    [property: JsonPropertyName("targetCommitHash")] string TargetCommitHash = "",
+    [property: JsonPropertyName("stackGitRelativePath")] string StackGitRelativePath = "",
+    [property: JsonPropertyName("agentStackLocalPath")] string AgentStackLocalPath = "",
+    [property: JsonPropertyName("dispatchExpiresAt")] DateTimeOffset? DispatchExpiresAt = null) : IProtocolMessage;
 
 public sealed record HeartbeatMessage(
     [property: JsonPropertyName("schemaVersion")] int SchemaVersion,

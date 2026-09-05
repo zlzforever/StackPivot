@@ -690,6 +690,44 @@ public sealed class ComposeExecutorTests
     }
 
     [SkippableFact]
+    public async Task ComposeUpRejectsAnEmptyDirectoryFloodBeforeCompose()
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-empty-directory-flood-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(Path.Combine(stackPath, "compose.yaml"), "services:\n  app:\n    image: alpine\n");
+        for (var index = 0; index < 4096; index++)
+        {
+            Directory.CreateDirectory(Path.Combine(stackPath, $"empty_{index:D4}"));
+        }
+
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task ComposeUpPreservesAWatchIncludePatternInThePrivateSnapshot()
     {
         TestPlatform.RequireLinux();

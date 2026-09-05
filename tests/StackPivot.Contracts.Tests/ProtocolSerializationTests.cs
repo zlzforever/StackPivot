@@ -118,4 +118,28 @@ public sealed class ProtocolSerializationTests
         Assert.DoesNotContain("accessToken", snapshot);
         Assert.Contains("targetCommitHash", snapshot);
     }
+
+    [Fact]
+    public void DispatchFingerprintBindsTheNonSecretDispatchSnapshot()
+    {
+        var command = new DeployStackCommand(
+            ProtocolVersion.Current,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            "https://git.example/repository.git",
+            "git-user",
+            "secret-git-token"u8.ToArray(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "workspace_prod/stack_web",
+            "/opt/agent-main/workspace_prod/stack_web",
+            DateTimeOffset.UtcNow.AddMinutes(5));
+
+        var fingerprint = DispatchFingerprint.Compute(command);
+        var changed = command with { TargetCommitHash = "abcdef0123456789abcdef0123456789abcdef01" };
+
+        Assert.Matches("^[0-9a-f]{64}$", fingerprint);
+        Assert.NotEqual(fingerprint, DispatchFingerprint.Compute(changed));
+    }
 }
