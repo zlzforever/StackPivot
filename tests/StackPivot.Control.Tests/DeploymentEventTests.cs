@@ -626,6 +626,54 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task AcceptedReportCommitResultUnknownRemainsRetryableWithoutVerificationContext()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-accepted-commit-no-factory-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            var commitFailure = new CommitFailureInterceptor { Enabled = true };
+            var dispatchOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(commitFailure)
+                .Options;
+            await using (var seedDb = new StackPivotDbContext(baseOptions))
+            {
+                await seedDb.Database.EnsureCreatedAsync();
+                await SeedAsync(seedDb);
+                var history = await seedDb.ServiceOperationHistories.SingleAsync();
+                history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+                history.DispatchedAt = history.DispatchAttemptAt;
+                await seedDb.SaveChangesAsync();
+            }
+
+            await using var db = new StackPivotDbContext(dispatchOptions);
+            var historyForReport = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            var dispatcher = new DeploymentDispatcher(
+                db,
+                new OfflineTransport(),
+                protector,
+                new AuditWriter(db));
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                dispatcher.HandleAcceptedAsync(
+                    CreateAccepted(historyForReport, DateTimeOffset.UtcNow),
+                    CancellationToken.None));
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    [Fact]
     public async Task SuccessfullyDispatchedTaskIsNotSentAgainBeforeAcceptance()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");

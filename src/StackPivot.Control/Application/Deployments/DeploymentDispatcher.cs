@@ -443,27 +443,16 @@ public sealed class DeploymentDispatcher(
         Guid historyId,
         CancellationToken cancellationToken)
     {
+        if (verificationContextFactory is null)
+        {
+            return null;
+        }
+
         try
         {
-            if (verificationContextFactory is not null)
-            {
-                await using var verificationContext = await verificationContextFactory
-                    .CreateDbContextAsync(cancellationToken);
-                return await verificationContext.ServiceOperationHistories
-                    .AsNoTracking()
-                    .Where(value => value.HistoryId == historyId)
-                    .Select(value => new ReportPersistenceState(
-                        value.TaskStatus,
-                        value.AcceptedAt,
-                        value.StartTime,
-                        value.ExitCode,
-                        value.ErrorCode,
-                        value.FinishTime))
-                    .SingleOrDefaultAsync(cancellationToken);
-            }
-
-            dbContext.ChangeTracker.Clear();
-            return await dbContext.ServiceOperationHistories
+            await using var verificationContext = await verificationContextFactory
+                .CreateDbContextAsync(cancellationToken);
+            return await verificationContext.ServiceOperationHistories
                 .AsNoTracking()
                 .Where(value => value.HistoryId == historyId)
                 .Select(value => new ReportPersistenceState(

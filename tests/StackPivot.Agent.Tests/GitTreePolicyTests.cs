@@ -79,6 +79,18 @@ public sealed class GitTreePolicyTests
     }
 
     [Fact]
+    public void CheckoutTreeRejectsAPathEntryOverTheUtf8ByteBudget()
+    {
+        var oversizedName = new string('x', 4097);
+        var tree = "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n"
+            + $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/{oversizedName}.txt";
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("invalid_path", exception.Code);
+    }
+
+    [Fact]
     public void RemoteHostPolicyRejectsAHostOutsideTheConfiguredAllowList()
     {
         Assert.False(CentralRemotePolicy.IsAllowed(
@@ -437,6 +449,51 @@ public sealed class GitTreePolicyTests
                     "0123456789abcdef0123456789abcdef01234567",
                     "workspace_one/stack_web",
                     stackPath),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("invalid_path", result.ErrorCode);
+            Assert.DoesNotContain(runner.Requests, request => request.Arguments.Contains("read-tree"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task OversizedIncomingMetadataFailsClosedBeforeReadTree()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-tree-budget-" + Guid.NewGuid().ToString("N"));
+        var files = Enumerable.Range(0, 4097)
+            .Select(index => $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/file-{index}.txt");
+        var tree = string.Join(
+            '\n',
+            new[]
+            {
+                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml"
+            }.Concat(files));
+        var runner = new MaterializationRunner
+        {
+            TreeResult = new ProcessResult(0, tree, string.Empty)
+        };
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    Path.Combine(root, "workspace_one", "stack_web")),
                 CancellationToken.None);
 
             Assert.False(result.Success);
