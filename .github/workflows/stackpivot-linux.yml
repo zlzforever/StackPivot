@@ -1,0 +1,83 @@
+name: StackPivot Linux CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux tests and Release build
+    runs-on: ubuntu-24.04
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      STACKPIVOT_CI_PLATFORM: linux
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Verify Linux runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${RUNNER_OS:-}" = Linux
+          test "$(uname -s)" = Linux
+          case "$(dotnet --version)" in
+            8.*) ;;
+            *)
+              echo "::error::The workflow requires the .NET 8 SDK."
+              exit 1
+              ;;
+          esac
+
+      - name: Restore
+        run: dotnet restore StackPivot.sln
+
+      - name: Verify Docker Compose v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          daemon_version="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
+          if [ -z "$daemon_version" ] && command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl start docker >/dev/null 2>&1 || true
+            daemon_version="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
+          fi
+          if [ -z "$daemon_version" ]; then
+            echo "::error::Docker daemon is unavailable on the Linux runner."
+            exit 1
+          fi
+
+          compose_version="$(docker compose version --short 2>/dev/null || true)"
+          case "$compose_version" in
+            v2.*|2.*) ;;
+            *)
+              echo "::error::Docker Compose v2 is unavailable (Docker server ${daemon_version})."
+              exit 1
+              ;;
+          esac
+          printf 'Docker server: %s\nDocker Compose: %s\n' "$daemon_version" "$compose_version"
+
+      - name: Test contracts
+        run: dotnet test tests/StackPivot.Contracts.Tests/StackPivot.Contracts.Tests.csproj -c Release --no-restore
+
+      - name: Test control unit
+        run: dotnet test tests/StackPivot.Control.Tests/StackPivot.Control.Tests.csproj -c Release --no-restore
+
+      - name: Test control integration
+        run: dotnet test tests/StackPivot.Control.IntegrationTests/StackPivot.Control.IntegrationTests.csproj -c Release --no-restore
+
+      - name: Test agent
+        run: dotnet test tests/StackPivot.Agent.Tests/StackPivot.Agent.Tests.csproj -c Release --no-restore
+
+      - name: Build Release solution
+        run: dotnet build StackPivot.sln -c Release --no-restore
+
+      - name: Check diff
+        run: git diff --check
