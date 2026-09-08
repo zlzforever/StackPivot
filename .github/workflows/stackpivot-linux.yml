@@ -21,7 +21,7 @@ jobs:
       - name: Set up .NET 8 SDK
         uses: actions/setup-dotnet@v4.3.1
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: '8.0.424'
 
       - name: Verify Linux runner
         shell: bash
@@ -29,13 +29,12 @@ jobs:
           set -euo pipefail
           test "${RUNNER_OS:-}" = Linux
           test "$(uname -s)" = Linux
-          case "$(dotnet --version)" in
-            8.*) ;;
-            *)
-              echo "::error::The workflow requires the .NET 8 SDK."
-              exit 1
-              ;;
-          esac
+          sdk_version="$(dotnet --version)"
+          if [[ ! "$sdk_version" =~ ^8\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The workflow requires a .NET 8 SDK; detected ${sdk_version:-none}."
+            exit 1
+          fi
+          printf 'Using .NET SDK: %s\n' "$sdk_version"
 
       - name: Restore
         run: dotnet restore StackPivot.sln
@@ -44,17 +43,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          daemon_version="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
-          if [ -z "$daemon_version" ] && command -v systemctl >/dev/null 2>&1; then
-            sudo systemctl start docker >/dev/null 2>&1 || true
-            daemon_version="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::Docker CLI is unavailable on the Linux runner."
+            exit 1
           fi
-          if [ -z "$daemon_version" ]; then
+          if ! daemon_version="$(docker info --format '{{.ServerVersion}}' 2>/dev/null)"; then
             echo "::error::Docker daemon is unavailable on the Linux runner."
             exit 1
           fi
-
-          compose_version="$(docker compose version --short 2>/dev/null || true)"
+          if [ -z "$daemon_version" ]; then
+            echo "::error::Docker daemon returned no server version."
+            exit 1
+          fi
+          if ! compose_version="$(docker compose version --short 2>/dev/null)"; then
+            echo "::error::Docker Compose v2 is unavailable on the Linux runner."
+            exit 1
+          fi
           case "$compose_version" in
             v2.*|2.*) ;;
             *)
