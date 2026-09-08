@@ -44,6 +44,25 @@ public sealed class AuthAndPermissionTests
     }
 
     [Fact]
+    public async Task MixedCredentialsAreRejectedBeforeAuthenticationRuns()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Headers[AgentApiKeyDefaults.HeaderName] = "agent-api-key";
+        context.Request.Headers.Cookie = SsoAuthenticationDefaults.CookieName + "=sso-session";
+        var nextCalled = false;
+        var middleware = new MixedCredentialGuardMiddleware(_ =>
+        {
+            nextCalled = true;
+            return Task.CompletedTask;
+        });
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status401Unauthorized, context.Response.StatusCode);
+        Assert.False(nextCalled);
+    }
+
+    [Fact]
     public void SsoAdapterRequiresSubAndMapsNameAndRoles()
     {
         var context = new DefaultHttpContext

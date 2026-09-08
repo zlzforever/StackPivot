@@ -120,6 +120,7 @@ builder.Services.AddSignalR()
 
 var app = builder.Build();
 app.UseExceptionHandler();
+app.UseMiddleware<MixedCredentialGuardMiddleware>();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseAntiforgery();

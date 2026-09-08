@@ -24,8 +24,8 @@ public sealed class AgentTaskCoordinatorTests
         var secondReporter = new RecordingReporter();
         var firstCommand = CreateCommand();
         var firstToken = firstCommand.AccessToken;
-        var secondCommand = CreateCommand();
-        secondCommand = secondCommand with { TaskId = firstCommand.TaskId };
+        var secondCommand = firstCommand with { AccessToken = "second-secret"u8.ToArray() };
+        secondCommand = secondCommand with { DispatchFingerprint = DispatchFingerprint.Compute(secondCommand) };
 
         var first = coordinator.HandleAsync(firstCommand, firstReporter, CancellationToken.None);
         await executor.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -53,8 +53,8 @@ public sealed class AgentTaskCoordinatorTests
         var firstReporter = new RecordingReporter();
         var secondReporter = new RecordingReporter();
         var firstCommand = CreateCommand();
-        var secondCommand = CreateCommand();
-        secondCommand = secondCommand with { TaskId = firstCommand.TaskId };
+        var secondCommand = firstCommand with { AccessToken = "second-secret"u8.ToArray() };
+        secondCommand = secondCommand with { DispatchFingerprint = DispatchFingerprint.Compute(secondCommand) };
 
         await coordinator.HandleAsync(firstCommand, firstReporter, CancellationToken.None);
         await coordinator.HandleAsync(secondCommand, secondReporter, CancellationToken.None);
@@ -68,6 +68,30 @@ public sealed class AgentTaskCoordinatorTests
         Assert.Equal(firstReporter.Completed[0].Success, secondReporter.Completed[0].Success);
         Assert.All(firstCommand.AccessToken, value => Assert.Equal(0, value));
         Assert.All(secondCommand.AccessToken, value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public async Task SameTaskIdWithDifferentDispatchContextIsRejectedInsteadOfReplaying()
+    {
+        var executor = new LargeOutputExecutor();
+        var coordinator = new AgentTaskCoordinator(AgentId, executor);
+        var firstCommand = CreateCommand();
+        var secondCommand = firstCommand with
+        {
+            AccessToken = "different-secret"u8.ToArray(),
+            TargetCommitHash = "fedcba9876543210fedcba9876543210fedcba98"
+        };
+        secondCommand = secondCommand with { DispatchFingerprint = DispatchFingerprint.Compute(secondCommand) };
+
+        await coordinator.HandleAsync(firstCommand, new RecordingReporter(), CancellationToken.None);
+        var secondReporter = new RecordingReporter();
+        await coordinator.HandleAsync(secondCommand, secondReporter, CancellationToken.None);
+
+        Assert.Equal(0, executor.ExecutionCount);
+        Assert.Single(secondReporter.Accepted);
+        var completed = Assert.Single(secondReporter.Completed);
+        Assert.False(completed.Success);
+        Assert.Equal("task_context_mismatch", completed.ErrorCode);
     }
 
     [SkippableFact]

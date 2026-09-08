@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using StackPivot.Agent.Security;
 using StackPivot.Contracts.Deployments;
 using StackPivot.Contracts.SignalR;
@@ -127,14 +128,36 @@ internal static class CheckoutMetadataPolicy
     }
 }
 
+public sealed record GitTreeEntry(
+    string RelativePath,
+    string Mode,
+    long? BlobSize)
+{
+    public bool IsExecutable => string.Equals(Mode, "100755", StringComparison.Ordinal);
+}
+
 public static class GitTreePolicy
 {
+    public const int MaxEntries = 4096;
+    public const int MaxPathBytes = 4096;
+    public const int MaxPathDepth = 32;
+    public const long MaxBlobBytes = 16L * 1024 * 1024;
+    public const long MaxTotalBlobBytes = 64L * 1024 * 1024;
+
     public static IReadOnlyList<string> Validate(string treeOutput, string stackPath)
+    {
+        return ValidateEntries(treeOutput, stackPath)
+            .Select(entry => entry.RelativePath)
+            .ToArray();
+    }
+
+    public static IReadOnlyList<GitTreeEntry> ValidateEntries(string treeOutput, string stackPath)
     {
         ArgumentNullException.ThrowIfNull(treeOutput);
         ArgumentException.ThrowIfNullOrWhiteSpace(stackPath);
         var prefix = stackPath.TrimEnd('/') + "/";
-        var files = new List<string>();
+        var entries = new List<GitTreeEntry>();
+        long totalBlobBytes = 0;
         foreach (var rawLine in treeOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
             var line = rawLine.TrimEnd('\r');
@@ -142,6 +165,7 @@ public static class GitTreePolicy
             string mode;
             string type;
             string fullPath;
+            long? blobSize = null;
             if (separator < 0)
             {
                 mode = "100644";
@@ -158,6 +182,17 @@ public static class GitTreePolicy
 
                 mode = header[0];
                 type = header[1];
+                if (header.Length >= 4 && header[3] != "-")
+                {
+                    if (!long.TryParse(header[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsedSize)
+                        || parsedSize < 0)
+                    {
+                        throw new GitTreePolicyException("invalid_path", "Git tree blob size is invalid.");
+                    }
+
+                    blobSize = parsedSize;
+                }
+
                 fullPath = line[(separator + 1)..];
             }
 
@@ -168,9 +203,38 @@ public static class GitTreePolicy
 
             var relative = fullPath[prefix.Length..];
             ValidateRelativePath(relative);
+            if (Encoding.UTF8.GetByteCount(relative) > MaxPathBytes)
+            {
+                throw new GitTreePolicyException("invalid_path", "Git tree path exceeds the safety limit.");
+            }
+
             if (mode == "120000" || !string.Equals(type, "blob", StringComparison.Ordinal))
             {
                 throw new GitTreePolicyException("policy_violation", "Symlinks and non-file Git tree entries are not deployable.");
+            }
+
+            if (mode is not ("100644" or "100755"))
+            {
+                throw new GitTreePolicyException("policy_violation", "Git tree file mode is not deployable.");
+            }
+
+            if (blobSize is null)
+            {
+                throw new GitTreePolicyException("resource_limit", "Git tree blob size is unavailable.");
+            }
+
+            if (blobSize is > MaxBlobBytes)
+            {
+                throw new GitTreePolicyException("resource_limit", "Git tree blob exceeds the per-file byte budget.");
+            }
+
+            if (blobSize is { } size)
+            {
+                totalBlobBytes = checked(totalBlobBytes + size);
+                if (totalBlobBytes > MaxTotalBlobBytes)
+                {
+                    throw new GitTreePolicyException("resource_limit", "Git tree exceeds the total byte budget.");
+                }
             }
 
             var fileName = relative[(relative.LastIndexOf('/') + 1)..];
@@ -179,25 +243,28 @@ public static class GitTreePolicy
                 throw new GitTreePolicyException("policy_violation", "Sensitive environment files are not deployable.");
             }
 
-            files.Add(relative);
+            entries.Add(new GitTreeEntry(relative, mode, blobSize));
+            if (entries.Count > MaxEntries)
+            {
+                throw new GitTreePolicyException("invalid_path", "Git tree exceeds the entry limit.");
+            }
         }
 
-        if (!files.Contains("compose.yaml", StringComparer.Ordinal)
-            && !files.Contains("compose.yml", StringComparer.Ordinal))
+        if (!entries.Any(entry => entry.RelativePath is "compose.yaml" or "compose.yml"))
         {
             throw new GitTreePolicyException("invalid_path", "The stack does not contain a compose file.");
         }
 
         try
         {
-            CheckoutMetadataPolicy.ValidateTree(stackPath, files);
+            CheckoutMetadataPolicy.ValidateTree(stackPath, entries.Select(entry => entry.RelativePath).ToArray());
         }
         catch (CheckoutMetadataPolicyException exception)
         {
             throw new GitTreePolicyException("invalid_path", exception.Message);
         }
 
-        return files;
+        return entries;
     }
 
     private static void ValidateRelativePath(string relative)
@@ -210,6 +277,11 @@ public static class GitTreePolicy
         }
 
         var segments = relative.Split('/', StringSplitOptions.None);
+        if (segments.Length > MaxPathDepth)
+        {
+            throw new GitTreePolicyException("resource_limit", "Git tree path depth exceeds the safety limit.");
+        }
+
         if (segments.Any(segment => string.IsNullOrEmpty(segment) || segment is "." or ".." or ".git"))
         {
             throw new GitTreePolicyException("policy_violation", "Git tree path contains an unsafe segment.");
@@ -474,7 +546,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
                 var tree = await RunAsync(
                     safePath.FullPath,
-                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "ls-tree", "-r", input.TargetCommitHash, "--", input.StackGitRelativePath),
+                    RepositoryArguments(materializationDirectory.Directory.ProcessWorkingDirectory, "ls-tree", "-r", "-l", input.TargetCommitHash, "--", input.StackGitRelativePath),
                     cancellationToken,
                     environment,
                     repositoryHandle);
@@ -493,11 +565,13 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                     return Failure("git_tree_failed");
                 }
 
+                IReadOnlyList<GitTreeEntry> entries;
                 IReadOnlyList<string> files;
                 string metadataJson;
                 try
                 {
-                    files = GitTreePolicy.Validate(tree.StandardOutput, input.StackGitRelativePath);
+                    entries = GitTreePolicy.ValidateEntries(tree.StandardOutput, input.StackGitRelativePath);
+                    files = entries.Select(entry => entry.RelativePath).ToArray();
                     metadataJson = CheckoutMetadataPolicy.Serialize(
                         input.TargetCommitHash,
                         input.StackGitRelativePath,
@@ -512,11 +586,16 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                     return Failure("invalid_path");
                 }
 
-                IReadOnlyList<string> oldFiles;
+                PreviousCheckoutState previousCheckout;
                 try
                 {
-                    oldFiles = ReadPreviousFiles(repositoryHandle, input.StackGitRelativePath);
+                    previousCheckout = ReadPreviousCheckout(repositoryHandle, input.StackGitRelativePath);
                     foreach (var file in files)
+                    {
+                        directoryHandle.ValidateManagedFilePath(file);
+                    }
+
+                    foreach (var file in previousCheckout.Files)
                     {
                         directoryHandle.ValidateManagedFilePath(file);
                     }
@@ -542,11 +621,20 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                     return Failure("git_materialize_failed");
                 }
 
+                using var stagedDirectory = SafeDirectoryHandle.CreateTemporaryDirectory("git-stage-");
+                using var backupDirectory = SafeDirectoryHandle.CreateTemporaryDirectory("git-backup-");
                 try
                 {
-                    await RemoveManagedFilesAsync(directoryHandle, oldFiles, cancellationToken);
-                    await CopyStagedFilesAsync(materializationDirectory.Directory, directoryHandle, files, cancellationToken);
-                    WriteMetadata(repositoryHandle, metadataJson);
+                    await ApplyStagedCheckoutAsync(
+                        materializationDirectory.Directory,
+                        stagedDirectory.Directory,
+                        backupDirectory.Directory,
+                        directoryHandle,
+                        repositoryHandle,
+                        previousCheckout,
+                        entries,
+                        metadataJson,
+                        cancellationToken);
                 }
                 catch (PathPolicyException)
                 {
@@ -591,7 +679,11 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             cancellationToken);
     }
 
-    private static IReadOnlyList<string> ReadPreviousFiles(
+    private sealed record PreviousCheckoutState(
+        IReadOnlyList<string> Files,
+        string? MetadataJson);
+
+    private static PreviousCheckoutState ReadPreviousCheckout(
         SafeDirectoryHandle gitDirectory,
         string expectedStackPath)
     {
@@ -611,7 +703,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                     throw new CheckoutMetadataPolicyException("Checkout metadata path does not match the stack path.");
                 }
 
-                return metadata.Files!;
+                return new PreviousCheckoutState(metadata.Files!, json);
             }
             catch (JsonException exception)
             {
@@ -624,7 +716,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         }
         catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
         {
-            return Array.Empty<string>();
+            return new PreviousCheckoutState(Array.Empty<string>(), null);
         }
     }
 
@@ -663,32 +755,177 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         }
     }
 
-    private static Task RemoveManagedFilesAsync(
-        SafeDirectoryHandle root,
-        IReadOnlyList<string> files,
+    private static async Task ApplyStagedCheckoutAsync(
+        SafeDirectoryHandle source,
+        SafeDirectoryHandle staged,
+        SafeDirectoryHandle backup,
+        SafeDirectoryHandle destination,
+        SafeDirectoryHandle gitDirectory,
+        PreviousCheckoutState previousCheckout,
+        IReadOnlyList<GitTreeEntry> entries,
+        string metadataJson,
         CancellationToken cancellationToken)
     {
-        foreach (var relative in files)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            root.DeleteFile(relative);
-        }
+        // Complete and validate the new tree before moving any managed file out of the live tree.
+        await CopyStagedFilesAsync(source, staged, entries, cancellationToken);
 
-        return Task.CompletedTask;
+        var oldFilesMoved = new List<string>();
+        var newFilesMoved = new List<string>();
+        try
+        {
+            foreach (var relative in previousCheckout.Files.Distinct(StringComparer.Ordinal))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    destination.MoveFileTo(relative, backup, relative);
+                    oldFilesMoved.Add(relative);
+                }
+                catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
+                {
+                    // Metadata may reference a file removed by an interrupted prior cleanup.
+                }
+            }
+
+            RemoveEmptyManagedDirectories(destination, previousCheckout.Files, entries.Select(entry => entry.RelativePath));
+
+            foreach (var entry in entries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                staged.MoveFileTo(entry.RelativePath, destination, entry.RelativePath);
+                newFilesMoved.Add(entry.RelativePath);
+            }
+
+            WriteMetadata(gitDirectory, metadataJson);
+            RemoveEmptyManagedDirectories(destination, previousCheckout.Files, entries.Select(entry => entry.RelativePath));
+        }
+        catch
+        {
+            foreach (var relative in newFilesMoved.AsEnumerable().Reverse())
+            {
+                TryMoveFile(destination, relative, staged, relative);
+            }
+
+            foreach (var relative in oldFilesMoved.AsEnumerable().Reverse())
+            {
+                TryMoveFile(backup, relative, destination, relative);
+            }
+
+            TryRestoreMetadata(gitDirectory, previousCheckout.MetadataJson);
+            RemoveEmptyManagedDirectories(destination, entries.Select(entry => entry.RelativePath), previousCheckout.Files);
+            throw;
+        }
+    }
+
+    private static void TryMoveFile(
+        SafeDirectoryHandle source,
+        string sourcePath,
+        SafeDirectoryHandle destination,
+        string destinationPath)
+    {
+        try
+        {
+            source.MoveFileTo(sourcePath, destination, destinationPath);
+        }
+        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
+        {
+        }
+    }
+
+    private static void TryRestoreMetadata(
+        SafeDirectoryHandle gitDirectory,
+        string? previousMetadataJson)
+    {
+        try
+        {
+            if (previousMetadataJson is null)
+            {
+                gitDirectory.DeleteFile("stackpivot-checkout.json");
+            }
+            else
+            {
+                WriteMetadata(gitDirectory, previousMetadataJson);
+            }
+        }
+        catch (PathPolicyException)
+        {
+            // Preserve the original checkout failure; the metadata write is still fail-closed.
+        }
+    }
+
+    private static void RemoveEmptyManagedDirectories(
+        SafeDirectoryHandle root,
+        IEnumerable<string> removedFiles,
+        IEnumerable<string> remainingFiles)
+    {
+        var remaining = remainingFiles
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var candidateDirectories = removedFiles
+            .SelectMany(GetParentDirectories)
+            .Distinct(StringComparer.Ordinal)
+            .OrderByDescending(value => value.Count(character => character == '/'))
+            .ToArray();
+        foreach (var directory in candidateDirectories)
+        {
+            if (remaining.Any(file => IsPathWithin(file, directory)))
+            {
+                continue;
+            }
+
+            try
+            {
+                root.TryDeleteEmptyDirectory(directory);
+            }
+            catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
+            {
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetParentDirectories(string relativeFile)
+    {
+        var segments = relativeFile.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        for (var length = segments.Length - 1; length > 0; length--)
+        {
+            yield return string.Join('/', segments[..length]);
+        }
+    }
+
+    private static bool IsPathWithin(string relativePath, string directory)
+    {
+        return relativePath.StartsWith(directory + "/", StringComparison.Ordinal);
     }
 
     private static async Task CopyStagedFilesAsync(
         SafeDirectoryHandle source,
         SafeDirectoryHandle destination,
-        IReadOnlyList<string> files,
+        IReadOnlyList<GitTreeEntry> entries,
         CancellationToken cancellationToken)
     {
-        foreach (var relative in files)
+        foreach (var entry in entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var relative = entry.RelativePath;
             using var sourceFile = source.OpenFile(relative, FileMode.Open, FileAccess.Read);
             using var destinationFile = destination.OpenFile(relative, FileMode.Create, FileAccess.Write);
             await sourceFile.CopyToAsync(destinationFile, cancellationToken);
+            destinationFile.Flush(flushToDisk: true);
+            if (OperatingSystem.IsLinux())
+            {
+                var mode = UnixFileMode.UserRead
+                    | UnixFileMode.UserWrite
+                    | UnixFileMode.GroupRead
+                    | UnixFileMode.OtherRead;
+                if (entry.IsExecutable)
+                {
+                    mode |= UnixFileMode.UserExecute
+                        | UnixFileMode.GroupExecute
+                        | UnixFileMode.OtherExecute;
+                }
+
+                File.SetUnixFileMode(Path.Combine(destination.ProcessWorkingDirectory, relative), mode);
+            }
         }
     }
 
@@ -696,19 +933,43 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         SafeDirectoryHandle gitDirectory,
         string json)
     {
+        var temporaryName = "stackpivot-checkout.json.tmp-" + Guid.NewGuid().ToString("N");
         try
         {
             CheckoutMetadataPolicy.ValidateSerializedJson(json);
-            using var file = gitDirectory.OpenFile("stackpivot-checkout.json", FileMode.Create, FileAccess.Write);
-            using var writer = new StreamWriter(
-                file,
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-                bufferSize: 4096);
-            writer.Write(json);
+            var bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(json);
+            try
+            {
+                using var file = gitDirectory.OpenFile(temporaryName, FileMode.CreateNew, FileAccess.Write);
+                file.Write(bytes, 0, bytes.Length);
+                file.Flush(flushToDisk: true);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(bytes);
+            }
+
+            if (!OperatingSystem.IsLinux())
+            {
+                throw new PlatformNotSupportedException("Atomic checkout metadata replacement requires Linux.");
+            }
+
+            LinuxAtomicFileOperations.Replace(gitDirectory, temporaryName, "stackpivot-checkout.json");
+            LinuxAtomicFileOperations.FlushDirectory(gitDirectory);
         }
         catch (CheckoutMetadataPolicyException exception)
         {
             throw new PathPolicyException("Checkout metadata exceeds its size limit.", exception);
+        }
+        finally
+        {
+            try
+            {
+                gitDirectory.DeleteFile(temporaryName);
+            }
+            catch (PathPolicyException)
+            {
+            }
         }
     }
 
@@ -717,6 +978,58 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         return new GitCheckoutResult(false, errorCode, Array.Empty<string>());
     }
 
+}
+
+internal static class LinuxAtomicFileOperations
+{
+    internal static void Replace(
+        SafeDirectoryHandle directory,
+        string sourceName,
+        string destinationName)
+    {
+        var directoryFileDescriptor = GetFileDescriptor(directory);
+        if (renameat(
+                directoryFileDescriptor,
+                sourceName,
+                directoryFileDescriptor,
+                destinationName) != 0)
+        {
+            throw new PathPolicyException(
+                $"Unable to atomically replace checkout metadata (errno {Marshal.GetLastWin32Error()}).");
+        }
+    }
+
+    internal static void FlushDirectory(SafeDirectoryHandle directory)
+    {
+        var directoryFileDescriptor = GetFileDescriptor(directory);
+        if (fsync(directoryFileDescriptor) != 0)
+        {
+            throw new PathPolicyException(
+                $"Unable to flush checkout metadata directory (errno {Marshal.GetLastWin32Error()}).");
+        }
+    }
+
+    private static int GetFileDescriptor(SafeDirectoryHandle directory)
+    {
+        const string prefix = "/proc/self/fd/";
+        var path = directory.ProcessWorkingDirectory;
+        return path.StartsWith(prefix, StringComparison.Ordinal)
+            && int.TryParse(path[prefix.Length..], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var fileDescriptor)
+            ? fileDescriptor
+            : throw new PathPolicyException("Unable to access the checkout metadata directory safely.");
+    }
+
+    #pragma warning disable CA2101
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "renameat", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Ansi, CallingConvention = System.Runtime.InteropServices.CallingConvention.Cdecl)]
+    private static extern int renameat(
+        int oldDirectoryFileDescriptor,
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPStr)] string oldPath,
+        int newDirectoryFileDescriptor,
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPStr)] string newPath);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fsync", SetLastError = true, CallingConvention = System.Runtime.InteropServices.CallingConvention.Cdecl)]
+    private static extern int fsync(int fileDescriptor);
+    #pragma warning restore CA2101
 }
 
 public static class CentralRemotePolicy

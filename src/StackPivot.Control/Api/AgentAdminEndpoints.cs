@@ -69,22 +69,35 @@ public static class AgentAdminEndpoints
                         return ApiProblem.Create(context, "invalid_request", 422, "X-Request-Id is required.");
                     }
 
-                    var admin = await RequireAdminAsync(context, dbContext, users, adapter);
-                    if (admin is not null)
-                    {
-                        return admin;
-                    }
-
                     AgentCreateRequest request;
                     try
                     {
-                        using var reader = new StreamReader(context.Request.Body);
-                        request = JsonSerializer.Deserialize<AgentCreateRequest>(await reader.ReadToEndAsync(context.RequestAborted), RequestJsonOptions)
+                        var body = await RequestBodyReader.ReadUtf8Async(
+                            context,
+                            RequestBodyReader.MaxJsonBodyBytes,
+                            context.RequestAborted);
+                        if (body.TooLarge)
+                        {
+                            return ApiProblem.Create(context, "request_too_large", StatusCodes.Status413PayloadTooLarge, "Request body is too large.", requestId);
+                        }
+
+                        if (body.InvalidUtf8 || string.IsNullOrWhiteSpace(body.Text))
+                        {
+                            throw new JsonException();
+                        }
+
+                        request = JsonSerializer.Deserialize<AgentCreateRequest>(body.Text, RequestJsonOptions)
                             ?? throw new JsonException();
                     }
                     catch (JsonException)
                     {
                         return ApiProblem.Create(context, "invalid_request", 422, "Agent request is invalid.", requestId);
+                    }
+
+                    var admin = await RequireAdminAsync(context, dbContext, users, adapter);
+                    if (admin is not null)
+                    {
+                        return admin;
                     }
 
                     var name = request.Name?.Trim();
@@ -188,22 +201,40 @@ public static class AgentAdminEndpoints
                         return ApiProblem.Create(context, "invalid_request", 422, "X-Request-Id is required.");
                     }
 
-                    var admin = await RequireAdminAsync(context, dbContext, users, adapter);
-                    if (admin is not null)
-                    {
-                        return admin;
-                    }
-
                     UpdateStackAgentBindingsRequest request;
                     try
                     {
-                        using var reader = new StreamReader(context.Request.Body);
-                        request = JsonSerializer.Deserialize<UpdateStackAgentBindingsRequest>(await reader.ReadToEndAsync(context.RequestAborted), RequestJsonOptions)
+                        var body = await RequestBodyReader.ReadUtf8Async(
+                            context,
+                            RequestBodyReader.MaxJsonBodyBytes,
+                            context.RequestAborted);
+                        if (body.TooLarge)
+                        {
+                            return ApiProblem.Create(context, "request_too_large", StatusCodes.Status413PayloadTooLarge, "Request body is too large.", requestId);
+                        }
+
+                        if (body.InvalidUtf8 || string.IsNullOrWhiteSpace(body.Text))
+                        {
+                            throw new JsonException();
+                        }
+
+                        request = JsonSerializer.Deserialize<UpdateStackAgentBindingsRequest>(body.Text, RequestJsonOptions)
                             ?? throw new JsonException();
                     }
                     catch (JsonException)
                     {
                         return ApiProblem.Create(context, "invalid_request", 422, "Binding request is invalid.", requestId);
+                    }
+
+                    if (request.AgentIds is { Count: > RequestBodyReader.MaxAgentBindingIds })
+                    {
+                        return ApiProblem.Create(context, "request_too_large", StatusCodes.Status413PayloadTooLarge, "Too many agent ids were supplied.", requestId);
+                    }
+
+                    var admin = await RequireAdminAsync(context, dbContext, users, adapter);
+                    if (admin is not null)
+                    {
+                        return admin;
                     }
 
                     var stack = await dbContext.Stacks.SingleOrDefaultAsync(value => value.StackId == stackId, context.RequestAborted);

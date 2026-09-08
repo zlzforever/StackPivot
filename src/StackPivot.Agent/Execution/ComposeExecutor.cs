@@ -24,13 +24,30 @@ public sealed class ComposeExecutor
     private readonly IProcessRunner processRunner;
     private readonly TimeSpan timeout;
     private readonly LogSanitizer sanitizer;
+    private readonly TimeSpan snapshotRetention;
+    private readonly TimeProvider timeProvider;
 
-    public ComposeExecutor(IProcessRunner processRunner, TimeSpan timeout, LogSanitizer? sanitizer = null)
+    public ComposeExecutor(
+        IProcessRunner processRunner,
+        TimeSpan timeout,
+        LogSanitizer? sanitizer = null,
+        TimeSpan? snapshotRetention = null,
+        TimeProvider? timeProvider = null)
     {
         this.processRunner = processRunner ?? throw new ArgumentNullException(nameof(processRunner));
         this.timeout = timeout;
         this.sanitizer = sanitizer ?? new LogSanitizer();
+        this.snapshotRetention = snapshotRetention ?? ComposeWorkspaceSnapshot.DefaultRetention;
+        if (this.snapshotRetention < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(snapshotRetention));
+        }
+
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
+
+    public int ReclaimExpiredSnapshots(TimeSpan? retention = null) =>
+        ComposeWorkspaceSnapshot.ReclaimExpiredSnapshots(retention ?? snapshotRetention, timeProvider);
 
     public async Task<ComposeExecutionResult> ExecuteAsync(
         string workingDirectory,
@@ -88,7 +105,11 @@ public sealed class ComposeExecutor
         {
             using var snapshot = workingDirectoryHandle is null
                 ? null
-                : ComposeWorkspaceSnapshot.Create(workingDirectoryHandle, cancellationToken);
+                : ComposeWorkspaceSnapshot.Create(
+                    workingDirectoryHandle,
+                    snapshotRetention,
+                    timeProvider,
+                    cancellationToken);
             var processWorkingDirectory = snapshot?.WorkingDirectory ?? workingDirectory;
             var processWorkingDirectoryHandle = snapshot?.WorkingDirectoryHandle ?? workingDirectoryHandle;
             var environment = snapshot is null
@@ -111,7 +132,8 @@ public sealed class ComposeExecutor
                     WorkingDirectoryHandle: processWorkingDirectoryHandle),
                 cancellationToken);
             var sanitized = Sanitize(execution);
-            var errorCode = execution.TimedOut ? "process_timeout" : execution.ExitCode == 0 ? null : "compose_failed";
+            var errorCode = execution.ErrorCode
+                ?? (execution.TimedOut ? "process_timeout" : execution.ExitCode == 0 ? null : "compose_failed");
             return new ComposeExecutionResult(
                 execution.ExitCode == 0 && !execution.TimedOut,
                 execution.ExitCode,

@@ -6,6 +6,9 @@ namespace StackPivot.Agent.Execution;
 
 internal sealed class ComposeWorkspaceSnapshot : IDisposable
 {
+    internal const string SnapshotDirectoryPrefix = "compose-snapshot-";
+    internal static readonly TimeSpan DefaultRetention = TimeSpan.FromHours(24);
+    private static readonly object SnapshotGate = new();
     private const int MaxSnapshotFileCount = 4096;
     private const int MaxSnapshotDirectoryCount = 4096;
     private const int MaxSnapshotEntryCount = 8192;
@@ -39,14 +42,19 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         "devices"
     };
 
-    private readonly TemporaryDirectory temporaryDirectory;
+    private readonly SafeDirectoryHandle workingDirectoryHandle;
+    private readonly string workingDirectoryPath;
     private bool disposed;
 
-    private ComposeWorkspaceSnapshot(TemporaryDirectory temporaryDirectory, string composeFileName)
+    private ComposeWorkspaceSnapshot(
+        SafeDirectoryHandle workingDirectoryHandle,
+        string workingDirectoryPath,
+        string composeFileName)
     {
-        this.temporaryDirectory = temporaryDirectory;
-        WorkingDirectory = temporaryDirectory.FullPath;
-        WorkingDirectoryHandle = temporaryDirectory.Directory;
+        this.workingDirectoryHandle = workingDirectoryHandle;
+        this.workingDirectoryPath = workingDirectoryPath;
+        WorkingDirectory = workingDirectoryPath;
+        WorkingDirectoryHandle = workingDirectoryHandle;
         ComposeFileName = composeFileName;
     }
 
@@ -58,28 +66,68 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
 
     public static ComposeWorkspaceSnapshot Create(
         SafeDirectoryHandle source,
+        TimeSpan retention,
+        TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        ArgumentOutOfRangeException.ThrowIfLessThan(retention, TimeSpan.Zero);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var temporaryDirectory = SafeDirectoryHandle.CreateTemporaryDirectory("compose-");
-        try
+        lock (SnapshotGate)
         {
-            CopyDirectory(
-                source,
-                temporaryDirectory.Directory,
-                isRoot: true,
-                depth: 0,
-                new SnapshotBudget(),
-                cancellationToken);
-            var composeFileName = ValidateComposeReferences(temporaryDirectory.Directory);
-            return new ComposeWorkspaceSnapshot(temporaryDirectory, composeFileName);
+            using var snapshotRoot = OpenSnapshotRoot();
+            ReclaimExpiredCore(snapshotRoot, retention, timeProvider.GetUtcNow());
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                var name = SnapshotDirectoryPrefix + Guid.NewGuid().ToString("N");
+                SafeDirectoryHandle? snapshot = null;
+                try
+                {
+                    snapshot = snapshotRoot.OpenChildDirectory(name, create: true);
+                    snapshot.EnsurePrivateDirectory();
+                    CopyDirectory(
+                        source,
+                        snapshot,
+                        isRoot: true,
+                        depth: 0,
+                        new SnapshotBudget(),
+                        cancellationToken);
+                    var composeFileName = ValidateComposeReferences(snapshot);
+                    var path = Path.Combine(snapshotRoot.CanonicalPath, name);
+                    Directory.SetLastWriteTimeUtc(path, timeProvider.GetUtcNow().UtcDateTime);
+                    return new ComposeWorkspaceSnapshot(snapshot, path, composeFileName);
+                }
+                catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryExists)
+                {
+                    snapshot?.Dispose();
+                }
+                catch
+                {
+                    if (snapshot is not null)
+                    {
+                        snapshot.DeleteContents();
+                        snapshot.Dispose();
+                        snapshotRoot.DeleteChildDirectory(name);
+                    }
+
+                    throw;
+                }
+            }
+
+            throw new PathPolicyException("Unable to create a unique Compose workspace snapshot.");
         }
-        catch
+    }
+
+    internal static int ReclaimExpiredSnapshots(TimeSpan retention, TimeProvider timeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        ArgumentOutOfRangeException.ThrowIfLessThan(retention, TimeSpan.Zero);
+        lock (SnapshotGate)
         {
-            temporaryDirectory.Dispose();
-            throw;
+            using var snapshotRoot = OpenSnapshotRoot();
+            return ReclaimExpiredCore(snapshotRoot, retention, timeProvider.GetUtcNow());
         }
     }
 
@@ -91,7 +139,75 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         }
 
         disposed = true;
-        temporaryDirectory.Dispose();
+        try
+        {
+            Directory.SetLastWriteTimeUtc(workingDirectoryPath, DateTime.UtcNow);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        workingDirectoryHandle.Dispose();
+    }
+
+    private static SafeDirectoryHandle OpenSnapshotRoot()
+    {
+        var privateRootPath = Path.Combine(Path.GetTempPath(), "stackpivot-private");
+        using var privateRoot = SafeDirectoryHandle.OpenOrCreateAbsoluteDirectory(privateRootPath);
+        privateRoot.EnsurePrivateDirectory();
+        var snapshotRoot = privateRoot.OpenChildDirectory("compose-snapshots", create: true);
+        snapshotRoot.EnsurePrivateDirectory();
+        return snapshotRoot;
+    }
+
+    private static int ReclaimExpiredCore(
+        SafeDirectoryHandle snapshotRoot,
+        TimeSpan retention,
+        DateTimeOffset now)
+    {
+        var reclaimed = 0;
+        foreach (var name in snapshotRoot.EnumerateEntryNames(MaxSnapshotEntryCount + 1))
+        {
+            if (!name.StartsWith(SnapshotDirectoryPrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            using var snapshot = snapshotRoot.TryOpenChildDirectory(name);
+            if (snapshot is null)
+            {
+                continue;
+            }
+
+            var path = Path.Combine(snapshotRoot.CanonicalPath, name);
+            DateTime lastWrite;
+            try
+            {
+                lastWrite = Directory.GetLastWriteTimeUtc(path);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                continue;
+            }
+
+            if (now.UtcDateTime - lastWrite < retention)
+            {
+                continue;
+            }
+
+            snapshot.DeleteContents();
+            snapshotRoot.DeleteChildDirectory(name);
+            reclaimed++;
+        }
+
+        return reclaimed;
     }
 
     private static void CopyDirectory(

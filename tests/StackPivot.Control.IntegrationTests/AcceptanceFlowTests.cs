@@ -36,6 +36,20 @@ public sealed class AcceptanceFlowTests(AcceptanceFlowFactory factory)
     }
 
     [Fact]
+    public async Task SsoEndpointRejectsMixedAgentApiKeyAndSsoCookieAtTheHttpBoundary()
+    {
+        using var client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/me");
+        request.Headers.Add(AgentApiKeyDefaults.HeaderName, "invalid-agent-api-key");
+        request.Headers.Add("Cookie", SsoAuthenticationDefaults.CookieName + "=sso-session");
+
+        using var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Contains("mixed_credentials", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void OidcKeepsTheLiteralSubClaimForSsoMapping()
     {
         var options = factory.Services
@@ -128,6 +142,28 @@ public sealed class AcceptanceFlowTests(AcceptanceFlowFactory factory)
         Assert.Equal("agent", target.GetProperty("name").GetString());
         Assert.DoesNotContain("apiKey", body, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("git", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AgentBindingRejectsTooManyAgentIdsBeforeDatabaseQueries()
+    {
+        var fixture = await factory.SeedStackAsync();
+        using var client = factory.CreateAuthenticatedClient();
+        using var request = new HttpRequestMessage(HttpMethod.Put, $"/api/stacks/{fixture.StackId}/agent-bindings")
+        {
+            Content = JsonContent.Create(new
+            {
+                agentIds = Enumerable.Range(0, 129).Select(_ => Guid.NewGuid()).ToArray()
+            })
+        };
+        request.Headers.Add("X-Request-Id", Guid.NewGuid().ToString());
+        factory.AddAntiforgeryHeaders(request);
+
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+        Assert.Contains("\"code\":\"request_too_large\"", body, StringComparison.Ordinal);
     }
 
     [Fact]

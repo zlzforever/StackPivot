@@ -15,8 +15,8 @@ public sealed class GitTreePolicyTests
     [Fact]
     public void SensitiveEnvInAnySubdirectoryIsRejected()
     {
-        const string tree = "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n"
-            + "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/config/.env\n";
+        const string tree = "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n"
+            + "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/config/.env\n";
 
         var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
 
@@ -26,8 +26,8 @@ public sealed class GitTreePolicyTests
     [Fact]
     public void SymlinkInFetchedTreeIsRejected()
     {
-        const string tree = "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n"
-            + "120000 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/config/data\n";
+        const string tree = "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n"
+            + "120000 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/config/data\n";
 
         var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
 
@@ -37,7 +37,7 @@ public sealed class GitTreePolicyTests
     [Fact]
     public void ValidTreeRequiresComposeAtStackRoot()
     {
-        const string tree = "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/app.txt\n";
+        const string tree = "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/app.txt\n";
 
         var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
 
@@ -48,12 +48,12 @@ public sealed class GitTreePolicyTests
     public void CheckoutTreeRejectsMoreThanTheMetadataEntryBudget()
     {
         var files = Enumerable.Range(0, 4097)
-            .Select(index => $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/file-{index}.txt");
+            .Select(index => $"100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/file-{index}.txt");
         var tree = string.Join(
             '\n',
             new[]
             {
-                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml"
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml"
             }.Concat(files));
 
         var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
@@ -65,12 +65,12 @@ public sealed class GitTreePolicyTests
     public void CheckoutTreeRejectsMetadataThatExceedsTheSerializedByteBudget()
     {
         var files = Enumerable.Range(0, 4095)
-            .Select(index => $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/{new string('x', 350)}-{index}.txt");
+            .Select(index => $"100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/{new string('x', 350)}-{index}.txt");
         var tree = string.Join(
             '\n',
             new[]
             {
-                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml"
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml"
             }.Concat(files));
 
         var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
@@ -82,12 +82,70 @@ public sealed class GitTreePolicyTests
     public void CheckoutTreeRejectsAPathEntryOverTheUtf8ByteBudget()
     {
         var oversizedName = new string('x', 4097);
-        var tree = "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n"
-            + $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/{oversizedName}.txt";
+        var tree = "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n"
+            + $"100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/{oversizedName}.txt";
 
         var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
 
         Assert.Equal("invalid_path", exception.Code);
+    }
+
+    [Fact]
+    public void CheckoutTreeRejectsABlobWithoutASizeBudgetValue()
+    {
+        const string tree = "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml";
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("resource_limit", exception.Code);
+    }
+
+    [Fact]
+    public void CheckoutTreeRejectsABlobOverThePerFileByteBudget()
+    {
+        var tree = "100644 blob 0123456789012345678901234567890123456789 16777217\tworkspace_one/stack_web/large.bin\n"
+            + "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml";
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("resource_limit", exception.Code);
+    }
+
+    [Fact]
+    public void CheckoutTreeRejectsBlobsOverTheTotalByteBudget()
+    {
+        var tree = string.Join(
+            '\n',
+            Enumerable.Range(0, 5)
+                .Select(index => $"100644 blob 0123456789012345678901234567890123456789 16777216\tworkspace_one/stack_web/file-{index}.bin")
+                .Append("100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml"));
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("resource_limit", exception.Code);
+    }
+
+    [Fact]
+    public void CheckoutTreeRejectsPathDepthBeyondTheBudget()
+    {
+        var deepPath = string.Join('/', Enumerable.Range(0, 33).Select(index => "level" + index)) + "/compose.yaml";
+        var tree = $"100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/{deepPath}";
+
+        var exception = Assert.Throws<GitTreePolicyException>(() => GitTreePolicy.Validate(tree, "workspace_one/stack_web"));
+
+        Assert.Equal("resource_limit", exception.Code);
+    }
+
+    [Fact]
+    public void CheckoutTreePreservesExecutableModeInValidatedEntries()
+    {
+        var tree = "100755 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/entrypoint.sh\n"
+            + "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml";
+
+        var entries = GitTreePolicy.ValidateEntries(tree, "workspace_one/stack_web");
+
+        Assert.True(Assert.Single(entries, entry => entry.RelativePath == "entrypoint.sh").IsExecutable);
+        Assert.False(Assert.Single(entries, entry => entry.RelativePath == "compose.yaml").IsExecutable);
     }
 
     [Fact]
@@ -241,7 +299,7 @@ public sealed class GitTreePolicyTests
         {
             TreeResult = new ProcessResult(
                 1,
-                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n",
                 "tree failed")
         };
         var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
@@ -390,10 +448,12 @@ public sealed class GitTreePolicyTests
         var stackPath = Path.Combine(root, "workspace_one", "stack_web");
         var gitPath = Path.Combine(stackPath, ".git");
         Directory.CreateDirectory(gitPath);
-        File.WriteAllText(Path.Combine(stackPath, "stale.txt"), "old");
+        var stalePath = Path.Combine(stackPath, "obsolete", "nested", "stale.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(stalePath)!);
+        File.WriteAllText(stalePath, "old");
         File.WriteAllText(
             Path.Combine(gitPath, "stackpivot-checkout.json"),
-            JsonSerializer.Serialize(new { commit = "old", path = "workspace_one/stack_web", files = new[] { "stale.txt" } }));
+            JsonSerializer.Serialize(new { commit = "old", path = "workspace_one/stack_web", files = new[] { "obsolete/nested/stale.txt" } }));
 
         var runner = new MaterializationRunner();
         var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
@@ -411,7 +471,160 @@ public sealed class GitTreePolicyTests
                 CancellationToken.None);
 
             Assert.True(result.Success, result.ErrorCode);
-            Assert.False(File.Exists(Path.Combine(stackPath, "stale.txt")));
+            Assert.False(File.Exists(stalePath));
+            Assert.False(Directory.Exists(Path.Combine(stackPath, "obsolete", "nested")));
+            Assert.False(Directory.Exists(Path.Combine(stackPath, "obsolete")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task FailedStagedFileCopyLeavesPreviouslyManagedFilesInPlace()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-copy-failure-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var gitPath = Path.Combine(stackPath, ".git");
+        Directory.CreateDirectory(gitPath);
+        var stalePath = Path.Combine(stackPath, "obsolete", "nested", "stale.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(stalePath)!);
+        File.WriteAllText(stalePath, "old");
+        File.WriteAllText(
+            Path.Combine(gitPath, "stackpivot-checkout.json"),
+            JsonSerializer.Serialize(new { commit = "old", path = "workspace_one/stack_web", files = new[] { "obsolete/nested/stale.txt" } }));
+        var runner = new MaterializationRunner
+        {
+            TreeResult = new ProcessResult(
+                0,
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n"
+                + "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/missing.txt\n",
+                string.Empty)
+        };
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.True(File.Exists(stalePath));
+            Assert.Equal("old", await File.ReadAllTextAsync(stalePath));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task SuccessfulCheckoutRemovesEmptyDirectoriesOwnedByThePreviousTree()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-empty-directories-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var gitPath = Path.Combine(stackPath, ".git");
+        var stalePath = Path.Combine(stackPath, "obsolete", "nested", "stale.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(stalePath)!);
+        Directory.CreateDirectory(gitPath);
+        File.WriteAllText(stalePath, "old");
+        File.WriteAllText(
+            Path.Combine(gitPath, "stackpivot-checkout.json"),
+            JsonSerializer.Serialize(new { commit = "old", path = "workspace_one/stack_web", files = new[] { "obsolete/nested/stale.txt" } }));
+        var executor = new GitCheckoutExecutor(new MaterializationRunner(), new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.True(result.Success, result.ErrorCode);
+            Assert.False(File.Exists(stalePath));
+            Assert.False(Directory.Exists(Path.Combine(stackPath, "obsolete", "nested")));
+            Assert.False(Directory.Exists(Path.Combine(stackPath, "obsolete")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task SuccessfulCheckoutReplacesAnOldManagedDirectoryWithAFile()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-directory-to-file-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var gitPath = Path.Combine(stackPath, ".git");
+        var oldFile = Path.Combine(stackPath, "foo", "bar.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(oldFile)!);
+        Directory.CreateDirectory(gitPath);
+        File.WriteAllText(oldFile, "old");
+        File.WriteAllText(
+            Path.Combine(gitPath, "stackpivot-checkout.json"),
+            JsonSerializer.Serialize(new { commit = "old", path = "workspace_one/stack_web", files = new[] { "foo/bar.txt" } }));
+        var runner = new MaterializationRunner
+        {
+            TreeResult = new ProcessResult(
+                0,
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n"
+                + "100644 blob 0123456789012345678901234567890123456789 3\tworkspace_one/stack_web/foo\n",
+                string.Empty),
+            BeforeReadTree = request =>
+            {
+                var workTree = request.Arguments
+                    .Single(argument => argument.StartsWith("--work-tree=", StringComparison.Ordinal))["--work-tree=".Length..];
+                Directory.CreateDirectory(workTree);
+                File.WriteAllText(Path.Combine(workTree, "foo"), "new");
+            }
+        };
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.True(result.Success, result.ErrorCode);
+            Assert.Equal("new", await File.ReadAllTextAsync(Path.Combine(stackPath, "foo")));
+            Assert.False(File.Exists(oldFile));
+            Assert.DoesNotContain("foo/bar.txt", result.MaterializedFiles);
         }
         finally
         {
@@ -471,12 +684,12 @@ public sealed class GitTreePolicyTests
 
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-tree-budget-" + Guid.NewGuid().ToString("N"));
         var files = Enumerable.Range(0, 4097)
-            .Select(index => $"100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/file-{index}.txt");
+            .Select(index => $"100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/file-{index}.txt");
         var tree = string.Join(
             '\n',
             new[]
             {
-                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml"
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml"
             }.Concat(files));
         var runner = new MaterializationRunner
         {
@@ -576,8 +789,8 @@ public sealed class GitTreePolicyTests
         {
             TreeResult = new ProcessResult(
                 0,
-                "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n"
-                + "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/config/data.txt\n",
+                "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n"
+                + "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/config/data.txt\n",
                 string.Empty)
         };
         var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
@@ -707,7 +920,7 @@ public sealed class GitTreePolicyTests
         private string? TimeoutCommand { get; } = timeoutCommand;
         public ProcessResult TreeResult { get; init; } = new(
             0,
-            "100644 blob 0123456789012345678901234567890123456789\tworkspace_one/stack_web/compose.yaml\n",
+            "100644 blob 0123456789012345678901234567890123456789 12\tworkspace_one/stack_web/compose.yaml\n",
             string.Empty);
 
         public Task<ProcessResult> RunAsync(ProcessRequest request, CancellationToken cancellationToken)
