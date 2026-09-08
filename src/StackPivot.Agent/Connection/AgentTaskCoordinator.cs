@@ -113,17 +113,6 @@ public sealed class AgentTaskCoordinator
     {
         try
         {
-            if (!OperatingSystem.IsLinux())
-            {
-                var failure = new AgentExecutionResult(false, -1, string.Empty, false, "platform_unsupported");
-                await reporter.ReportAcceptedAsync(
-                    CreateAccepted(command, DateTimeOffset.UtcNow),
-                    cancellationToken);
-                CacheCompleted(TaskContext.Create(command), failure);
-                await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
-                return failure;
-            }
-
             var lockResult = StackDeploymentLease.TryAcquire(command.AgentStackLocalPath, stackLockDirectory);
             if (!lockResult.Acquired)
             {
@@ -410,11 +399,6 @@ public sealed class AgentTaskCoordinator
 
         public static LeaseResult TryAcquire(string? stackPath, string lockDirectory)
         {
-            if (!OperatingSystem.IsLinux())
-            {
-                return new LeaseResult(false, null, "stack_lock_unavailable");
-            }
-
             if (string.IsNullOrWhiteSpace(stackPath))
             {
                 return new LeaseResult(false, null, "invalid_path");
@@ -433,6 +417,11 @@ public sealed class AgentTaskCoordinator
             var pathBytes = Encoding.UTF8.GetBytes(normalizedPath);
             var lockName = Convert.ToHexString(SHA256.HashData(pathBytes)) + ".lock";
             CryptographicOperations.ZeroMemory(pathBytes);
+            if (!OperatingSystem.IsLinux())
+            {
+                return TryAcquirePortable(lockDirectory, lockName);
+            }
+
             try
             {
                 using var lockDirectoryHandle = SafeDirectoryHandle.OpenOrCreateAbsoluteDirectory(lockDirectory);
@@ -445,6 +434,27 @@ public sealed class AgentTaskCoordinator
             }
             catch (Exception exception) when (exception is PathPolicyException
                 or IOException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or NotSupportedException)
+            {
+                return new LeaseResult(false, null, "stack_lock_unavailable");
+            }
+        }
+
+        private static LeaseResult TryAcquirePortable(string lockDirectory, string lockName)
+        {
+            try
+            {
+                Directory.CreateDirectory(lockDirectory);
+                var stream = new FileStream(
+                    Path.Combine(lockDirectory, lockName),
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None);
+                return new LeaseResult(true, new StackDeploymentLease(stream), null);
+            }
+            catch (Exception exception) when (exception is IOException
                 or UnauthorizedAccessException
                 or ArgumentException
                 or NotSupportedException)

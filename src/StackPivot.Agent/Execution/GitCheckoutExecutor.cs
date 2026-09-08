@@ -35,6 +35,12 @@ public sealed class GitTreePolicyException(string code, string message) : Except
     public string Code { get; } = code;
 }
 
+internal sealed class CheckoutRollbackException(Exception originalFailure, Exception rollbackFailure)
+    : Exception("Checkout rollback failed after the original checkout failure.", rollbackFailure)
+{
+    public Exception OriginalFailure { get; } = originalFailure;
+}
+
 internal sealed class CheckoutMetadataPolicyException(string message) : Exception(message)
 {
 }
@@ -394,6 +400,10 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             {
                 return await MaterializeInDirectoryAsync(input, safePath, cancellationToken);
             }
+            catch (CheckoutRollbackException)
+            {
+                return Failure("checkout_rollback_failed");
+            }
             catch (PathPolicyException)
             {
                 return Failure("invalid_path");
@@ -592,7 +602,17 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                     previousCheckout = ReadPreviousCheckout(repositoryHandle, input.StackGitRelativePath);
                     foreach (var file in files)
                     {
-                        directoryHandle.ValidateManagedFilePath(file);
+                        try
+                        {
+                            directoryHandle.ValidateManagedFilePath(file);
+                        }
+                        catch (PathPolicyException) when (
+                            IsExistingDirectory(directoryHandle, file)
+                            && previousCheckout.Files.Any(previous => IsPathWithin(previous, file)))
+                        {
+                            // A managed directory may be replaced by an incoming regular file
+                            // after its previous managed descendants are moved aside.
+                        }
                     }
 
                     foreach (var file in previousCheckout.Files)
@@ -770,9 +790,34 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         await CopyStagedFilesAsync(source, staged, entries, cancellationToken);
 
         var oldFilesMoved = new List<string>();
+        var overwrittenFilesMoved = new List<string>();
         var newFilesMoved = new List<string>();
+        var metadataReplaced = false;
         try
         {
+            var previousFiles = previousCheckout.Files
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var entry in entries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (previousFiles.Contains(entry.RelativePath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (TryMoveExistingFile(destination, entry.RelativePath, backup, entry.RelativePath))
+                    {
+                        overwrittenFilesMoved.Add(entry.RelativePath);
+                    }
+                }
+                catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
+                {
+                    // The incoming file did not replace an existing unmanaged file.
+                }
+            }
+
             foreach (var relative in previousCheckout.Files.Distinct(StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -796,23 +841,40 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
                 newFilesMoved.Add(entry.RelativePath);
             }
 
-            WriteMetadata(gitDirectory, metadataJson);
+            WriteMetadata(gitDirectory, metadataJson, out metadataReplaced);
             RemoveEmptyManagedDirectories(destination, previousCheckout.Files, entries.Select(entry => entry.RelativePath));
         }
-        catch
+        catch (Exception originalFailure)
         {
-            foreach (var relative in newFilesMoved.AsEnumerable().Reverse())
+            try
             {
-                TryMoveFile(destination, relative, staged, relative);
+                foreach (var relative in newFilesMoved.AsEnumerable().Reverse())
+                {
+                    TryMoveFile(destination, relative, staged, relative);
+                }
+
+                foreach (var relative in oldFilesMoved.AsEnumerable().Reverse())
+                {
+                    TryMoveFile(backup, relative, destination, relative);
+                }
+
+                foreach (var relative in overwrittenFilesMoved.AsEnumerable().Reverse())
+                {
+                    TryMoveFile(backup, relative, destination, relative);
+                }
+
+                if (metadataReplaced)
+                {
+                    TryRestoreMetadata(gitDirectory, previousCheckout.MetadataJson);
+                }
+
+                RemoveEmptyManagedDirectories(destination, entries.Select(entry => entry.RelativePath), previousCheckout.Files);
+            }
+            catch (Exception rollbackFailure)
+            {
+                throw new CheckoutRollbackException(originalFailure, rollbackFailure);
             }
 
-            foreach (var relative in oldFilesMoved.AsEnumerable().Reverse())
-            {
-                TryMoveFile(backup, relative, destination, relative);
-            }
-
-            TryRestoreMetadata(gitDirectory, previousCheckout.MetadataJson);
-            RemoveEmptyManagedDirectories(destination, entries.Select(entry => entry.RelativePath), previousCheckout.Files);
             throw;
         }
     }
@@ -832,6 +894,65 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
         }
     }
 
+    private static bool TryMoveExistingFile(
+        SafeDirectoryHandle source,
+        string sourcePath,
+        SafeDirectoryHandle destination,
+        string destinationPath)
+    {
+        if (IsExistingDirectory(source, sourcePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var file = source.OpenFile(sourcePath, FileMode.Open, FileAccess.Read);
+            source.MoveFileTo(sourcePath, destination, destinationPath);
+            return true;
+        }
+        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.EntryNotFound)
+        {
+            return false;
+        }
+        catch (PathPolicyException exception) when (exception.ErrorNumber == LinuxPathOperations.NotDirectory)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsExistingDirectory(
+        SafeDirectoryHandle root,
+        string relativePath)
+    {
+        var segments = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        SafeDirectoryHandle? current = null;
+        try
+        {
+            var parent = root;
+            for (var index = 0; index < segments.Length - 1; index++)
+            {
+                var next = parent.TryOpenChildDirectory(segments[index]);
+                if (next is null)
+                {
+                    return false;
+                }
+
+                current?.Dispose();
+                current = next;
+                parent = next;
+            }
+
+            var final = parent.TryOpenChildDirectory(segments[^1]);
+            final?.Dispose();
+            return final is not null;
+        }
+        finally
+        {
+            current?.Dispose();
+        }
+    }
+
     private static void TryRestoreMetadata(
         SafeDirectoryHandle gitDirectory,
         string? previousMetadataJson)
@@ -844,12 +965,12 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             }
             else
             {
-                WriteMetadata(gitDirectory, previousMetadataJson);
+                WriteMetadata(gitDirectory, previousMetadataJson, out _);
             }
         }
-        catch (PathPolicyException)
+        catch (Exception exception)
         {
-            // Preserve the original checkout failure; the metadata write is still fail-closed.
+            throw new InvalidOperationException("Unable to restore checkout metadata.", exception);
         }
     }
 
@@ -931,8 +1052,10 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
 
     private static void WriteMetadata(
         SafeDirectoryHandle gitDirectory,
-        string json)
+        string json,
+        out bool replaced)
     {
+        replaced = false;
         var temporaryName = "stackpivot-checkout.json.tmp-" + Guid.NewGuid().ToString("N");
         try
         {
@@ -955,6 +1078,7 @@ public sealed class GitCheckoutExecutor : IGitCheckoutExecutor
             }
 
             LinuxAtomicFileOperations.Replace(gitDirectory, temporaryName, "stackpivot-checkout.json");
+            replaced = true;
             LinuxAtomicFileOperations.FlushDirectory(gitDirectory);
         }
         catch (CheckoutMetadataPolicyException exception)

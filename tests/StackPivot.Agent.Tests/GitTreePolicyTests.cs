@@ -535,6 +535,140 @@ public sealed class GitTreePolicyTests
     }
 
     [SkippableFact]
+    public async Task FailedLiveSwapRestoresManagedFilesAndLeavesConflictingDirectoriesInPlace()
+    {
+        TestPlatform.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-live-rollback-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var gitPath = Path.Combine(stackPath, ".git");
+        var oldPath = Path.Combine(stackPath, "old.txt");
+        var conflictingPath = Path.Combine(stackPath, "compose.yaml");
+        var metadata = JsonSerializer.Serialize(new
+        {
+            commit = "old",
+            path = "workspace_one/stack_web",
+            files = new[] { "old.txt" }
+        });
+        Directory.CreateDirectory(gitPath);
+        File.WriteAllText(oldPath, "old");
+        File.WriteAllText(Path.Combine(gitPath, "stackpivot-checkout.json"), metadata);
+        var runner = new MaterializationRunner
+        {
+            BeforeReadTree = _ => Directory.CreateDirectory(conflictingPath)
+        };
+        var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+        try
+        {
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("invalid_path", result.ErrorCode);
+            Assert.Equal("old", await File.ReadAllTextAsync(oldPath));
+            Assert.True(Directory.Exists(conflictingPath));
+            Assert.Equal(metadata, await File.ReadAllTextAsync(Path.Combine(gitPath, "stackpivot-checkout.json")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task MetadataReplacementFailureRestoresTheLiveTreeAndPreviousMetadata()
+    {
+        TestPlatform.RequireLinux();
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new Xunit.SkipException("Linux-only test: requires Unix file permissions.");
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-git-metadata-rollback-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        var gitPath = Path.Combine(stackPath, ".git");
+        var oldPath = Path.Combine(stackPath, "old.txt");
+        var metadataPath = Path.Combine(gitPath, "stackpivot-checkout.json");
+        var metadata = JsonSerializer.Serialize(new
+        {
+            commit = "old",
+            path = "workspace_one/stack_web",
+            files = new[] { "old.txt" }
+        });
+        Directory.CreateDirectory(gitPath);
+        File.WriteAllText(oldPath, "old");
+        File.WriteAllText(metadataPath, metadata);
+        var originalMode = File.GetUnixFileMode(gitPath);
+        File.SetUnixFileMode(gitPath, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var probePath = Path.Combine(gitPath, "write-probe");
+            try
+            {
+                using (File.Open(probePath, FileMode.CreateNew, FileAccess.Write))
+                {
+                }
+
+                File.Delete(probePath);
+                throw new Xunit.SkipException("The test filesystem user can bypass directory write permissions.");
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+
+            var runner = new MaterializationRunner
+            {
+                BeforeReadTree = _ =>
+                {
+                    if (OperatingSystem.IsLinux())
+                    {
+                        File.SetUnixFileMode(gitPath, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                    }
+                }
+            };
+            var executor = new GitCheckoutExecutor(runner, new PathPolicy(root), TimeSpan.FromSeconds(5), AllowedRemoteHosts);
+
+            var result = await executor.MaterializeAsync(
+                new GitDeploymentInput(
+                    "https://git.example/repository.git",
+                    "git-user",
+                    "secret"u8.ToArray(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "workspace_one/stack_web",
+                    stackPath),
+                CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("invalid_path", result.ErrorCode);
+            Assert.Equal("old", await File.ReadAllTextAsync(oldPath));
+            Assert.False(File.Exists(Path.Combine(stackPath, "compose.yaml")));
+            Assert.Equal(metadata, await File.ReadAllTextAsync(metadataPath));
+        }
+        finally
+        {
+            File.SetUnixFileMode(gitPath, originalMode);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task SuccessfulCheckoutRemovesEmptyDirectoriesOwnedByThePreviousTree()
     {
         TestPlatform.RequireLinux();

@@ -1658,25 +1658,47 @@ internal sealed class ComposeWorkspaceSnapshot : IDisposable
         switch (node)
         {
             case ComposeScalar:
-                ValidatePathNode(node, "build.ssh");
+                ValidateSshValue(RequireScalar(node, "build.ssh"));
                 break;
             case ComposeSequence sequence:
                 foreach (var item in sequence.Items)
                 {
-                    ValidatePathNode(item, "build.ssh");
+                    ValidateSshValue(RequireScalar(item, "build.ssh"));
                 }
 
                 break;
             case ComposeMap map:
                 foreach (var property in map.Properties)
                 {
-                    ValidatePathNode(property.Value, "build.ssh." + property.Key);
+                    if (string.Equals(property.Key, "default", StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new PathPolicyException("Compose build.ssh cannot use the host SSH agent.");
+                    }
+
+                    ValidateSshValue(RequireScalar(property.Value, "build.ssh." + property.Key));
                 }
 
                 break;
             default:
                 throw new PathPolicyException("Compose build.ssh has an unsupported value.");
         }
+    }
+
+    private static void ValidateSshValue(ComposeScalar scalar)
+    {
+        if (scalar.IsBlockScalar || scalar.IsNull || scalar.Value.Length == 0)
+        {
+            throw new PathPolicyException("Compose build.ssh must reference a private workspace file.");
+        }
+
+        var value = scalar.Value.Trim();
+        if (string.Equals(value, "default", StringComparison.OrdinalIgnoreCase)
+            || value.Contains("SSH_AUTH_SOCK", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new PathPolicyException("Compose build.ssh cannot use the host SSH agent.");
+        }
+
+        ValidatePathValue(value);
     }
 
     private static void ValidateDevelop(ComposeNode node)

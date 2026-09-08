@@ -68,12 +68,17 @@ public sealed class ComposeExecutor
         CancellationToken cancellationToken,
         SafeDirectoryHandle? workingDirectoryHandle = null)
     {
+        using var dockerConfig = CreateDockerConfigDirectory();
+        var environment = CreateComposeEnvironment();
+        AddPrivateDockerConfig(environment, dockerConfig);
         var version = await processRunner.RunAsync(
             new ProcessRequest(
                 "docker",
                 ComposeVersionArguments,
                 workingDirectory,
+                EnvironmentVariables: environment,
                 Timeout: timeout,
+                ClearInheritedEnvironment: true,
                 WorkingDirectoryHandle: workingDirectoryHandle),
             cancellationToken);
         var sanitized = Sanitize(version);
@@ -112,13 +117,15 @@ public sealed class ComposeExecutor
                     cancellationToken);
             var processWorkingDirectory = snapshot?.WorkingDirectory ?? workingDirectory;
             var processWorkingDirectoryHandle = snapshot?.WorkingDirectoryHandle ?? workingDirectoryHandle;
-            var environment = snapshot is null
-                ? null
-                : new Dictionary<string, string?>
-                {
-                    ["COMPOSE_FILE"] = snapshot.ComposeFileName,
-                    ["COMPOSE_PROJECT_NAME"] = Path.GetFileName(workingDirectory.TrimEnd(Path.DirectorySeparatorChar))
-                };
+            using var dockerConfig = CreateDockerConfigDirectory();
+            var environment = CreateComposeEnvironment();
+            AddPrivateDockerConfig(environment, dockerConfig);
+            if (snapshot is not null)
+            {
+                environment["COMPOSE_FILE"] = snapshot.ComposeFileName;
+                environment["COMPOSE_PROJECT_NAME"] = Path.GetFileName(workingDirectory.TrimEnd(Path.DirectorySeparatorChar));
+            }
+
             var execution = await processRunner.RunAsync(
                 new ProcessRequest(
                     "docker",
@@ -126,6 +133,7 @@ public sealed class ComposeExecutor
                     processWorkingDirectory,
                     EnvironmentVariables: environment,
                     Timeout: timeout,
+                    ClearInheritedEnvironment: true,
                     OutputHandler: outputHandler is null
                         ? null
                         : line => outputHandler(new ProcessOutputLine(line.Stream, sanitizer.Sanitize(line.Text))),
@@ -148,6 +156,36 @@ public sealed class ComposeExecutor
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
         {
             return new ComposeExecutionResult(false, -1, string.Empty, false, "compose_workspace_unavailable");
+        }
+    }
+
+    private static Dictionary<string, string?> CreateComposeEnvironment()
+    {
+        return new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ["SSH_AUTH_SOCK"] = null,
+            ["DOCKER_AUTH_CONFIG"] = null,
+            ["DOCKER_CONFIG"] = null,
+            ["GIT_ASKPASS"] = null,
+            ["GIT_CONFIG_GLOBAL"] = null,
+            ["GIT_CONFIG_SYSTEM"] = null
+        };
+    }
+
+    private static TemporaryDirectory? CreateDockerConfigDirectory() =>
+        OperatingSystem.IsLinux()
+            ? SafeDirectoryHandle.CreateTemporaryDirectory("compose-docker-config-")
+            : null;
+
+    private static void AddPrivateDockerConfig(
+        Dictionary<string, string?> environment,
+        TemporaryDirectory? dockerConfig)
+    {
+        if (dockerConfig is not null)
+        {
+            environment["DOCKER_CONFIG"] = dockerConfig.FullPath;
+            environment["HOME"] = dockerConfig.FullPath;
         }
     }
 

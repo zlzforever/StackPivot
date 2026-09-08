@@ -48,6 +48,27 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
+    public void ClearInheritedEnvironmentRemovesHostCredentialsFromTheStartInfo()
+    {
+        var startInfo = ProcessRunner.CreateStartInfo(
+            new ProcessRequest(
+                "printf",
+                [],
+                Directory.GetCurrentDirectory(),
+                EnvironmentVariables: new Dictionary<string, string?>
+                {
+                    ["PATH"] = "/usr/bin",
+                    ["SSH_AUTH_SOCK"] = null,
+                    ["DOCKER_AUTH_CONFIG"] = null
+                },
+                ClearInheritedEnvironment: true));
+
+        Assert.Equal("/usr/bin", startInfo.Environment["PATH"]);
+        Assert.DoesNotContain("SSH_AUTH_SOCK", startInfo.Environment.Keys);
+        Assert.DoesNotContain("DOCKER_AUTH_CONFIG", startInfo.Environment.Keys);
+    }
+
+    [Fact]
     public async Task OutputHandlerFailureReturnsAnExplicitFailureResult()
     {
         var result = await new ProcessRunner().RunAsync(
@@ -202,6 +223,92 @@ public sealed class ProcessRunnerTests
         }
     }
 
+    [SkippableFact]
+    public async Task TimeoutKillsAChildThatKeepsThePipesAfterTheParentExits()
+    {
+        TestPlatform.RequireLinux();
+        var harnessPath = Path.Combine(AppContext.BaseDirectory, "StackPivot.ProcessHarness.dll");
+        Assert.True(File.Exists(harnessPath), $"Process harness was not copied to {AppContext.BaseDirectory}.");
+        var childPidPath = Path.Combine(Path.GetTempPath(), "stackpivot-child-pid-" + Guid.NewGuid().ToString("N"));
+        var execution = new ProcessRunner().RunAsync(
+            new ProcessRequest(
+                "dotnet",
+                [harnessPath, "spawn-child-and-exit", childPidPath],
+                Directory.GetCurrentDirectory(),
+                Timeout: TimeSpan.FromMilliseconds(250)),
+            CancellationToken.None);
+        var childPid = 0;
+
+        try
+        {
+            childPid = await WaitForPidAsync(childPidPath);
+            var result = await execution.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.True(result.TimedOut);
+            Assert.Equal(-1, result.ExitCode);
+            Assert.True(await WaitForProcessExitAsync(childPid), $"Child process {childPid} survived after its parent exited.");
+        }
+        finally
+        {
+            KillProcess(childPid);
+            try
+            {
+                await execution.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (Exception)
+            {
+            }
+
+            if (File.Exists(childPidPath))
+            {
+                File.Delete(childPidPath);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task OutputHandlerFailureKillsAChildThatKeepsThePipesAfterTheParentExits()
+    {
+        TestPlatform.RequireLinux();
+        var harnessPath = Path.Combine(AppContext.BaseDirectory, "StackPivot.ProcessHarness.dll");
+        Assert.True(File.Exists(harnessPath), $"Process harness was not copied to {AppContext.BaseDirectory}.");
+        var childPidPath = Path.Combine(Path.GetTempPath(), "stackpivot-child-pid-" + Guid.NewGuid().ToString("N"));
+        var execution = new ProcessRunner().RunAsync(
+            new ProcessRequest(
+                "dotnet",
+                [harnessPath, "spawn-child-and-exit", childPidPath],
+                Directory.GetCurrentDirectory(),
+                OutputHandler: _ => ValueTask.FromException(new InvalidOperationException("handler failed"))),
+            CancellationToken.None);
+        var childPid = 0;
+
+        try
+        {
+            childPid = await WaitForPidAsync(childPidPath);
+            var result = await execution.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(-1, result.ExitCode);
+            Assert.Equal("output_handler_failed", result.ErrorCode);
+            Assert.True(await WaitForProcessExitAsync(childPid), $"Child process {childPid} survived an output handler failure.");
+        }
+        finally
+        {
+            KillProcess(childPid);
+            try
+            {
+                await execution.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (Exception)
+            {
+            }
+
+            if (File.Exists(childPidPath))
+            {
+                File.Delete(childPidPath);
+            }
+        }
+    }
+
     private static async Task<int> WaitForPidAsync(string path)
     {
         var deadline = DateTime.UtcNow.AddSeconds(5);
@@ -241,5 +348,28 @@ public sealed class ProcessRunnerTests
         }
 
         return false;
+    }
+
+    private static void KillProcess(int pid)
+    {
+        if (pid <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (ArgumentException)
+        {
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
 }

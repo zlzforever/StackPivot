@@ -844,10 +844,91 @@ public sealed class DeploymentEventTests
                 protector,
                 new AuditWriter(db));
 
-            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 dispatcher.HandleAcceptedAsync(
                     CreateAccepted(historyForReport, DateTimeOffset.UtcNow),
                     CancellationToken.None));
+            Assert.Equal("simulated unknown commit result", exception.Message);
+
+            await using var verifyDb = new StackPivotDbContext(baseOptions);
+            var persisted = await verifyDb.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            Assert.Equal("pending", persisted.TaskStatus);
+            Assert.NotNull(persisted.AcceptedAt);
+            Assert.NotNull(persisted.StartTime);
+            Assert.Null(persisted.FinishTime);
+            Assert.Null(persisted.ExitCode);
+            Assert.Null(persisted.ErrorCode);
+            Assert.Single(await verifyDb.AuditLogs
+                .Where(value => value.Action == AuditActions.TaskAccepted)
+                .ToListAsync());
+            Assert.Equal(1, commitFailure.CommitCalls);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                File.Delete(databasePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task AcceptedReportCommitFailureBeforeCommitRollsBackTheStateChange()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-accepted-commit-rollback-" + Guid.NewGuid().ToString("N") + ".db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        try
+        {
+            var baseOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            var commitFailure = new CommitFailureInterceptor
+            {
+                Enabled = true,
+                FailBeforeCommit = true
+            };
+            var dispatchOptions = new DbContextOptionsBuilder<StackPivotDbContext>()
+                .UseSqlite(connectionString)
+                .AddInterceptors(commitFailure)
+                .Options;
+            await using (var seedDb = new StackPivotDbContext(baseOptions))
+            {
+                await seedDb.Database.EnsureCreatedAsync();
+                await SeedAsync(seedDb);
+                var history = await seedDb.ServiceOperationHistories.SingleAsync();
+                history.DispatchAttemptAt = DateTimeOffset.UtcNow;
+                history.DispatchedAt = history.DispatchAttemptAt;
+                await seedDb.SaveChangesAsync();
+            }
+
+            await using var db = new StackPivotDbContext(dispatchOptions);
+            var historyForReport = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            var dispatcher = new DeploymentDispatcher(
+                db,
+                new OfflineTransport(),
+                protector,
+                new AuditWriter(db));
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                dispatcher.HandleAcceptedAsync(
+                    CreateAccepted(historyForReport, DateTimeOffset.UtcNow),
+                    CancellationToken.None));
+            Assert.Equal("simulated commit failure before commit", exception.Message);
+
+            await using var verifyDb = new StackPivotDbContext(baseOptions);
+            var persisted = await verifyDb.ServiceOperationHistories.AsNoTracking().SingleAsync();
+            Assert.Equal("pending", persisted.TaskStatus);
+            Assert.Null(persisted.AcceptedAt);
+            Assert.Null(persisted.StartTime);
+            Assert.Null(persisted.FinishTime);
+            Assert.Null(persisted.ExitCode);
+            Assert.Null(persisted.ErrorCode);
+            Assert.Empty(await verifyDb.AuditLogs
+                .Where(value => value.Action == AuditActions.TaskAccepted)
+                .ToListAsync());
+            Assert.Equal(1, commitFailure.CommitAttemptCalls);
+            Assert.Equal(0, commitFailure.CommitCalls);
         }
         finally
         {
@@ -1843,13 +1924,34 @@ public sealed class DeploymentEventTests
     private sealed class CommitFailureInterceptor : DbTransactionInterceptor
     {
         public bool Enabled { get; set; }
+        public bool FailBeforeCommit { get; set; }
+        public int CommitAttemptCalls => Volatile.Read(ref commitAttemptCalls);
+        public int CommitCalls => Volatile.Read(ref commitCalls);
+        private int commitAttemptCalls;
+        private int commitCalls;
         private int failed;
+
+        public override ValueTask<InterceptionResult> TransactionCommittingAsync(
+            DbTransaction transaction,
+            TransactionEventData eventData,
+            InterceptionResult result,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref commitAttemptCalls);
+            if (Enabled && FailBeforeCommit)
+            {
+                throw new InvalidOperationException("simulated commit failure before commit");
+            }
+
+            return ValueTask.FromResult(result);
+        }
 
         public override Task TransactionCommittedAsync(
             DbTransaction transaction,
             TransactionEndEventData eventData,
             CancellationToken cancellationToken = default)
         {
+            Interlocked.Increment(ref commitCalls);
             if (Enabled && Interlocked.Exchange(ref failed, 1) == 0)
             {
                 throw new InvalidOperationException("simulated unknown commit result");

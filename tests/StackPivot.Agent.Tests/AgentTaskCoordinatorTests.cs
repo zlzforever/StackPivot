@@ -13,11 +13,9 @@ public sealed class AgentTaskCoordinatorTests
 {
     private static readonly Guid AgentId = Guid.Parse("00000000-0000-0000-0000-000000000001");
 
-    [SkippableFact]
+    [Fact]
     public async Task ConcurrentCommandsForOneTaskExecuteOnlyOnce()
     {
-        TestPlatform.RequireLinux();
-
         var executor = new BlockingExecutor();
         var coordinator = new AgentTaskCoordinator(AgentId, executor);
         var firstReporter = new RecordingReporter();
@@ -43,11 +41,9 @@ public sealed class AgentTaskCoordinatorTests
         Assert.All(secondCommand.AccessToken, value => Assert.Equal(0, value));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task ExecutorExceptionIsReportedAndTaskCanBeReplayedWithoutReexecution()
     {
-        TestPlatform.RequireLinux();
-
         var executor = new ThrowingExecutor();
         var coordinator = new AgentTaskCoordinator(AgentId, executor);
         var firstReporter = new RecordingReporter();
@@ -87,18 +83,16 @@ public sealed class AgentTaskCoordinatorTests
         var secondReporter = new RecordingReporter();
         await coordinator.HandleAsync(secondCommand, secondReporter, CancellationToken.None);
 
-        Assert.Equal(0, executor.ExecutionCount);
+        Assert.Equal(1, executor.ExecutionCount);
         Assert.Single(secondReporter.Accepted);
         var completed = Assert.Single(secondReporter.Completed);
         Assert.False(completed.Success);
         Assert.Equal("task_context_mismatch", completed.ErrorCode);
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task StreamingExecutorReportsBothStreamsBeforeCompletionAndPreservesTruncation()
     {
-        TestPlatform.RequireLinux();
-
         var coordinator = new AgentTaskCoordinator(AgentId, new StreamingExecutor());
         var reporter = new RecordingReporter();
 
@@ -126,11 +120,9 @@ public sealed class AgentTaskCoordinatorTests
         Assert.All(command.AccessToken, value => Assert.Equal(0, value));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task CompletedTaskCacheIsBoundedAndCachedTasksRemainIdempotent()
     {
-        TestPlatform.RequireLinux();
-
         var executor = new LargeOutputExecutor();
         var coordinator = new AgentTaskCoordinator(
             AgentId,
@@ -165,11 +157,9 @@ public sealed class AgentTaskCoordinatorTests
         Assert.True((int)completedTasks!.GetType().GetProperty("Count")!.GetValue(completedTasks)! <= 1);
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task ExpiredCompletedTaskIsExecutedAgainInsteadOfReplayed()
     {
-        TestPlatform.RequireLinux();
-
         var executor = new LargeOutputExecutor();
         var coordinator = new AgentTaskCoordinator(
             AgentId,

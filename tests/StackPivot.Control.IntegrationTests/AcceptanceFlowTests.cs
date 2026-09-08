@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text.Json;
 using Microsoft.AspNetCore.Antiforgery;
@@ -13,6 +14,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using StackPivot.Control.Api;
 using StackPivot.Control.Auth;
 using StackPivot.Control.Authorization;
 using StackPivot.Control.Domain.Entities;
@@ -167,6 +169,62 @@ public sealed class AcceptanceFlowTests(AcceptanceFlowFactory factory)
     }
 
     [Fact]
+    public async Task OversizedDeploymentBodyIsRejectedBeforeLookingUpTheStack()
+    {
+        using var client = factory.CreateAuthenticatedClient();
+        var payload = new byte[RequestBodyReader.MaxJsonBodyBytes + 1];
+        Array.Fill(payload, (byte)'a');
+        using var request = CreateRawDeploymentRequest(Guid.NewGuid(), Guid.NewGuid(), payload);
+        factory.AddAntiforgeryHeaders(request);
+
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+        Assert.Contains("\"code\":\"request_too_large\"", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DeploymentBodyAtTheExactLimitIsAcceptedWhenReadInChunks()
+    {
+        var fixture = await factory.SeedStackAsync();
+        using var client = factory.CreateAuthenticatedClient();
+        var payload = CreateBoundaryDeploymentPayload();
+        using var request = CreateRawDeploymentRequest(
+            fixture.StackId,
+            Guid.NewGuid(),
+            payload,
+            new ChunkedJsonContent(payload, 1021));
+        request.Headers.TransferEncodingChunked = true;
+        factory.AddAntiforgeryHeaders(request);
+
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.True(response.StatusCode == HttpStatusCode.Accepted, body);
+        Assert.DoesNotContain("\"code\":\"request_too_large\"", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DeploymentBodyWithInvalidUtf8IsRejectedBeforeServiceValidation()
+    {
+        using var client = factory.CreateAuthenticatedClient();
+        var payload = new byte[]
+        {
+            (byte)'{', (byte)'"', (byte)'t', (byte)'a', (byte)'r', (byte)'g', (byte)'e', (byte)'t',
+            (byte)'"', (byte)':', (byte)'"', 0xC3, 0x28, (byte)'"', (byte)'}'
+        };
+        using var request = CreateRawDeploymentRequest(Guid.NewGuid(), Guid.NewGuid(), payload);
+        factory.AddAntiforgeryHeaders(request);
+
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        Assert.Contains("\"code\":\"invalid_request\"", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task SingleAgentDeploymentCreatesOnlyTheSelectedBoundTarget()
     {
         var fixture = await factory.SeedStackWithAgentsAsync();
@@ -250,6 +308,52 @@ public sealed class AcceptanceFlowTests(AcceptanceFlowFactory factory)
 
         request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
         return request;
+    }
+
+    private static HttpRequestMessage CreateRawDeploymentRequest(
+        Guid stackId,
+        Guid requestId,
+        byte[] payload,
+        HttpContent? content = null)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, $"/api/stacks/{stackId}/deployments")
+        {
+            Content = content ?? new ByteArrayContent(payload)
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        request.Headers.Add("X-Request-Id", requestId.ToString());
+        request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        return request;
+    }
+
+    private static byte[] CreateBoundaryDeploymentPayload()
+    {
+        const string json = "{\"targetCommitHash\":\"0123456789abcdef0123456789abcdef01234567\",\"mode\":\"boundAgents\",\"agentId\":null}";
+        var paddingLength = RequestBodyReader.MaxJsonBodyBytes
+            - System.Text.Encoding.UTF8.GetByteCount(json);
+        Assert.True(paddingLength > 0);
+        return System.Text.Encoding.UTF8.GetBytes(json + new string(' ', paddingLength));
+    }
+
+    private sealed class ChunkedJsonContent(byte[] payload, int chunkSize) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            WriteChunksAsync(stream);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        private async Task WriteChunksAsync(Stream stream)
+        {
+            for (var offset = 0; offset < payload.Length; offset += chunkSize)
+            {
+                var count = Math.Min(chunkSize, payload.Length - offset);
+                await stream.WriteAsync(payload.AsMemory(offset, count));
+            }
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Text;
 using StackPivot.Agent.Security;
 
@@ -12,7 +13,8 @@ public sealed record ProcessRequest(
     IReadOnlyDictionary<string, string?>? EnvironmentVariables = null,
     TimeSpan? Timeout = null,
     Func<ProcessOutputLine, ValueTask>? OutputHandler = null,
-    SafeDirectoryHandle? WorkingDirectoryHandle = null);
+    SafeDirectoryHandle? WorkingDirectoryHandle = null,
+    bool ClearInheritedEnvironment = false);
 
 public sealed record ProcessOutputLine(string Stream, string Text);
 
@@ -40,30 +42,42 @@ public sealed class ProcessRunner : IProcessRunner
         ArgumentException.ThrowIfNullOrWhiteSpace(request.FileName);
         ArgumentNullException.ThrowIfNull(request.Arguments);
         ArgumentException.ThrowIfNullOrWhiteSpace(request.WorkingDirectory);
+        if (request.Timeout is { } requestedTimeout)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(requestedTimeout, TimeSpan.Zero);
+        }
 
+        var isolateProcessGroup = ShouldIsolateProcessGroup();
         using var process = new Process
         {
             StartInfo = CreateStartInfo(request)
         };
         process.Start();
-        using var timeoutCancellation = request.Timeout is { } timeout
-            ? new CancellationTokenSource(timeout)
+        var processId = process.Id;
+        var processGroupId = isolateProcessGroup
+            ? TryGetIsolatedProcessGroupId(processId)
             : null;
-        using var linkedCancellation = timeoutCancellation is null
-            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCancellation.Token);
-        var waitToken = linkedCancellation.Token;
         var budget = new OutputBudget(MaxOutputBytes);
-        var stdoutTask = ReadBoundedAsync(process.StandardOutput, "stdout", budget, request.OutputHandler, waitToken);
-        var stderrTask = ReadBoundedAsync(process.StandardError, "stderr", budget, request.OutputHandler, waitToken);
-        var waitForExitTask = process.WaitForExitAsync(waitToken);
+        var stdoutTask = ReadBoundedAsync(process.StandardOutput, "stdout", budget, request.OutputHandler, CancellationToken.None);
+        var stderrTask = ReadBoundedAsync(process.StandardError, "stderr", budget, request.OutputHandler, CancellationToken.None);
+        var waitForExitTask = process.WaitForExitAsync(CancellationToken.None);
+        var callerCancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        var timeoutTask = request.Timeout is { } timeout
+            ? Task.Delay(timeout, CancellationToken.None)
+            : null;
+        var processExited = false;
+        var stdoutObserved = false;
+        var stderrObserved = false;
         try
         {
-            var stdoutObserved = false;
-            var stderrObserved = false;
-            while (!waitForExitTask.IsCompleted)
+            while (!processExited || !stdoutObserved || !stderrObserved)
             {
-                var pending = new List<Task>(capacity: 3) { waitForExitTask };
+                var pending = new List<Task>(capacity: 5);
+                if (!processExited)
+                {
+                    pending.Add(waitForExitTask);
+                }
+
                 if (!stdoutObserved)
                 {
                     pending.Add(stdoutTask);
@@ -74,7 +88,27 @@ public sealed class ProcessRunner : IProcessRunner
                     pending.Add(stderrTask);
                 }
 
+                pending.Add(callerCancellationTask);
+                if (timeoutTask is not null)
+                {
+                    pending.Add(timeoutTask);
+                }
+
                 var completed = await Task.WhenAny(pending);
+                if (completed == callerCancellationTask)
+                {
+                    KillProcessTree(process, processGroupId);
+                    await DrainAfterKillAsync(stdoutTask, stderrTask);
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
+                if (completed == timeoutTask)
+                {
+                    KillProcessTree(process, processGroupId);
+                    await DrainAfterKillAsync(stdoutTask, stderrTask);
+                    return new ProcessResult(-1, string.Empty, string.Empty, true, false);
+                }
+
                 if (completed == stdoutTask)
                 {
                     await stdoutTask;
@@ -88,10 +122,10 @@ public sealed class ProcessRunner : IProcessRunner
                 else
                 {
                     await waitForExitTask;
+                    processExited = true;
                 }
             }
 
-            await waitForExitTask;
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
             return new ProcessResult(
@@ -103,28 +137,19 @@ public sealed class ProcessRunner : IProcessRunner
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            if (timeoutCancellation?.IsCancellationRequested != true)
-            {
-                linkedCancellation.Cancel();
-                KillProcessTree(process);
-                await DrainAfterKillAsync(stdoutTask, stderrTask);
-                return new ProcessResult(-1, string.Empty, string.Empty, false, false, "output_handler_failed");
-            }
-
-            KillProcessTree(process);
+            KillProcessTree(process, processGroupId);
             await DrainAfterKillAsync(stdoutTask, stderrTask);
-            return new ProcessResult(-1, string.Empty, string.Empty, true, false);
+            return new ProcessResult(-1, string.Empty, string.Empty, false, false, "output_handler_failed");
         }
         catch (OperationCanceledException)
         {
-            KillProcessTree(process);
+            KillProcessTree(process, processGroupId);
             await DrainAfterKillAsync(stdoutTask, stderrTask);
             throw;
         }
         catch (Exception)
         {
-            linkedCancellation.Cancel();
-            KillProcessTree(process);
+            KillProcessTree(process, processGroupId);
             await DrainAfterKillAsync(stdoutTask, stderrTask);
             return new ProcessResult(-1, string.Empty, string.Empty, false, false, "output_handler_failed");
         }
@@ -148,9 +173,40 @@ public sealed class ProcessRunner : IProcessRunner
 
         if (request.EnvironmentVariables is not null)
         {
+            if (request.ClearInheritedEnvironment)
+            {
+                info.Environment.Clear();
+            }
+
             foreach (var pair in request.EnvironmentVariables)
             {
-                info.Environment[pair.Key] = pair.Value;
+                if (pair.Value is null)
+                {
+                    info.Environment.Remove(pair.Key);
+                }
+                else
+                {
+                    info.Environment[pair.Key] = pair.Value;
+                }
+            }
+        }
+        else if (request.ClearInheritedEnvironment)
+        {
+            info.Environment.Clear();
+        }
+
+        if (OperatingSystem.IsLinux()
+            && TryGetSetsidPath() is { } setsidPath)
+        {
+            var fileName = info.FileName;
+            var arguments = info.ArgumentList.ToArray();
+            info.FileName = setsidPath;
+            info.ArgumentList.Clear();
+            info.ArgumentList.Add("--wait");
+            info.ArgumentList.Add(fileName);
+            foreach (var argument in arguments)
+            {
+                info.ArgumentList.Add(argument);
             }
         }
 
@@ -243,7 +299,7 @@ public sealed class ProcessRunner : IProcessRunner
         return new BoundedOutput(output.ToString(), truncated);
     }
 
-    private static void KillProcessTree(Process process)
+    private static void KillProcessTree(Process process, int? processGroupId)
     {
         try
         {
@@ -261,6 +317,20 @@ public sealed class ProcessRunner : IProcessRunner
         catch (Win32Exception)
         {
         }
+
+        if (processGroupId is { } groupId && OperatingSystem.IsLinux())
+        {
+            try
+            {
+                _ = kill(-groupId, SigKill);
+            }
+            catch (DllNotFoundException)
+            {
+            }
+            catch (EntryPointNotFoundException)
+            {
+            }
+        }
     }
 
     private static async Task DrainAfterKillAsync(
@@ -269,12 +339,77 @@ public sealed class ProcessRunner : IProcessRunner
     {
         try
         {
-            await Task.WhenAll(stdoutTask, stderrTask);
+            await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(5));
         }
         catch (Exception)
         {
         }
     }
+
+    private static bool ShouldIsolateProcessGroup() =>
+        OperatingSystem.IsLinux() && TryGetSetsidPath() is not null;
+
+    private static string? TryGetSetsidPath()
+    {
+        if (File.Exists("/usr/bin/setsid"))
+        {
+            return "/usr/bin/setsid";
+        }
+
+        return File.Exists("/bin/setsid") ? "/bin/setsid" : null;
+    }
+
+    private static bool TryGetProcessGroupId(int processId, out int processGroupId)
+    {
+        processGroupId = 0;
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+
+        try
+        {
+            processGroupId = getpgid(processId);
+            return processGroupId > 0;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
+
+    private static int? TryGetIsolatedProcessGroupId(int processId)
+    {
+        for (var attempt = 0; attempt < 50; attempt++)
+        {
+            if (TryGetProcessGroupId(processId, out var processGroupId)
+                && processGroupId == processId)
+            {
+                return processGroupId;
+            }
+
+            Thread.Sleep(1);
+        }
+
+        // setsid is started directly by Process.Start. Its child cannot already be
+        // a process-group leader, so its PID is the deterministic PGID even after
+        // the --wait wrapper exits.
+        return processId;
+    }
+
+    private const int SigKill = 9;
+
+    #pragma warning disable CA2101
+    [DllImport("libc", EntryPoint = "getpgid", SetLastError = true)]
+    private static extern int getpgid(int processId);
+
+    [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
+    private static extern int kill(int processId, int signal);
+    #pragma warning restore CA2101
 
     private sealed record BoundedOutput(string Text, bool Truncated);
 

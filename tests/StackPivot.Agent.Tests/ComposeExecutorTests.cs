@@ -73,6 +73,33 @@ public sealed class ComposeExecutorTests
     }
 
     [Fact]
+    public async Task ComposeProcessesUseAnExplicitlyCleanEnvironment()
+    {
+        var runner = new RecordingProcessRunner(
+            new ProcessResult(0, "Docker Compose version v2.24.0", string.Empty),
+            new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        var result = await executor.ExecuteAsync(
+            "/opt/agent-main/workspace_one/stack_web",
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, runner.Requests.Count);
+        Assert.All(runner.Requests, request =>
+        {
+            Assert.True(request.ClearInheritedEnvironment);
+            Assert.NotNull(request.EnvironmentVariables);
+            Assert.Contains("SSH_AUTH_SOCK", request.EnvironmentVariables!.Keys);
+            Assert.Null(request.EnvironmentVariables["SSH_AUTH_SOCK"]);
+            Assert.Contains("DOCKER_AUTH_CONFIG", request.EnvironmentVariables.Keys);
+            Assert.Null(request.EnvironmentVariables["DOCKER_AUTH_CONFIG"]);
+            Assert.Contains("GIT_ASKPASS", request.EnvironmentVariables.Keys);
+            Assert.Null(request.EnvironmentVariables["GIT_ASKPASS"]);
+        });
+    }
+
+    [Fact]
     public async Task ComposeOutputIsLimitedToOneMebibyteAfterCombiningStreams()
     {
         var line = new string('x', LogSanitizer.MaxLineBytes);
@@ -203,6 +230,44 @@ public sealed class ComposeExecutorTests
             if (Directory.Exists(outside))
             {
                 Directory.Delete(outside, recursive: true);
+            }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("build:\n      ssh: default")]
+    [InlineData("build:\n      ssh:\n        - default")]
+    [InlineData("build:\n      ssh:\n        default: default")]
+    public async Task ComposeUpRejectsBuildSshThatCouldForwardTheHostAgent(string serviceConfiguration)
+    {
+        TestPlatform.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-ssh-" + Guid.NewGuid().ToString("N"));
+        var stackPath = Path.Combine(root, "workspace_one", "stack_web");
+        Directory.CreateDirectory(stackPath);
+        File.WriteAllText(
+            Path.Combine(stackPath, "compose.yaml"),
+            "services:\n  app:\n    image: alpine\n    " + serviceConfiguration.Replace("\n", "\n    ", StringComparison.Ordinal) + "\n");
+        var policy = new PathPolicy(root);
+        await using var safePath = await policy.OpenStackPathAsync("workspace_one/stack_web", CancellationToken.None);
+        var runner = new RecordingProcessRunner(new ProcessResult(0, "started", string.Empty));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var result = await executor.ExecuteUpAsync(
+                stackPath,
+                CancellationToken.None,
+                workingDirectoryHandle: safePath.DirectoryHandle);
+
+            Assert.False(result.Success);
+            Assert.Equal("compose_workspace_unavailable", result.ErrorCode);
+            Assert.Empty(runner.Requests);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
             }
         }
     }

@@ -34,6 +34,61 @@ public sealed class AuthAndPermissionTests
     }
 
     [Fact]
+    public void NewlyIssuedApiKeysCarryAnAgentLookupHintWithoutChangingTheStoredHash()
+    {
+        var manager = new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests"));
+        var agentId = Guid.Parse("00000000-0000-0000-0000-000000000101");
+
+        var issue = manager.Issue(agentId);
+
+        Assert.StartsWith("v2_", issue.ApiKey, StringComparison.Ordinal);
+        Assert.Contains(agentId.ToString("N"), issue.ApiKey, StringComparison.Ordinal);
+        Assert.Equal(manager.ComputeHash(agentId, issue.ApiKey), issue.ApiKeyHash);
+    }
+
+    [Fact]
+    public async Task LegacyAuthenticationFailsClosedWhenTheBoundedCandidateWindowIsExceeded()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var manager = new AgentApiKeyManager(Encoding.UTF8.GetBytes("pepper-that-is-long-enough-for-tests"));
+        var legacyAgentId = Guid.Parse("00000000-0000-0000-0000-0000000001ff");
+        const string legacyApiKey = "legacy-api-key-for-compatibility";
+        var agents = Enumerable.Range(0, 129)
+            .Select(index =>
+            {
+                var agentId = index == 128
+                    ? legacyAgentId
+                    : Guid.Parse($"00000000-0000-0000-0000-{index + 1:000000000000}");
+                var hash = manager.ComputeHash(agentId, index == 128 ? legacyApiKey : $"other-key-{index}");
+                return new AgentNode
+                {
+                    AgentId = agentId,
+                    Name = "agent-" + index,
+                    ApiKeyHash = hash,
+                    ApiKeyVersion = 1
+                };
+            })
+            .ToArray();
+        db.AgentNodes.AddRange(agents);
+        await db.SaveChangesAsync();
+
+        var authentication = new AgentApiKeyAuthenticationService(
+            db,
+            new AgentApiKeyService(db, manager));
+
+        var identity = await authentication.AuthenticateAsync(legacyApiKey, CancellationToken.None);
+
+        Assert.Null(identity);
+    }
+
+    [Fact]
     public void AgentCredentialsRejectAnApiKeyMixedWithTheSsoCookie()
     {
         var context = new DefaultHttpContext();

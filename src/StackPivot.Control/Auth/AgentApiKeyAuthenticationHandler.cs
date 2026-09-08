@@ -35,6 +35,10 @@ public sealed record AgentApiKeyIssue(
 
 public sealed class AgentApiKeyManager
 {
+    private const string V2Prefix = "v2_";
+    private const int RandomPartLength = 43;
+    private const int V2KeyLength = 3 + 32 + 1 + RandomPartLength;
+    private const int MaxCandidateLength = 512;
     private readonly byte[] pepper;
 
     public AgentApiKeyManager(byte[] pepper)
@@ -56,11 +60,43 @@ public sealed class AgentApiKeyManager
         }
 
         var keyBytes = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
-        var key = Microsoft.AspNetCore.WebUtilities.WebEncoders.Base64UrlEncode(keyBytes);
+        var randomPart = Microsoft.AspNetCore.WebUtilities.WebEncoders.Base64UrlEncode(keyBytes);
+        var key = V2Prefix + agentId.ToString("N") + "_" + randomPart;
         var hash = ComputeHash(agentId, key);
         var last4 = key[^4..];
         CryptographicOperations.ZeroMemory(keyBytes);
         return new AgentApiKeyIssue(key, hash, version, last4);
+    }
+
+    public static bool LooksLikeV2(string candidate) =>
+        candidate.Length == V2KeyLength
+            && candidate.StartsWith(V2Prefix, StringComparison.Ordinal);
+
+    public static bool TryGetV2AgentId(string candidate, out Guid agentId)
+    {
+        agentId = Guid.Empty;
+        if (!LooksLikeV2(candidate))
+        {
+            return false;
+        }
+
+        var separator = candidate.IndexOf('_', V2Prefix.Length);
+        if (separator != V2Prefix.Length + 32
+            || !Guid.TryParseExact(candidate[V2Prefix.Length..separator], "N", out agentId))
+        {
+            agentId = Guid.Empty;
+            return false;
+        }
+
+        var randomPart = candidate[(separator + 1)..];
+        if (randomPart.Length != RandomPartLength
+            || !randomPart.All(IsBase64UrlCharacter))
+        {
+            agentId = Guid.Empty;
+            return false;
+        }
+
+        return true;
     }
 
     public bool Verify(
@@ -74,6 +110,7 @@ public sealed class AgentApiKeyManager
             || expectedVersion < 1
             || revokedAt is not null
             || string.IsNullOrWhiteSpace(candidate)
+            || candidate.Length > MaxCandidateLength
             || string.IsNullOrWhiteSpace(expectedHash))
         {
             return false;
@@ -127,6 +164,12 @@ public sealed class AgentApiKeyManager
             CryptographicOperations.ZeroMemory(input);
         }
     }
+
+    private static bool IsBase64UrlCharacter(char value) =>
+        value is >= 'A' and <= 'Z'
+            or >= 'a' and <= 'z'
+            or >= '0' and <= '9'
+            or '-' or '_';
 }
 
 public sealed class AgentApiKeyService(
@@ -369,6 +412,8 @@ public sealed class AgentApiKeyAuthenticationService(
     StackPivotDbContext dbContext,
     AgentApiKeyService keyService)
 {
+    private const int MaxLegacyCandidates = 128;
+
     public async Task<AgentApiKeyIdentity?> AuthenticateAsync(
         string candidate,
         CancellationToken cancellationToken)
@@ -378,27 +423,72 @@ public sealed class AgentApiKeyAuthenticationService(
             return null;
         }
 
+        if (AgentApiKeyManager.LooksLikeV2(candidate))
+        {
+            if (!AgentApiKeyManager.TryGetV2AgentId(candidate, out var agentId))
+            {
+                return null;
+            }
+
+            var agent = await dbContext.AgentNodes
+                .Where(value => value.AgentId == agentId && value.RevokedAt == null)
+                .AsNoTracking()
+                .SingleOrDefaultAsync(cancellationToken);
+            return await VerifyAndMarkAsync(agent, candidate, cancellationToken);
+        }
+
         var agents = await dbContext.AgentNodes
             .Where(value => value.RevokedAt == null)
+            .OrderBy(value => value.AgentId)
+            .Take(MaxLegacyCandidates + 1)
             .AsNoTracking()
             .ToListAsync(cancellationToken);
+        if (agents.Count > MaxLegacyCandidates)
+        {
+            return null;
+        }
+
         foreach (var agent in agents)
         {
-            if (keyService.Verify(agent, candidate))
+            var identity = await VerifyAndMarkAsync(agent, candidate, cancellationToken);
+            if (identity is not null)
             {
-                var lastSeenAt = DateTimeOffset.UtcNow;
-                await dbContext.AgentNodes
-                    .Where(value => value.AgentId == agent.AgentId
-                        && value.ApiKeyVersion == agent.ApiKeyVersion
-                        && value.ApiKeyHash == agent.ApiKeyHash
-                        && value.RevokedAt == null)
-                    .ExecuteUpdateAsync(
-                        setters => setters.SetProperty(value => value.LastSeenAt, lastSeenAt),
-                        cancellationToken);
-                return new AgentApiKeyIdentity(agent.AgentId, agent.ApiKeyVersion);
+                return identity;
             }
         }
 
         return null;
     }
+
+    private async Task<AgentApiKeyIdentity?> VerifyAndMarkAsync(
+        AgentNode? agent,
+        string candidate,
+        CancellationToken cancellationToken)
+    {
+        if (agent is null || !keyService.Verify(agent, candidate))
+        {
+            return null;
+        }
+
+        var lastSeenAt = DateTimeOffset.UtcNow;
+        var updated = await dbContext.AgentNodes
+            .Where(value => value.AgentId == agent.AgentId
+                && value.ApiKeyVersion == agent.ApiKeyVersion
+                && value.ApiKeyHash == agent.ApiKeyHash
+                && value.RevokedAt == null)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(value => value.LastSeenAt, lastSeenAt),
+                cancellationToken);
+
+        if (updated == 0
+            && !await dbContext.AgentNodes
+                .AsNoTracking()
+                .AnyAsync(value => value.AgentId == agent.AgentId && value.RevokedAt == null, cancellationToken))
+        {
+            return null;
+        }
+
+        return new AgentApiKeyIdentity(agent.AgentId, agent.ApiKeyVersion);
+    }
+
 }
