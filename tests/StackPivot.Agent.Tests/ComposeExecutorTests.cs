@@ -56,6 +56,23 @@ public sealed class ComposeExecutorTests
     }
 
     [Fact]
+    public async Task ComposeUpPreservesAnExplicitProcessFailureCode()
+    {
+        var runner = new RecordingProcessRunner(
+            new ProcessResult(0, "Docker Compose version v2.24.0", string.Empty),
+            new ProcessResult(-1, string.Empty, string.Empty, ErrorCode: "output_handler_failed"));
+        var executor = new ComposeExecutor(runner, TimeSpan.FromSeconds(5));
+
+        var result = await executor.ExecuteAsync(
+            "/opt/agent-main/workspace_one/stack_web",
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("output_handler_failed", result.ErrorCode);
+        Assert.Equal(-1, result.ExitCode);
+    }
+
+    [Fact]
     public async Task ComposeOutputIsLimitedToOneMebibyteAfterCombiningStreams()
     {
         var line = new string('x', LogSanitizer.MaxLineBytes);
@@ -133,7 +150,7 @@ public sealed class ComposeExecutorTests
     }
 
     [SkippableFact]
-    public async Task ComposeUpCleansSnapshotEntriesCreatedDuringProcess()
+    public async Task ComposeUpKeepsSnapshotUntilAnExplicitExpiredSnapshotReclaim()
     {
         TestPlatform.RequireLinux();
         var root = Path.Combine(Path.GetTempPath(), "stackpivot-compose-cleanup-" + Guid.NewGuid().ToString("N"));
@@ -156,20 +173,26 @@ public sealed class ComposeExecutorTests
 
             Assert.True(result.Success);
             Assert.NotNull(runner.WorkingDirectory);
-            Assert.False(Directory.Exists(runner.WorkingDirectory));
+            Assert.True(Directory.Exists(runner.WorkingDirectory));
+            if (!OperatingSystem.IsLinux())
+            {
+                throw new Xunit.SkipException("Linux-only test: requires private snapshot filesystem permissions.");
+            }
+
+            Assert.Equal(
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                File.GetUnixFileMode(runner.WorkingDirectory));
             Assert.True(Directory.Exists(outside));
+
+            Directory.SetLastWriteTimeUtc(runner.WorkingDirectory, DateTime.UtcNow.AddHours(-2));
+            Assert.Equal(1, executor.ReclaimExpiredSnapshots(TimeSpan.FromHours(1)));
+            Assert.False(Directory.Exists(runner.WorkingDirectory));
         }
         finally
         {
             if (runner.WorkingDirectory is not null && Directory.Exists(runner.WorkingDirectory))
             {
-                var link = Path.Combine(runner.WorkingDirectory, "link");
-                if (File.Exists(link) || Directory.Exists(link))
-                {
-                    File.Delete(link);
-                }
-
-                Directory.Delete(runner.WorkingDirectory, recursive: true);
+                executor.ReclaimExpiredSnapshots(TimeSpan.Zero);
             }
 
             if (Directory.Exists(root))

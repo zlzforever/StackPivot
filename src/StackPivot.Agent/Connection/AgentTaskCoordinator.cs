@@ -24,7 +24,7 @@ public sealed class AgentTaskCoordinator
     private readonly int maxCompletedTasks;
     private readonly TimeSpan completedTaskTtl;
     private readonly object completedTasksGate = new();
-    private readonly ConcurrentDictionary<Guid, Lazy<Task<AgentExecutionResult>>> activeTasks = new();
+    private readonly ConcurrentDictionary<Guid, ActiveTask> activeTasks = new();
     private readonly ConcurrentDictionary<Guid, CachedExecutionResult> completedTasks = new();
 
     public AgentTaskCoordinator(
@@ -70,8 +70,15 @@ public sealed class AgentTaskCoordinator
                 return;
             }
 
-            if (TryGetCompleted(command.TaskId, out var completed))
+            var context = TaskContext.Create(command);
+            if (TryGetCompleted(command.TaskId, context, out var completed, out var contextMismatch))
             {
+                if (contextMismatch)
+                {
+                    await ReportContextMismatchAsync(command, reporter, cancellationToken);
+                    return;
+                }
+
                 await reporter.ReportAcceptedAsync(
                     CreateAccepted(command, DateTimeOffset.UtcNow),
                     cancellationToken);
@@ -79,11 +86,19 @@ public sealed class AgentTaskCoordinator
                 return;
             }
 
-            var candidate = new Lazy<Task<AgentExecutionResult>>(
+            var candidate = new ActiveTask(
+                context,
+                new Lazy<Task<AgentExecutionResult>>(
                 () => ExecuteAndReportAsync(command, reporter, cancellationToken),
-                LazyThreadSafetyMode.ExecutionAndPublication);
+                LazyThreadSafetyMode.ExecutionAndPublication));
             var execution = activeTasks.GetOrAdd(command.TaskId, candidate);
-            await execution.Value;
+            if (!execution.Context.Equals(context))
+            {
+                await ReportContextMismatchAsync(command, reporter, cancellationToken);
+                return;
+            }
+
+            await execution.Execution.Value;
         }
         finally
         {
@@ -104,7 +119,7 @@ public sealed class AgentTaskCoordinator
                 await reporter.ReportAcceptedAsync(
                     CreateAccepted(command, DateTimeOffset.UtcNow),
                     cancellationToken);
-                CacheCompleted(command.TaskId, failure);
+                CacheCompleted(TaskContext.Create(command), failure);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
                 return failure;
             }
@@ -116,7 +131,7 @@ public sealed class AgentTaskCoordinator
                 await reporter.ReportAcceptedAsync(
                     CreateAccepted(command, DateTimeOffset.UtcNow),
                     cancellationToken);
-                CacheCompleted(command.TaskId, failure);
+                CacheCompleted(TaskContext.Create(command), failure);
                 await reporter.ReportCompletedAsync(CreateCompleted(command, failure), cancellationToken);
                 return failure;
             }
@@ -140,7 +155,7 @@ public sealed class AgentTaskCoordinator
                 result = new AgentExecutionResult(false, -1, string.Empty, false, "agent_execution_failed");
             }
 
-            CacheCompleted(command.TaskId, result);
+            CacheCompleted(TaskContext.Create(command), result);
             await reporter.ReportCompletedAsync(CreateCompleted(command, result), cancellationToken);
             return result;
         }
@@ -265,13 +280,18 @@ public sealed class AgentTaskCoordinator
             command.AgentStackLocalPath,
             command.ExpiresAt);
 
-    private bool TryGetCompleted(Guid taskId, out AgentExecutionResult result)
+    private bool TryGetCompleted(
+        Guid taskId,
+        TaskContext context,
+        out AgentExecutionResult result,
+        out bool contextMismatch)
     {
         lock (completedTasksGate)
         {
             if (!completedTasks.TryGetValue(taskId, out var cached))
             {
                 result = null!;
+                contextMismatch = false;
                 return false;
             }
 
@@ -279,17 +299,27 @@ public sealed class AgentTaskCoordinator
             {
                 completedTasks.TryRemove(taskId, out _);
                 result = null!;
+                contextMismatch = false;
                 return false;
             }
 
+            if (!cached.Context.Equals(context))
+            {
+                result = null!;
+                contextMismatch = true;
+                return true;
+            }
+
             result = cached.Result;
+            contextMismatch = false;
             return true;
         }
     }
 
-    private void CacheCompleted(Guid taskId, AgentExecutionResult result)
+    private void CacheCompleted(TaskContext context, AgentExecutionResult result)
     {
         var cached = new CachedExecutionResult(
+            context,
             result with { OutputLog = string.Empty },
             DateTimeOffset.UtcNow.Add(completedTaskTtl));
         lock (completedTasksGate)
@@ -303,7 +333,7 @@ public sealed class AgentTaskCoordinator
                 }
             }
 
-            completedTasks[taskId] = cached;
+            completedTasks[context.TaskId] = cached;
             while (completedTasks.Count > maxCompletedTasks)
             {
                 var oldest = completedTasks
@@ -315,8 +345,59 @@ public sealed class AgentTaskCoordinator
     }
 
     private sealed record CachedExecutionResult(
+        TaskContext Context,
         AgentExecutionResult Result,
         DateTimeOffset ExpiresAt);
+
+    private sealed record ActiveTask(
+        TaskContext Context,
+        Lazy<Task<AgentExecutionResult>> Execution);
+
+    private sealed record TaskContext(
+        Guid TaskId,
+        Guid RequestId,
+        Guid StackId,
+        Guid AgentId,
+        string GitRepo,
+        string GitUserName,
+        string TargetCommitHash,
+        string StackGitRelativePath,
+        string AgentStackLocalPath,
+        DateTimeOffset ExpiresAt,
+        string DispatchFingerprint)
+    {
+        public static TaskContext Create(DeployStackCommand command) =>
+            new(
+                command.TaskId,
+                command.RequestId,
+                command.StackId,
+                command.AgentId,
+                command.GitRepo,
+                command.GitUserName,
+                command.TargetCommitHash,
+                command.StackGitRelativePath,
+                command.AgentStackLocalPath,
+                command.ExpiresAt,
+                command.DispatchFingerprint);
+    }
+
+    private static TaskCompleted CreateContextMismatchCompleted(DeployStackCommand command) =>
+        CreateCompleted(
+            command,
+            new AgentExecutionResult(false, -1, string.Empty, false, "task_context_mismatch"));
+
+    private static async Task ReportContextMismatchAsync(
+        DeployStackCommand command,
+        IAgentTaskReporter reporter,
+        CancellationToken cancellationToken)
+    {
+        await reporter.ReportAcceptedAsync(
+            CreateAccepted(command, DateTimeOffset.UtcNow),
+            cancellationToken);
+        await reporter.ReportCompletedAsync(
+            CreateContextMismatchCompleted(command),
+            cancellationToken);
+    }
 
     private sealed class StackDeploymentLease : IAsyncDisposable
     {

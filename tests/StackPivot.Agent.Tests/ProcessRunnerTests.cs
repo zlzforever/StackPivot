@@ -47,6 +47,21 @@ public sealed class ProcessRunnerTests
         Assert.All(lines, line => Assert.Equal("stdout", line.Stream));
     }
 
+    [Fact]
+    public async Task OutputHandlerFailureReturnsAnExplicitFailureResult()
+    {
+        var result = await new ProcessRunner().RunAsync(
+            new ProcessRequest(
+                "printf",
+                ["line\\n"],
+                Directory.GetCurrentDirectory(),
+                OutputHandler: _ => ValueTask.FromException(new InvalidOperationException("handler failed"))),
+            CancellationToken.None);
+
+        Assert.Equal(-1, result.ExitCode);
+        Assert.Equal("output_handler_failed", result.ErrorCode);
+    }
+
     [SkippableFact]
     public async Task DirectoryHandleKeepsAProcessInTheOpenedDirectoryAfterPathReplacement()
     {

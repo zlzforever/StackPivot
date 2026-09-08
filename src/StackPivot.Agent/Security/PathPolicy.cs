@@ -167,6 +167,34 @@ public sealed class SafeDirectoryHandle : IDisposable
         LinuxPathOperations.DeleteFileAt(GetFileDescriptor(), relativePath);
     }
 
+    internal void MoveFileTo(
+        string relativePath,
+        SafeDirectoryHandle destination,
+        string destinationRelativePath)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        LinuxPathOperations.MoveFileAt(
+            GetFileDescriptor(),
+            relativePath,
+            destination.GetFileDescriptor(),
+            destinationRelativePath);
+    }
+
+    internal bool TryDeleteEmptyDirectory(string relativePath)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("File descriptor relative paths require Linux.");
+        }
+
+        return LinuxPathOperations.TryDeleteEmptyDirectoryAt(GetFileDescriptor(), relativePath);
+    }
+
     internal FileStream OpenLockFile(string relativePath)
     {
         if (!OperatingSystem.IsLinux())
@@ -548,6 +576,7 @@ internal static class LinuxPathOperations
     internal const int EntryExists = 17;
     internal const int NotDirectory = 20;
     internal const int SymbolicLinkLoop = 40;
+    internal const int DirectoryNotEmpty = 39;
     internal const int ResourceBusy = 11;
 
     internal static void EnsurePrivateDirectory(int fileDescriptor)
@@ -771,6 +800,102 @@ internal static class LinuxPathOperations
         finally
         {
             current?.Dispose();
+        }
+    }
+
+    internal static void MoveFileAt(
+        int sourceRootFileDescriptor,
+        string sourceRelativePath,
+        int destinationRootFileDescriptor,
+        string destinationRelativePath)
+    {
+        var sourceSegments = ValidateManagedSegments(sourceRelativePath);
+        var destinationSegments = ValidateManagedSegments(destinationRelativePath);
+        using var sourceParent = OpenDirectoryPath(
+            sourceRootFileDescriptor,
+            sourceSegments[..^1],
+            create: false);
+        using var destinationParent = OpenDirectoryPath(
+            destinationRootFileDescriptor,
+            destinationSegments[..^1],
+            create: true);
+        var result = renameat(
+            sourceParent is null ? sourceRootFileDescriptor : GetFileDescriptor(sourceParent),
+            sourceSegments[^1],
+            destinationParent is null ? destinationRootFileDescriptor : GetFileDescriptor(destinationParent),
+            destinationSegments[^1]);
+        if (result != 0)
+        {
+            throw CreateNativeException("Unable to move a managed file safely.", Marshal.GetLastWin32Error());
+        }
+    }
+
+    internal static bool TryDeleteEmptyDirectoryAt(int rootFileDescriptor, string relativePath)
+    {
+        var segments = ValidateManagedSegments(relativePath);
+        if (segments.Length == 0)
+        {
+            return false;
+        }
+
+        using var directory = OpenDirectoryPath(rootFileDescriptor, segments, create: false);
+        var entries = Directory.EnumerateFileSystemEntries($"/proc/self/fd/{GetFileDescriptor(directory!)}");
+        using var enumerator = entries.GetEnumerator();
+        if (enumerator.MoveNext())
+        {
+            return false;
+        }
+
+        using var parent = OpenDirectoryPath(
+            rootFileDescriptor,
+            segments[..^1],
+            create: false);
+        var result = unlinkat(
+            parent is null ? rootFileDescriptor : GetFileDescriptor(parent),
+            segments[^1],
+            RemoveDirectory);
+        if (result == 0 || Marshal.GetLastWin32Error() == EntryNotFound)
+        {
+            return result == 0;
+        }
+
+        var error = Marshal.GetLastWin32Error();
+        if (error == DirectoryNotEmpty)
+        {
+            return false;
+        }
+
+        throw CreateNativeException("Unable to remove an empty managed directory.", error);
+    }
+
+    private static SafeFileHandle? OpenDirectoryPath(
+        int rootFileDescriptor,
+        string[] segments,
+        bool create)
+    {
+        if (segments.Length == 0)
+        {
+            return null;
+        }
+
+        SafeFileHandle? current = null;
+        var currentFileDescriptor = rootFileDescriptor;
+        try
+        {
+            foreach (var segment in segments)
+            {
+                var next = OpenDirectoryAt(currentFileDescriptor, segment, create);
+                current?.Dispose();
+                current = next;
+                currentFileDescriptor = GetFileDescriptor(current);
+            }
+
+            return current;
+        }
+        catch
+        {
+            current?.Dispose();
+            throw;
         }
     }
 
@@ -1099,6 +1224,13 @@ internal static class LinuxPathOperations
         int directoryFileDescriptor,
         [MarshalAs(UnmanagedType.LPStr)] string path,
         int flags);
+
+    [DllImport("libc", EntryPoint = "renameat", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int renameat(
+        int oldDirectoryFileDescriptor,
+        [MarshalAs(UnmanagedType.LPStr)] string oldPath,
+        int newDirectoryFileDescriptor,
+        [MarshalAs(UnmanagedType.LPStr)] string newPath);
 
     [DllImport("libc", EntryPoint = "flock", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
     private static extern int flock(int fileDescriptor, int operation);

@@ -27,8 +27,21 @@ public static class DeploymentEndpoints
                     DeployStackRequest request;
                     try
                     {
-                        using var reader = new StreamReader(context.Request.Body);
-                        request = ProtocolJson.Deserialize<DeployStackRequest>(await reader.ReadToEndAsync(context.RequestAborted));
+                        var body = await RequestBodyReader.ReadUtf8Async(
+                            context,
+                            RequestBodyReader.MaxJsonBodyBytes,
+                            context.RequestAborted);
+                        if (body.TooLarge)
+                        {
+                            return ApiProblem.Create(context, "request_too_large", StatusCodes.Status413PayloadTooLarge, "Request body is too large.", requestId);
+                        }
+
+                        if (body.InvalidUtf8 || string.IsNullOrWhiteSpace(body.Text))
+                        {
+                            throw new JsonException();
+                        }
+
+                        request = ProtocolJson.Deserialize<DeployStackRequest>(body.Text);
                     }
                     catch (JsonException)
                     {

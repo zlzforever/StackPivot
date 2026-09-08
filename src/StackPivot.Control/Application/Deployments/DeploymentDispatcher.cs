@@ -161,13 +161,19 @@ public sealed class DeploymentDispatcher(
             return;
         }
 
-        var sanitized = DeploymentLogSanitizer.SanitizeLine(log.Line);
-        var outputLog = DeploymentLogSanitizer.Append(
-            history.OutputLog,
-            sanitized,
-            out var truncated);
+        var outputLog = history.OutputLog;
         var logEntries = history.OutputLogEntriesJson;
-        var entriesTruncated = AppendLogEntry(ref logEntries, log.Stream, sanitized);
+        var truncated = history.LogTruncated;
+        var entriesTruncated = history.LogTruncated;
+        if (!history.LogTruncated)
+        {
+            var sanitized = DeploymentLogSanitizer.SanitizeLine(log.Line);
+            outputLog = DeploymentLogSanitizer.Append(
+                history.OutputLog,
+                sanitized,
+                out truncated);
+            entriesTruncated = AppendLogEntry(ref logEntries, log.Stream, sanitized);
+        }
         var now = DateTimeOffset.UtcNow;
         await dbContext.ServiceOperationHistories
             .Where(value => value.HistoryId == history.HistoryId
@@ -867,31 +873,35 @@ public sealed class DeploymentDispatcher(
 
     private static bool AppendLogEntry(ref string json, string stream, string line)
     {
-        try
+        var entry = JsonSerializer.Serialize(new DeploymentLogEntryView(stream, line));
+        var entryBytes = Encoding.UTF8.GetByteCount(entry);
+        if (json.Length >= 2
+            && json[0] == '['
+            && json[^1] == ']')
         {
-            var entries = JsonSerializer.Deserialize<List<DeploymentLogEntryView>>(json)
-                ?? new List<DeploymentLogEntryView>();
-            entries.Add(new DeploymentLogEntryView(stream, line));
-            var serialized = JsonSerializer.Serialize(entries);
-            if (Encoding.UTF8.GetByteCount(serialized) <= DeploymentLogSanitizer.MaxTaskBytes)
+            var hasEntries = json.Length > 2;
+            var requiredBytes = Encoding.UTF8.GetByteCount(json)
+                - 1
+                + (hasEntries ? 1 : 0)
+                + entryBytes
+                + 1;
+            if (requiredBytes <= DeploymentLogSanitizer.MaxTaskBytes)
             {
-                json = serialized;
+                json = json[..^1] + (hasEntries ? "," : string.Empty) + entry + "]";
                 return false;
             }
 
             return true;
         }
-        catch (JsonException)
-        {
-            var serialized = JsonSerializer.Serialize(new[] { new DeploymentLogEntryView(stream, line) });
-            if (Encoding.UTF8.GetByteCount(serialized) <= DeploymentLogSanitizer.MaxTaskBytes)
-            {
-                json = serialized;
-                return false;
-            }
 
-            return true;
+        var replacement = "[" + entry + "]";
+        if (entryBytes + 2 <= DeploymentLogSanitizer.MaxTaskBytes)
+        {
+            json = replacement;
+            return false;
         }
+
+        return true;
     }
 }
 

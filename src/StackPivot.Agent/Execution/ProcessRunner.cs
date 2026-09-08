@@ -21,7 +21,8 @@ public sealed record ProcessResult(
     string StandardOutput,
     string StandardError,
     bool TimedOut = false,
-    bool OutputTruncated = false);
+    bool OutputTruncated = false,
+    string? ErrorCode = null);
 
 public interface IProcessRunner
 {
@@ -49,15 +50,48 @@ public sealed class ProcessRunner : IProcessRunner
             ? new CancellationTokenSource(timeout)
             : null;
         using var linkedCancellation = timeoutCancellation is null
-            ? null
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
             : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCancellation.Token);
-        var waitToken = linkedCancellation?.Token ?? cancellationToken;
+        var waitToken = linkedCancellation.Token;
         var budget = new OutputBudget(MaxOutputBytes);
         var stdoutTask = ReadBoundedAsync(process.StandardOutput, "stdout", budget, request.OutputHandler, waitToken);
         var stderrTask = ReadBoundedAsync(process.StandardError, "stderr", budget, request.OutputHandler, waitToken);
+        var waitForExitTask = process.WaitForExitAsync(waitToken);
         try
         {
-            await process.WaitForExitAsync(waitToken);
+            var stdoutObserved = false;
+            var stderrObserved = false;
+            while (!waitForExitTask.IsCompleted)
+            {
+                var pending = new List<Task>(capacity: 3) { waitForExitTask };
+                if (!stdoutObserved)
+                {
+                    pending.Add(stdoutTask);
+                }
+
+                if (!stderrObserved)
+                {
+                    pending.Add(stderrTask);
+                }
+
+                var completed = await Task.WhenAny(pending);
+                if (completed == stdoutTask)
+                {
+                    await stdoutTask;
+                    stdoutObserved = true;
+                }
+                else if (completed == stderrTask)
+                {
+                    await stderrTask;
+                    stderrObserved = true;
+                }
+                else
+                {
+                    await waitForExitTask;
+                }
+            }
+
+            await waitForExitTask;
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
             return new ProcessResult(
@@ -69,6 +103,14 @@ public sealed class ProcessRunner : IProcessRunner
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            if (timeoutCancellation?.IsCancellationRequested != true)
+            {
+                linkedCancellation.Cancel();
+                KillProcessTree(process);
+                await DrainAfterKillAsync(stdoutTask, stderrTask);
+                return new ProcessResult(-1, string.Empty, string.Empty, false, false, "output_handler_failed");
+            }
+
             KillProcessTree(process);
             await DrainAfterKillAsync(stdoutTask, stderrTask);
             return new ProcessResult(-1, string.Empty, string.Empty, true, false);
@@ -78,6 +120,13 @@ public sealed class ProcessRunner : IProcessRunner
             KillProcessTree(process);
             await DrainAfterKillAsync(stdoutTask, stderrTask);
             throw;
+        }
+        catch (Exception)
+        {
+            linkedCancellation.Cancel();
+            KillProcessTree(process);
+            await DrainAfterKillAsync(stdoutTask, stderrTask);
+            return new ProcessResult(-1, string.Empty, string.Empty, false, false, "output_handler_failed");
         }
     }
 

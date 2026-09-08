@@ -367,6 +367,186 @@ public sealed class DeploymentEventTests
         Assert.Null(history.StartTime);
     }
 
+    [Theory]
+    [InlineData("agent")]
+    [InlineData("task")]
+    [InlineData("commit")]
+    [InlineData("stack_path")]
+    [InlineData("local_path")]
+    [InlineData("fingerprint")]
+    [InlineData("expires_at")]
+    [InlineData("accepted_at_before_window")]
+    [InlineData("accepted_at_after_window")]
+    public async Task AcceptedReportWithAnyContextMismatchIsIgnored(string mismatch)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        var dispatchStartedAt = DateTimeOffset.UtcNow.AddSeconds(-1);
+        history.DispatchAttemptAt = dispatchStartedAt;
+        history.DispatchedAt = dispatchStartedAt;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        var accepted = CreateAccepted(history, DateTimeOffset.UtcNow);
+        accepted = mismatch switch
+        {
+            "agent" => accepted with { AgentId = Guid.NewGuid() },
+            "task" => accepted with { TaskId = Guid.NewGuid() },
+            "commit" => accepted with { TargetCommitHash = "abcdef0123456789abcdef0123456789abcdef01" },
+            "stack_path" => accepted with { StackGitRelativePath = "workspace_other/stack_web" },
+            "local_path" => accepted with { AgentStackLocalPath = "/opt/agent-main/workspace_other/stack_web" },
+            "fingerprint" => accepted with { DispatchFingerprint = new string('0', 64) },
+            "expires_at" => accepted with { DispatchExpiresAt = accepted.DispatchExpiresAt!.Value.AddSeconds(1) },
+            "accepted_at_before_window" => accepted with { AcceptedAt = dispatchStartedAt.AddMinutes(-10) },
+            "accepted_at_after_window" => accepted with { AcceptedAt = DateTimeOffset.UtcNow.AddMinutes(10) },
+            _ => throw new ArgumentOutOfRangeException(nameof(mismatch), mismatch, null)
+        };
+
+        await dispatcher.HandleAcceptedAsync(accepted, CancellationToken.None);
+
+        var persisted = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("pending", persisted.TaskStatus);
+        Assert.Null(persisted.AcceptedAt);
+        Assert.Null(persisted.StartTime);
+        Assert.Null(persisted.FinishTime);
+        Assert.Empty(await db.AuditLogs.Where(value => value.Action == AuditActions.TaskAccepted).ToListAsync());
+    }
+
+    [Theory]
+    [InlineData("agent")]
+    [InlineData("task")]
+    [InlineData("commit")]
+    [InlineData("stack_path")]
+    [InlineData("local_path")]
+    [InlineData("fingerprint")]
+    [InlineData("expires_at")]
+    [InlineData("finished_at_before_window")]
+    [InlineData("finished_at_after_window")]
+    public async Task CompletedReportWithAnyContextMismatchIsIgnored(string mismatch)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        var dispatchStartedAt = DateTimeOffset.UtcNow.AddSeconds(-1);
+        history.DispatchAttemptAt = dispatchStartedAt;
+        history.DispatchedAt = dispatchStartedAt;
+        history.AcceptedAt = dispatchStartedAt;
+        history.StartTime = dispatchStartedAt;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        var completed = CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0);
+        completed = mismatch switch
+        {
+            "agent" => completed with { AgentId = Guid.NewGuid() },
+            "task" => completed with { TaskId = Guid.NewGuid() },
+            "commit" => completed with { TargetCommitHash = "abcdef0123456789abcdef0123456789abcdef01" },
+            "stack_path" => completed with { StackGitRelativePath = "workspace_other/stack_web" },
+            "local_path" => completed with { AgentStackLocalPath = "/opt/agent-main/workspace_other/stack_web" },
+            "fingerprint" => completed with { DispatchFingerprint = new string('0', 64) },
+            "expires_at" => completed with { DispatchExpiresAt = completed.DispatchExpiresAt!.Value.AddSeconds(1) },
+            "finished_at_before_window" => completed with { FinishedAt = dispatchStartedAt.AddMinutes(-10) },
+            "finished_at_after_window" => completed with { FinishedAt = DateTimeOffset.UtcNow.AddMinutes(10) },
+            _ => throw new ArgumentOutOfRangeException(nameof(mismatch), mismatch, null)
+        };
+
+        await dispatcher.HandleCompletedAsync(completed, CancellationToken.None);
+
+        var persisted = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("pending", persisted.TaskStatus);
+        Assert.Equal(dispatchStartedAt, persisted.AcceptedAt);
+        Assert.Equal(dispatchStartedAt, persisted.StartTime);
+        Assert.Null(persisted.FinishTime);
+        Assert.Null(persisted.ExitCode);
+        Assert.Null(persisted.ErrorCode);
+        Assert.Empty(await db.AuditLogs
+            .Where(value => value.Action == AuditActions.TaskSucceeded || value.Action == AuditActions.TaskFailed)
+            .ToListAsync());
+    }
+
+    [Fact]
+    public async Task DuplicateAcceptedReportsPersistOneAcceptanceAndOneAudit()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        var dispatchStartedAt = DateTimeOffset.UtcNow.AddSeconds(-1);
+        history.DispatchAttemptAt = dispatchStartedAt;
+        history.DispatchedAt = dispatchStartedAt;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+        var accepted = CreateAccepted(history, DateTimeOffset.UtcNow);
+
+        await dispatcher.HandleAcceptedAsync(accepted, CancellationToken.None);
+        await dispatcher.HandleAcceptedAsync(accepted, CancellationToken.None);
+
+        var persisted = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("pending", persisted.TaskStatus);
+        Assert.NotNull(persisted.AcceptedAt);
+        Assert.NotNull(persisted.StartTime);
+        Assert.Equal(persisted.AcceptedAt, persisted.StartTime);
+        Assert.Single(await db.AuditLogs.Where(value => value.Action == AuditActions.TaskAccepted).ToListAsync());
+    }
+
+    [Fact]
+    public async Task DuplicateCompletedReportsPersistOneCompletionAndOneAudit()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        var dispatchStartedAt = DateTimeOffset.UtcNow.AddSeconds(-1);
+        history.DispatchAttemptAt = dispatchStartedAt;
+        history.DispatchedAt = dispatchStartedAt;
+        history.AcceptedAt = dispatchStartedAt;
+        history.StartTime = dispatchStartedAt;
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+        var completed = CreateCompleted(history, DateTimeOffset.UtcNow, success: true, exitCode: 0);
+
+        await dispatcher.HandleCompletedAsync(completed, CancellationToken.None);
+        await dispatcher.HandleCompletedAsync(completed, CancellationToken.None);
+
+        var persisted = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("success", persisted.TaskStatus);
+        Assert.Equal(0, persisted.ExitCode);
+        Assert.Null(persisted.ErrorCode);
+        Assert.NotNull(persisted.FinishTime);
+        Assert.Single(await db.AuditLogs.Where(value => value.Action == AuditActions.TaskSucceeded).ToListAsync());
+    }
+
     [Fact]
     public async Task SuccessfulSendKeepsTheDispatchMarkerWhenAuditPersistenceFails()
     {
@@ -434,6 +614,7 @@ public sealed class DeploymentEventTests
         };
         var dispatcher = new DeploymentDispatcher(db, transport, protector, new AuditWriter(db));
 
+        await dispatcher.DispatchPendingAsync(CancellationToken.None);
         await dispatcher.DispatchPendingAsync(CancellationToken.None);
 
         var history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
@@ -541,12 +722,13 @@ public sealed class DeploymentEventTests
             await using var db = new StackPivotDbContext(dispatchOptions);
             var historyForReport = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
             var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            var verificationFactory = new TestDbContextFactory(baseOptions);
             var dispatcher = new DeploymentDispatcher(
                 db,
                 new OfflineTransport(),
                 protector,
                 new AuditWriter(db),
-                new TestDbContextFactory(baseOptions));
+                verificationFactory);
 
             await dispatcher.HandleAcceptedAsync(
                 CreateAccepted(historyForReport, DateTimeOffset.UtcNow),
@@ -557,6 +739,7 @@ public sealed class DeploymentEventTests
             Assert.Equal("pending", persisted.TaskStatus);
             Assert.NotNull(persisted.AcceptedAt);
             Assert.NotNull(persisted.StartTime);
+            Assert.Equal(1, verificationFactory.CreateCount);
         }
         finally
         {
@@ -598,12 +781,13 @@ public sealed class DeploymentEventTests
             await using var db = new StackPivotDbContext(dispatchOptions);
             var historyForReport = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
             var protector = new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
+            var verificationFactory = new TestDbContextFactory(baseOptions);
             var dispatcher = new DeploymentDispatcher(
                 db,
                 new OfflineTransport(),
                 protector,
                 new AuditWriter(db),
-                new TestDbContextFactory(baseOptions));
+                verificationFactory);
 
             await dispatcher.HandleCompletedAsync(
                 CreateCompleted(historyForReport, DateTimeOffset.UtcNow, success: true, exitCode: 0),
@@ -615,6 +799,7 @@ public sealed class DeploymentEventTests
             Assert.Equal(0, persisted.ExitCode);
             Assert.Null(persisted.ErrorCode);
             Assert.NotNull(persisted.FinishTime);
+            Assert.Equal(1, verificationFactory.CreateCount);
         }
         finally
         {
@@ -936,6 +1121,39 @@ public sealed class DeploymentEventTests
     }
 
     [Fact]
+    public async Task TruncatedLogsAdvanceTheSequenceWithoutRewritingStoredLogPayloads()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await SeedAsync(db);
+        var history = await db.ServiceOperationHistories.SingleAsync();
+        history.DispatchedAt = DateTimeOffset.UtcNow;
+        history.LogTruncated = true;
+        history.OutputLog = "already-truncated";
+        history.OutputLogEntriesJson = "not-json-but-preserved";
+        await db.SaveChangesAsync();
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAcceptedAsync(CreateAccepted(history, DateTimeOffset.UtcNow), CancellationToken.None);
+        await dispatcher.HandleLogAsync(
+            CreateLog(history, 0, "stdout", "late line", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal(0, history.LastSequence);
+        Assert.Equal("already-truncated", history.OutputLog);
+        Assert.Equal("not-json-but-preserved", history.OutputLogEntriesJson);
+        Assert.True(history.LogTruncated);
+    }
+
+    [Fact]
     public async Task DispatchLifecycleMigrationUsesAnEmptyJsonArrayAsTheLogEntryDefault()
     {
         var databasePath = Path.Combine(Path.GetTempPath(), "stackpivot-migration-" + Guid.NewGuid().ToString("N") + ".db");
@@ -1204,6 +1422,52 @@ public sealed class DeploymentEventTests
         history = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
         Assert.Equal("pending", history.TaskStatus);
         Assert.Null(history.ErrorCode);
+    }
+
+    [Fact]
+    public async Task DisconnectBeforeDispatchFailsTheTaskAndAllowsASubsequentDeployment()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<StackPivotDbContext>().UseSqlite(connection).Options;
+        await using var db = new StackPivotDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var fixture = await SeedAsync(db);
+        var dispatcher = new DeploymentDispatcher(
+            db,
+            new OfflineTransport(),
+            new AesGcmGitCredentialProtector(Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()),
+            new AuditWriter(db));
+
+        await dispatcher.HandleAgentDisconnectedAsync(fixture.AgentId, CancellationToken.None);
+
+        var failed = await db.ServiceOperationHistories.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", failed.TaskStatus);
+        Assert.Equal("agent_disconnected", failed.ErrorCode);
+        Assert.Null(failed.AcceptedAt);
+        Assert.Null(failed.StartTime);
+        Assert.NotNull(failed.FinishTime);
+
+        var service = new DeploymentService(
+            db,
+            new WorkspaceAuthorizationService(db),
+            new RecoveryPreflight(),
+            new AuditWriter(db));
+        var result = await service.RequestAsync(
+            failed.UserId,
+            failed.StackId,
+            new DeployStackRequest(
+                "abcdef0123456789abcdef0123456789abcdef01",
+                DeploymentMode.BoundAgents,
+                null),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            CancellationToken.None);
+
+        var pending = Assert.Single(result.Tasks);
+        Assert.Equal("pending", pending.Status);
+        Assert.Equal(1, await db.ServiceOperationHistories.CountAsync(value => value.TaskStatus == "pending"));
+        Assert.Equal(2, await db.ServiceOperationHistories.CountAsync());
     }
 
     [Fact]
@@ -1598,10 +1862,21 @@ public sealed class DeploymentEventTests
     private sealed class TestDbContextFactory(DbContextOptions<StackPivotDbContext> options)
         : IDbContextFactory<StackPivotDbContext>
     {
-        public StackPivotDbContext CreateDbContext() => new(options);
+        private int createCount;
 
-        public Task<StackPivotDbContext> CreateDbContextAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(new StackPivotDbContext(options));
+        public int CreateCount => Volatile.Read(ref createCount);
+
+        public StackPivotDbContext CreateDbContext()
+        {
+            Interlocked.Increment(ref createCount);
+            return new StackPivotDbContext(options);
+        }
+
+        public Task<StackPivotDbContext> CreateDbContextAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref createCount);
+            return Task.FromResult(new StackPivotDbContext(options));
+        }
     }
 
     private sealed class DispatchMarkerFailureInterceptor : DbCommandInterceptor
